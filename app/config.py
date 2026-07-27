@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import uuid
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,13 +15,47 @@ class Settings(BaseSettings):
     app_env: str = "dev"
     app_secret: str = "change-me"
     app_secret_key: str = "change-me"
+    shopify_api_secret: str = ""
+    shopify_api_key: str = ""
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     host: str = "0.0.0.0"
     port: int = 8080
+    poc_enabled: bool = True
+    poc_max_prompt_steps: int = 5
+    poc_max_image_size_mb: int = 10
+    poc_storage_dir: str = "storage/poc-jobs"
+    poc_job_ttl_hours: int = 24
+    openai_api_key: str = ""
+    openai_image_model: str = "gpt-image-1"
+    poc_dev_skip_auth: bool = False
+
+    # PostgreSQL (production). SQLite URL allowed for local/tests only.
+    database_url: str = "sqlite+pysqlite:///./storage/app.db"
+
+    auto_processing_enabled: bool = True
+    processing_batch_size: int = 10
+    processing_batch_concurrency: int = 2
+    processing_poll_interval_seconds: int = 5
+    processing_max_attempts: int = 3
+    processing_retry_delay_seconds: int = 60
+    processing_item_timeout_seconds: int = 300
+    processing_stale_lock_seconds: int = 600
+    processing_worker_id: str = ""
+    processing_output_directory: str = "storage/processed"
+
+    shopify_image_download_timeout_seconds: int = 60
+    shopify_image_max_download_mb: int = 30
+    shopify_api_version: str = "2026-07"
+    # Dev-only fallback when shop.access_token is empty. Never used when APP_ENV != dev.
+    shopify_dev_access_token: str = ""
 
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def effective_worker_id(self) -> str:
+        return self.processing_worker_id.strip() or f"worker_{uuid.uuid4().hex[:12]}"
 
 
 settings = Settings()
