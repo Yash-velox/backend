@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -29,6 +30,7 @@ query ProductMedia($ids: [ID!]!) {
           ... on MediaImage {
             id
             alt
+            updatedAt
             image {
               url
               width
@@ -36,6 +38,10 @@ query ProductMedia($ids: [ID!]!) {
             }
             originalSource {
               fileSize
+              url
+            }
+            file {
+              id
               url
             }
           }
@@ -63,6 +69,122 @@ query ProductSearch($query: String!, $first: Int!) {
 }
 """
 
+PRODUCTS_PAGE_QUERY = """
+query ProductsPage($first: Int!, $cursor: String) {
+  products(first: $first, after: $cursor) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    nodes {
+      id
+      title
+      descriptionHtml
+      handle
+      status
+      productType
+      vendor
+      tags
+      updatedAt
+      featuredMedia {
+        ... on MediaImage {
+          id
+        }
+      }
+      media(first: 50) {
+        nodes {
+          id
+          mediaContentType
+          alt
+          ... on MediaImage {
+            id
+            alt
+            updatedAt
+            image {
+              url
+              width
+              height
+            }
+            originalSource {
+              fileSize
+              url
+            }
+            file {
+              id
+              url
+              mimeType
+            }
+          }
+        }
+      }
+      variants(first: 50) {
+        nodes {
+          id
+          title
+          sku
+          updatedAt
+        }
+      }
+    }
+  }
+}
+"""
+
+PRODUCT_BY_GID_QUERY = """
+query ProductByGid($id: ID!) {
+  product(id: $id) {
+    id
+    title
+    descriptionHtml
+    handle
+    status
+    productType
+    vendor
+    tags
+    updatedAt
+    featuredMedia {
+      ... on MediaImage {
+        id
+      }
+    }
+    media(first: 50) {
+      nodes {
+        id
+        mediaContentType
+        alt
+        ... on MediaImage {
+          id
+          alt
+          updatedAt
+          image {
+            url
+            width
+            height
+          }
+          originalSource {
+            fileSize
+            url
+          }
+          file {
+            id
+            url
+            mimeType
+          }
+        }
+      }
+    }
+    variants(first: 50) {
+      nodes {
+        id
+        title
+        sku
+        updatedAt
+      }
+    }
+  }
+}
+"""
+
 
 class ShopifyGraphQLClient:
     """Minimal Admin GraphQL client — read-only for this phase."""
@@ -79,7 +201,30 @@ class ShopifyGraphQLClient:
         }
 
     def execute(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._execute_with_retry(query, variables, allow_retry=True)
+
+    def _execute_with_retry(
+        self,
+        query: str,
+        variables: dict[str, Any] | None,
+        *,
+        allow_retry: bool,
+    ) -> dict[str, Any]:
         payload = {"query": query, "variables": variables or {}}
+        try:
+            return self._execute_once(payload)
+        except ShopifyGraphQLError as exc:
+            if allow_retry and exc.retryable:
+                logger.warning(
+                    "Shopify GraphQL retry | shop=%s error=%s",
+                    self.shop_domain,
+                    exc,
+                )
+                time.sleep(0.5)
+                return self._execute_with_retry(query, variables, allow_retry=False)
+            raise
+
+    def _execute_once(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             response = httpx.post(self._url, headers=self._headers, json=payload, timeout=30.0)
         except httpx.TimeoutException as exc:
@@ -101,7 +246,11 @@ class ShopifyGraphQLClient:
         body = response.json()
         if body.get("errors"):
             message = "; ".join(str(e.get("message", e)) for e in body["errors"])
-            raise ShopifyGraphQLError(f"Shopify GraphQL errors: {message}", retryable=False)
+            retryable = any(
+                token in message.lower()
+                for token in ("throttled", "timeout", "internal", "temporarily")
+            )
+            raise ShopifyGraphQLError(f"Shopify GraphQL errors: {message}", retryable=retryable)
         return body.get("data") or {}
 
     def fetch_products_media(self, product_gids: list[str]) -> list[dict[str, Any]]:
@@ -115,8 +264,32 @@ class ShopifyGraphQLClient:
         q = (query or "").strip()
         if not q:
             return []
-        # Prefer title match; Shopify also accepts free-text product search.
         search_query = q if ":" in q else f"title:*{q}*"
         data = self.execute(PRODUCT_SEARCH_QUERY, {"query": search_query, "first": min(max(first, 1), 50)})
         nodes = ((data.get("products") or {}).get("nodes")) or []
         return [n for n in nodes if n]
+
+    def fetch_products_page(
+        self,
+        *,
+        cursor: str | None = None,
+        first: int = 25,
+    ) -> dict[str, Any]:
+        page_size = min(max(first, 1), 50)
+        data = self.execute(PRODUCTS_PAGE_QUERY, {"first": page_size, "cursor": cursor})
+        products_block = data.get("products") or {}
+        nodes = [n for n in (products_block.get("nodes") or []) if n]
+        page_info = products_block.get("pageInfo") or {}
+        return {
+            "products": nodes,
+            "pageInfo": {
+                "hasNextPage": bool(page_info.get("hasNextPage")),
+                "endCursor": page_info.get("endCursor"),
+            },
+        }
+
+    def fetch_product_by_gid(self, gid: str) -> dict[str, Any] | None:
+        if not gid:
+            return None
+        data = self.execute(PRODUCT_BY_GID_QUERY, {"id": gid})
+        return data.get("product")

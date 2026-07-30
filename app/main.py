@@ -4,14 +4,19 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.processing_batches import router as batches_router
-from app.api.processing_queue import router as queue_router
+from app.api.batches_v2 import router as batches_router
+from app.api.internal import router as internal_router
+from app.api.secondary_queue import router as secondary_queue_router
+from app.api.settings import router as settings_router
+from app.api.sync import router as sync_router
 from app.config import settings
+from app.core.deps import CurrentShop
 from app.logging_setup import setup_logging
+from app.poc.auth import require_shopify_jwt
 from app.poc.router import router as poc_router
 from app.workers.processing_worker import processing_worker
 
@@ -33,7 +38,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Image Enhancement API",
-    version="0.2.0",
+    version="0.3.0",
     description="FastAPI backend for Shopify Image Enhancement",
     lifespan=lifespan,
 )
@@ -94,19 +99,22 @@ def health():
     }
 
 
-@app.get("/tenant/checkConfig")
-def tenant_check_config():
-    """
-    Placeholder for Retention Hub-style first-install bootstrap.
-    Will validate Shopify session JWT + provision shop later.
-    """
+@app.get("/tenant/checkConfig", dependencies=[Depends(require_shopify_jwt)])
+def tenant_check_config(shop: CurrentShop):
+    installed = bool(shop.encrypted_access_token) or (
+        settings.app_env == "dev" and bool(settings.shopify_dev_access_token)
+    )
     return {
         "status": "ok",
-        "installed": False,
-        "message": "Skeleton only — install/bootstrap not implemented yet",
+        "installed": installed,
+        "shop": shop.shop_domain,
+        "message": "Shop is installed and configured." if installed else "Shop install handoff pending.",
     }
 
 
 app.include_router(poc_router)
-app.include_router(queue_router)
+app.include_router(internal_router)
+app.include_router(sync_router)
+app.include_router(settings_router)
+app.include_router(secondary_queue_router)
 app.include_router(batches_router)

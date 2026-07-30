@@ -2,20 +2,31 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 from uuid import UUID
 
 import httpx
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
-from app.models import AttemptStatus, ProcessingAttempt, ProcessingQueueItem, QueueItemStatus
+from app.models import (
+    AttemptStatus,
+    BatchImage,
+    BatchImageStatus,
+    BatchProduct,
+    BatchProductStatus,
+    ProcessingAttempt,
+    ProcessingBaseline,
+    Product,
+)
 from app.poc.openai_client import OpenAIImageClient, OpenAIImageError
-from app.services.batch_service import BatchService, assert_transition
 from app.services.output_storage import OutputStorage, checksum_sha256, get_output_storage
+from app.services.primary_batch import PrimaryBatchService
 from app.services.retry_service import RetryService
+from app.services.state_machine import BATCH_IMAGE_TRANSITIONS, BATCH_PRODUCT_TRANSITIONS, assert_transition
 
 logger = logging.getLogger("app.services.image_processor")
 
@@ -59,6 +70,7 @@ def download_shopify_cdn_to_temp(url: str) -> Path:
     timeout = settings.shopify_image_download_timeout_seconds
     max_bytes = settings.shopify_image_max_download_mb * 1024 * 1024
     logger.info("CDN download start | url_host=%s", urlparse(url).hostname)
+    content_type = ""
     try:
         with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as response:
             if response.status_code >= 400:
@@ -99,7 +111,6 @@ def download_shopify_cdn_to_temp(url: str) -> Path:
         tmp_path.unlink(missing_ok=True)
         raise ProcessingError("Downloaded file is not a valid image", code="CORRUPT_IMAGE", retryable=False)
 
-    # Basic magic-byte checks
     is_png = data[:8] == b"\x89PNG\r\n\x1a\n"
     is_jpeg = data[:2] == b"\xff\xd8"
     is_webp = data[:4] == b"RIFF" and data[8:12] == b"WEBP"
@@ -112,10 +123,10 @@ def download_shopify_cdn_to_temp(url: str) -> Path:
     return tmp_path
 
 
-def _default_prompts(prompt_data: object | None) -> list[str]:
-    if isinstance(prompt_data, list) and prompt_data:
+def _prompts_from_snapshot(prompt_snapshot: object | None) -> list[str]:
+    if isinstance(prompt_snapshot, list) and prompt_snapshot:
         prompts: list[str] = []
-        for entry in prompt_data:
+        for entry in prompt_snapshot:
             if isinstance(entry, str) and entry.strip():
                 prompts.append(entry.strip())
             elif isinstance(entry, dict):
@@ -141,7 +152,6 @@ class ImageProcessor:
         self.db = db
         self.storage = storage or get_output_storage()
         self._openai = openai_client
-        self.batch_service = BatchService(db)
         self.retry_service = RetryService(db)
 
     def _client(self) -> OpenAIImageClient:
@@ -149,88 +159,180 @@ class ImageProcessor:
             self._openai = OpenAIImageClient()
         return self._openai
 
-    def process_queue_item(self, item_id: UUID, *, worker_id: str) -> None:
-        item = self.db.get(ProcessingQueueItem, item_id)
-        if not item:
-            logger.error("Queue item missing | item_id=%s", item_id)
+    def _primary_batch_service(self, shop_id: UUID) -> PrimaryBatchService:
+        from app.models import Shop
+
+        shop = self.db.get(Shop, shop_id)
+        if shop is None:
+            raise ProcessingError("Shop not found", code="SHOP_NOT_FOUND", retryable=False)
+        return PrimaryBatchService(self.db, shop)
+
+    def process_batch_product(self, batch_product_id: UUID, *, worker_id: str) -> None:
+        batch_product = (
+            self.db.query(BatchProduct)
+            .options(selectinload(BatchProduct.images))
+            .filter(BatchProduct.id == batch_product_id)
+            .one_or_none()
+        )
+        if not batch_product:
+            logger.error("Batch product missing | id=%s", batch_product_id)
             return
 
+        if batch_product.status != BatchProductStatus.PROCESSING:
+            logger.warning(
+                "Skip batch product — not processing | id=%s status=%s",
+                batch_product.id,
+                batch_product.status,
+            )
+            return
+
+        images = sorted(batch_product.images, key=lambda i: i.created_at)
+        product_failed = False
+        for image in images:
+            if image.status in (BatchImageStatus.COMPLETED, BatchImageStatus.FAILED):
+                if image.status == BatchImageStatus.FAILED:
+                    product_failed = True
+                continue
+            success = self._process_single_batch_image(image, batch_product, worker_id=worker_id)
+            if not success:
+                product_failed = True
+                break
+
+        batch_service = self._primary_batch_service(batch_product.shop_id)
+        if product_failed:
+            any_retrying = any(i.status == BatchImageStatus.RETRYING for i in batch_product.images)
+            if not any_retrying:
+                assert_transition(
+                    "batch_product",
+                    BATCH_PRODUCT_TRANSITIONS,
+                    batch_product.status,
+                    BatchProductStatus.FAILED,
+                )
+                batch_product.status = BatchProductStatus.FAILED
+                batch_product.completed_at = datetime.now(timezone.utc)
+                batch_product.locked_by = None
+                batch_product.locked_at = None
+        else:
+            all_complete = all(i.status == BatchImageStatus.COMPLETED for i in batch_product.images)
+            if all_complete:
+                assert_transition(
+                    "batch_product",
+                    BATCH_PRODUCT_TRANSITIONS,
+                    batch_product.status,
+                    BatchProductStatus.COMPLETED,
+                )
+                batch_product.status = BatchProductStatus.COMPLETED
+                batch_product.completed_at = datetime.now(timezone.utc)
+                batch_product.locked_by = None
+                batch_product.locked_at = None
+                batch_product.error_code = None
+                batch_product.error_message = None
+                self._advance_baseline_on_success(batch_product)
+
+        batch = batch_service.get_batch(batch_product.batch_id)
+        if batch:
+            batch_service.refresh_batch_counters(batch)
+        self.db.commit()
+
+    def process_batch_image(self, batch_image_id: UUID, *, worker_id: str) -> None:
+        image = self.db.get(BatchImage, batch_image_id)
+        if not image:
+            logger.error("Batch image missing | id=%s", batch_image_id)
+            return
+        batch_product = self.db.get(BatchProduct, image.batch_product_id)
+        if not batch_product:
+            logger.error("Batch product missing for image | image=%s", batch_image_id)
+            return
+        self._process_single_batch_image(image, batch_product, worker_id=worker_id)
+        batch_service = self._primary_batch_service(batch_product.shop_id)
+        batch = batch_service.get_batch(batch_product.batch_id)
+        if batch:
+            batch_service.refresh_batch_counters(batch)
+        self.db.commit()
+
+    def _process_single_batch_image(
+        self,
+        image: BatchImage,
+        batch_product: BatchProduct,
+        *,
+        worker_id: str,
+    ) -> bool:
         now = datetime.now(timezone.utc)
-        try:
-            assert_transition(item.status, QueueItemStatus.PROCESSING)
-        except ValueError:
-            logger.warning("Skip item — invalid start state | item_id=%s status=%s", item.id, item.status)
-            return
+        if image.status not in (
+            BatchImageStatus.QUEUED,
+            BatchImageStatus.RETRYING,
+        ):
+            return image.status == BatchImageStatus.COMPLETED
 
-        item.status = QueueItemStatus.PROCESSING
-        item.attempt_count += 1
-        item.processing_started_at = now
-        item.locked_by = worker_id
-        item.locked_at = now
-        item.error_code = None
-        item.error_message = None
+        target = BatchImageStatus.DOWNLOADING
+        assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, target)
+        image.status = target
+        image.attempt_count += 1
+        image.started_at = image.started_at or now
+        image.error_code = None
+        image.error_message = None
 
         attempt = ProcessingAttempt(
-            queue_item_id=item.id,
-            batch_id=item.batch_id,
-            attempt_number=item.attempt_count,
+            batch_image_id=image.id,
+            batch_product_id=batch_product.id,
+            attempt_number=image.attempt_count,
             status=AttemptStatus.STARTED,
             provider="openai",
-            shopify_source_url=item.shopify_cdn_url,
+            shopify_source_url=image.cdn_url,
             started_at=now,
         )
         self.db.add(attempt)
         self.db.commit()
-        self.db.refresh(item)
+        self.db.refresh(image)
         self.db.refresh(attempt)
 
-        if item.batch_id:
-            self.batch_service.refresh_batch_summary(item.batch_id)
-
         temp_path: Path | None = None
+        started_perf = time.perf_counter()
         try:
-            temp_path = download_shopify_cdn_to_temp(item.shopify_cdn_url)
+            temp_path = download_shopify_cdn_to_temp(image.cdn_url)
+            assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.PROCESSING)
+            image.status = BatchImageStatus.PROCESSING
+            self.db.commit()
+
             input_bytes = temp_path.read_bytes()
-            prompts = _default_prompts(item.prompt_data)
+            prompts = _prompts_from_snapshot(batch_product.prompt_snapshot_json)
             client = self._client()
             current = input_bytes
             for index, prompt in enumerate(prompts, start=1):
+                image.current_prompt_step = index
                 current = client.edit_image(
                     image_bytes=current,
                     prompt=prompt,
-                    job_id=str(item.id),
+                    job_id=str(image.id),
                     step=index,
                 )
                 if not current:
                     raise ProcessingError("AI provider returned empty output", code="EMPTY_OUTPUT", retryable=True)
 
-            key = f"{item.shop_id}/{item.id}/output.png"
+            key = f"{batch_product.shop_id}/{batch_product.batch_id}/{image.id}/output.png"
             output_ref = self.storage.save_bytes(key=key, data=current, content_type="image/png")
             checksum = checksum_sha256(current)
 
-            item.status = QueueItemStatus.COMPLETED
-            item.output_storage_key = key
-            item.output_url = output_ref
-            item.output_mime_type = "image/png"
-            item.output_checksum = checksum
-            item.processing_completed_at = datetime.now(timezone.utc)
-            item.locked_by = None
-            item.locked_at = None
-            item.error_code = None
-            item.error_message = None
+            assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.COMPLETED)
+            image.status = BatchImageStatus.COMPLETED
+            image.output_storage_key = key
+            image.output_url = output_ref
+            image.output_mime_type = "image/png"
+            image.output_checksum = checksum
+            image.completed_at = datetime.now(timezone.utc)
 
             attempt.status = AttemptStatus.COMPLETED
             attempt.output_storage_key = key
+            attempt.duration_ms = (time.perf_counter() - started_perf) * 1000
             attempt.completed_at = datetime.now(timezone.utc)
             self.db.commit()
-
             logger.info(
-                "Item completed | item_id=%s batch_id=%s attempt=%s output_key=%s",
-                item.id,
-                item.batch_id,
-                item.attempt_count,
-                key,
+                "Batch image completed | image=%s product=%s attempt=%s",
+                image.id,
+                batch_product.id,
+                image.attempt_count,
             )
+            return True
         except Exception as exc:
             retryable = False
             code = "PROCESSING_ERROR"
@@ -245,24 +347,33 @@ class ImageProcessor:
                 code = "AI_PROVIDER_ERROR"
                 message = "AI image processing failed. Please retry later."
                 logger.exception(
-                    "AI provider failure | item_id=%s attempt=%s",
-                    item.id,
-                    item.attempt_count,
+                    "AI provider failure | image=%s attempt=%s",
+                    image.id,
+                    image.attempt_count,
                 )
             else:
-                logger.exception("Unexpected processing failure | item_id=%s", item.id)
+                logger.exception("Unexpected processing failure | image=%s", image.id)
                 retryable = True
                 message = "Unexpected processing error"
 
             attempt.status = AttemptStatus.FAILED
             attempt.error_code = code
             attempt.error_message = message
+            attempt.duration_ms = (time.perf_counter() - started_perf) * 1000
             attempt.completed_at = datetime.now(timezone.utc)
-            # Ensure item is PROCESSING for retry transitions
-            if item.status != QueueItemStatus.PROCESSING:
-                item.status = QueueItemStatus.PROCESSING
-            self.retry_service.schedule_retry(item, error_code=code, error_message=message, retryable=retryable)
+
+            if image.status != BatchImageStatus.PROCESSING:
+                image.status = BatchImageStatus.PROCESSING
+
+            self.retry_service.schedule_image_retry(
+                image,
+                batch_product,
+                error_code=code,
+                error_message=message,
+                retryable=retryable,
+            )
             self.db.commit()
+            return False
         finally:
             if temp_path is not None:
                 try:
@@ -270,5 +381,48 @@ class ImageProcessor:
                 except OSError:
                     logger.warning("Failed to delete temp CDN file | path=%s", temp_path)
 
-        if item.batch_id:
-            self.batch_service.refresh_batch_summary(item.batch_id)
+    def _advance_baseline_on_success(self, batch_product: BatchProduct) -> None:
+        if not batch_product.product_id:
+            return
+        product = self.db.get(Product, batch_product.product_id)
+        if not product:
+            return
+
+        baseline = (
+            self.db.query(ProcessingBaseline)
+            .filter(
+                ProcessingBaseline.shop_id == batch_product.shop_id,
+                ProcessingBaseline.product_id == product.id,
+            )
+            .one_or_none()
+        )
+        now = datetime.now(timezone.utc)
+        product_snapshot = batch_product.product_snapshot_json or {}
+        media_snapshot = []
+        for image in batch_product.images:
+            if image.status != BatchImageStatus.COMPLETED:
+                continue
+            media_snapshot.append(
+                {
+                    "media_gid": image.shopify_media_gid,
+                    "file_gid": image.shopify_file_gid,
+                    "cdn_url": image.cdn_url,
+                    "filename": image.original_filename,
+                    "width": image.width,
+                    "height": image.height,
+                    "mime_type": image.mime_type,
+                    "fingerprint": image.source_fingerprint,
+                }
+            )
+
+        if baseline is None:
+            baseline = ProcessingBaseline(
+                shop_id=batch_product.shop_id,
+                product_id=product.id,
+            )
+            self.db.add(baseline)
+
+        baseline.product_snapshot_json = product_snapshot
+        baseline.media_snapshot_json = media_snapshot
+        baseline.successfully_processed_at = now
+        baseline.evaluated_at = now

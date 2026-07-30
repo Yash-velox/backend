@@ -13,10 +13,13 @@ class Settings(BaseSettings):
     )
 
     app_env: str = "dev"
+    # Legacy placeholders retained for compatibility; prefer canonical names below.
     app_secret: str = "change-me"
     app_secret_key: str = "change-me"
     shopify_api_secret: str = ""
     shopify_api_key: str = ""
+    internal_handoff_secret: str = ""
+    token_encryption_key: str = ""
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     host: str = "0.0.0.0"
     port: int = 8080
@@ -43,10 +46,17 @@ class Settings(BaseSettings):
     processing_worker_id: str = ""
     processing_output_directory: str = "storage/processed"
 
+    # Week 2 Auto Sync caps (server-side upper bounds; per-shop settings live in DB)
+    max_products_per_batch_cap: int = 50
+    batch_interval_minutes_cap: int = 1440
+    default_max_products_per_batch: int = 10
+    default_batch_interval_minutes: int = 15
+    manual_batch_product_limit: int = 50
+
     shopify_image_download_timeout_seconds: int = 60
     shopify_image_max_download_mb: int = 30
     shopify_api_version: str = "2026-07"
-    # Dev-only fallback when shop.access_token is empty. Never used when APP_ENV != dev.
+    # Dev-only fallback when shop encrypted token is empty. Never used when APP_ENV != dev.
     shopify_dev_access_token: str = ""
 
     @property
@@ -56,6 +66,14 @@ class Settings(BaseSettings):
     @property
     def effective_worker_id(self) -> str:
         return self.processing_worker_id.strip() or f"worker_{uuid.uuid4().hex[:12]}"
+
+    @property
+    def effective_handoff_secret(self) -> str:
+        return self.internal_handoff_secret or self.app_secret
+
+    @property
+    def effective_token_encryption_key(self) -> str:
+        return self.token_encryption_key or self.app_secret_key
 
 
 settings = Settings()
