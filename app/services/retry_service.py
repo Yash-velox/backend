@@ -4,11 +4,21 @@ import logging
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
-from app.models import AttemptStatus, ProcessingAttempt, ProcessingQueueItem, QueueItemStatus
-from app.services.batch_service import BatchService, assert_transition
+from app.models import (
+    AttemptStatus,
+    BatchImage,
+    BatchImageStatus,
+    BatchProduct,
+    BatchProductStatus,
+    ProcessingAttempt,
+    ProcessingBatch,
+    Shop,
+)
+from app.services.primary_batch import PrimaryBatchService
+from app.services.state_machine import BATCH_IMAGE_TRANSITIONS, BATCH_PRODUCT_TRANSITIONS, assert_transition
 
 logger = logging.getLogger("app.services.retry")
 
@@ -16,135 +26,245 @@ logger = logging.getLogger("app.services.retry")
 class RetryService:
     def __init__(self, db: Session) -> None:
         self.db = db
-        self.batch_service = BatchService(db)
 
-    def schedule_retry(
+    def _primary_for_shop(self, shop_id: UUID) -> PrimaryBatchService | None:
+        shop = self.db.get(Shop, shop_id)
+        if shop is None:
+            return None
+        return PrimaryBatchService(self.db, shop)
+
+    def schedule_image_retry(
         self,
-        item: ProcessingQueueItem,
+        image: BatchImage,
+        batch_product: BatchProduct,
         *,
         error_code: str,
         error_message: str,
         retryable: bool,
-    ) -> QueueItemStatus:
-        now = datetime.now(timezone.utc)
-        if retryable and item.attempt_count < item.max_attempts:
-            delay = settings.processing_retry_delay_seconds * (2 ** max(item.attempt_count - 1, 0))
+    ) -> BatchImageStatus:
+        max_attempts = settings.processing_max_attempts
+        if retryable and image.attempt_count < max_attempts:
+            delay = settings.processing_retry_delay_seconds * (2 ** max(image.attempt_count - 1, 0))
             delay = min(delay, settings.processing_retry_delay_seconds * 16)
-            assert_transition(item.status, QueueItemStatus.RETRY_PENDING)
-            item.status = QueueItemStatus.RETRY_PENDING
-            item.next_retry_at = now + timedelta(seconds=delay)
-            item.error_code = error_code
-            item.error_message = error_message
-            item.locked_by = None
-            item.locked_at = None
-            logger.info(
-                "Retry scheduled | item_id=%s attempt=%s next_retry_at=%s",
-                item.id,
-                item.attempt_count,
-                item.next_retry_at.isoformat(),
+            assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.RETRYING)
+            image.status = BatchImageStatus.RETRYING
+            image.error_code = error_code
+            image.error_message = error_message
+            batch_product.retry_count += 1
+            assert_transition(
+                "batch_product",
+                BATCH_PRODUCT_TRANSITIONS,
+                batch_product.status,
+                BatchProductStatus.RETRYING,
             )
-            return QueueItemStatus.RETRY_PENDING
+            batch_product.status = BatchProductStatus.RETRYING
+            batch_product.next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            batch_product.error_code = error_code
+            batch_product.error_message = error_message
+            batch_product.locked_by = None
+            batch_product.locked_at = None
+            logger.info(
+                "Image retry scheduled | image=%s attempt=%s next_retry=%s",
+                image.id,
+                image.attempt_count,
+                batch_product.next_retry_at.isoformat(),
+            )
+            return BatchImageStatus.RETRYING
 
-        assert_transition(item.status, QueueItemStatus.FAILED)
-        item.status = QueueItemStatus.FAILED
-        item.error_code = error_code
-        item.error_message = error_message
-        item.next_retry_at = None
-        item.locked_by = None
-        item.locked_at = None
-        item.processing_completed_at = now
+        assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.FAILED)
+        image.status = BatchImageStatus.FAILED
+        image.error_code = error_code
+        image.error_message = error_message
+        image.completed_at = datetime.now(timezone.utc)
         logger.info(
-            "Permanent failure | item_id=%s attempt=%s code=%s",
-            item.id,
-            item.attempt_count,
+            "Image permanent failure | image=%s attempt=%s code=%s",
+            image.id,
+            image.attempt_count,
             error_code,
         )
-        return QueueItemStatus.FAILED
+        return BatchImageStatus.FAILED
 
-    def manual_retry_items(
+    def schedule_product_retry(
         self,
+        batch_product: BatchProduct,
         *,
-        shop_id: UUID,
-        item_ids: list[UUID] | None = None,
-        all_failed: bool = False,
-    ) -> list[ProcessingQueueItem]:
-        q = self.db.query(ProcessingQueueItem).filter(
-            ProcessingQueueItem.shop_id == shop_id,
-            ProcessingQueueItem.status == QueueItemStatus.FAILED,
+        error_code: str,
+        error_message: str,
+        retryable: bool,
+    ) -> BatchProductStatus:
+        max_attempts = settings.processing_max_attempts
+        if retryable and batch_product.retry_count < max_attempts:
+            delay = settings.processing_retry_delay_seconds * (2 ** max(batch_product.retry_count, 0))
+            delay = min(delay, settings.processing_retry_delay_seconds * 16)
+            assert_transition(
+                "batch_product",
+                BATCH_PRODUCT_TRANSITIONS,
+                batch_product.status,
+                BatchProductStatus.RETRYING,
+            )
+            batch_product.status = BatchProductStatus.RETRYING
+            batch_product.retry_count += 1
+            batch_product.next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            batch_product.error_code = error_code
+            batch_product.error_message = error_message
+            batch_product.locked_by = None
+            batch_product.locked_at = None
+            return BatchProductStatus.RETRYING
+
+        assert_transition(
+            "batch_product",
+            BATCH_PRODUCT_TRANSITIONS,
+            batch_product.status,
+            BatchProductStatus.FAILED,
         )
-        if item_ids is not None:
-            q = q.filter(ProcessingQueueItem.id.in_(item_ids))
-        elif not all_failed:
-            return []
+        batch_product.status = BatchProductStatus.FAILED
+        batch_product.error_code = error_code
+        batch_product.error_message = error_message
+        batch_product.completed_at = datetime.now(timezone.utc)
+        batch_product.locked_by = None
+        batch_product.locked_at = None
+        return BatchProductStatus.FAILED
 
-        items = q.all()
-        now = datetime.now(timezone.utc)
-        for item in items:
-            assert_transition(item.status, QueueItemStatus.RETRY_PENDING)
-            item.status = QueueItemStatus.RETRY_PENDING
-            item.next_retry_at = now
-            item.batch_id = None
-            item.error_code = None
-            item.error_message = None
-            item.locked_by = None
-            item.locked_at = None
-            logger.info("Manual retry | item_id=%s shop_id=%s", item.id, shop_id)
-
-        self.db.commit()
-        for item in items:
-            self.db.refresh(item)
-        return items
-
-    def recover_stale_items(self, *, worker_id: str) -> int:
+    def recover_stale_batch_products(self, *, worker_id: str) -> int:
         threshold = datetime.now(timezone.utc) - timedelta(seconds=settings.processing_stale_lock_seconds)
         stale = (
-            self.db.query(ProcessingQueueItem)
+            self.db.query(BatchProduct)
+            .options(selectinload(BatchProduct.images))
             .filter(
-                ProcessingQueueItem.status.in_([QueueItemStatus.QUEUED, QueueItemStatus.PROCESSING]),
-                ProcessingQueueItem.locked_at.is_not(None),
-                ProcessingQueueItem.locked_at < threshold,
+                BatchProduct.status.in_([BatchProductStatus.PROCESSING, BatchProductStatus.RETRYING]),
+                BatchProduct.locked_at.is_not(None),
+                BatchProduct.locked_at < threshold,
             )
             .all()
         )
         recovered = 0
         batch_ids: set[UUID] = set()
         now = datetime.now(timezone.utc)
-        for item in stale:
-            attempt = ProcessingAttempt(
-                queue_item_id=item.id,
-                batch_id=item.batch_id,
-                attempt_number=max(item.attempt_count, 1),
-                status=AttemptStatus.INTERRUPTED,
-                provider="system",
-                shopify_source_url=item.shopify_cdn_url,
-                error_code="STALE_LOCK",
-                error_message="Previous worker did not finish before the stale lock timeout.",
-                started_at=item.processing_started_at or item.locked_at or now,
-                completed_at=now,
-            )
-            self.db.add(attempt)
 
-            # Ensure status is PROCESSING for transition rules when recovering QUEUED.
-            if item.status == QueueItemStatus.QUEUED:
-                item.status = QueueItemStatus.PROCESSING
+        for batch_product in stale:
+            for image in batch_product.images:
+                if image.status in (BatchImageStatus.DOWNLOADING, BatchImageStatus.PROCESSING):
+                    attempt = ProcessingAttempt(
+                        batch_image_id=image.id,
+                        batch_product_id=batch_product.id,
+                        attempt_number=max(image.attempt_count, 1),
+                        status=AttemptStatus.INTERRUPTED,
+                        provider="system",
+                        shopify_source_url=image.cdn_url,
+                        error_code="STALE_LOCK",
+                        error_message="Previous worker did not finish before the stale lock timeout.",
+                        started_at=image.started_at or batch_product.locked_at or now,
+                        completed_at=now,
+                    )
+                    self.db.add(attempt)
+                    if image.status != BatchImageStatus.PROCESSING:
+                        image.status = BatchImageStatus.PROCESSING
+                    self.schedule_image_retry(
+                        image,
+                        batch_product,
+                        error_code="STALE_LOCK",
+                        error_message="Recovered stale processing lock after worker interruption.",
+                        retryable=True,
+                    )
 
-            self.schedule_retry(
-                item,
-                error_code="STALE_LOCK",
-                error_message="Recovered stale processing lock after worker interruption.",
-                retryable=True,
-            )
-            if item.batch_id:
-                batch_ids.add(item.batch_id)
+            if batch_product.status == BatchProductStatus.PROCESSING:
+                self.schedule_product_retry(
+                    batch_product,
+                    error_code="STALE_LOCK",
+                    error_message="Recovered stale product lock after worker interruption.",
+                    retryable=True,
+                )
+
+            batch_ids.add(batch_product.batch_id)
             recovered += 1
             logger.warning(
-                "Stale item recovered | item_id=%s previous_worker=%s recovery_worker=%s",
-                item.id,
-                item.locked_by,
+                "Stale batch product recovered | product=%s previous_worker=%s recovery_worker=%s",
+                batch_product.id,
+                batch_product.locked_by,
                 worker_id,
             )
 
         self.db.commit()
         for batch_id in batch_ids:
-            self.batch_service.refresh_batch_summary(batch_id)
+            batch = self.db.get(ProcessingBatch, batch_id)
+            if batch:
+                svc = self._primary_for_shop(batch.shop_id)
+                if svc:
+                    svc.refresh_batch_counters(batch)
+                    self.db.commit()
         return recovered
+
+    def manual_retry_failed_products(
+        self,
+        *,
+        shop_id: UUID,
+        batch_id: UUID | None = None,
+        product_ids: list[UUID] | None = None,
+    ) -> list[BatchProduct]:
+        q = self.db.query(BatchProduct).filter(
+            BatchProduct.shop_id == shop_id,
+            BatchProduct.status == BatchProductStatus.FAILED,
+        )
+        if batch_id is not None:
+            q = q.filter(BatchProduct.batch_id == batch_id)
+        if product_ids is not None:
+            q = q.filter(BatchProduct.id.in_(product_ids))
+        elif batch_id is None:
+            return []
+
+        products = q.all()
+        now = datetime.now(timezone.utc)
+        batch_ids: set[UUID] = set()
+
+        for batch_product in products:
+            assert_transition(
+                "batch_product",
+                BATCH_PRODUCT_TRANSITIONS,
+                batch_product.status,
+                BatchProductStatus.QUEUED,
+            )
+            batch_product.status = BatchProductStatus.QUEUED
+            batch_product.next_retry_at = now
+            batch_product.error_code = None
+            batch_product.error_message = None
+            batch_product.locked_by = None
+            batch_product.locked_at = None
+            batch_product.completed_at = None
+
+            images = (
+                self.db.query(BatchImage)
+                .filter(BatchImage.batch_product_id == batch_product.id)
+                .all()
+            )
+            for image in images:
+                if image.status != BatchImageStatus.FAILED:
+                    continue
+                assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.QUEUED)
+                image.status = BatchImageStatus.QUEUED
+                image.current_prompt_step = 0
+                image.error_code = None
+                image.error_message = None
+                image.completed_at = None
+                image.output_storage_key = None
+                image.output_url = None
+
+            batch_ids.add(batch_product.batch_id)
+            logger.info(
+                "Manual product retry | product=%s shop=%s batch=%s",
+                batch_product.id,
+                shop_id,
+                batch_product.batch_id,
+            )
+
+        self.db.commit()
+        for bid in batch_ids:
+            batch = self.db.get(ProcessingBatch, bid)
+            if batch:
+                svc = self._primary_for_shop(batch.shop_id)
+                if svc:
+                    svc.refresh_batch_counters(batch)
+                    self.db.commit()
+
+        for batch_product in products:
+            self.db.refresh(batch_product)
+        return products

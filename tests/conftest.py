@@ -13,6 +13,7 @@ from app.config import settings
 from app.core.deps import get_current_shop, get_db
 from app.db.base import Base
 from app.main import app
+from app.core.crypto import encrypt_token
 from app.models import Shop
 from app.poc.auth import require_shopify_jwt
 
@@ -53,7 +54,10 @@ def db_session(SessionLocal) -> Generator[Session, None, None]:
 
 @pytest.fixture()
 def shop(db_session: Session) -> Shop:
-    row = Shop(shop_domain="test-shop.myshopify.com", access_token="shpat_test")
+    row = Shop(
+        shop_domain="test-shop.myshopify.com",
+        encrypted_access_token=encrypt_token("shpat_test"),
+    )
     db_session.add(row)
     db_session.commit()
     db_session.refresh(row)
