@@ -286,6 +286,23 @@ class ProductPublisher:
             op.last_error_code = None
             op.last_error_message = None
             product.publish_status = PublishStatus.PUBLISHED
+
+            try:
+                from app.services.media_versions import MediaVersionsService
+
+                MediaVersionsService(self.db, self.shop).record_publish_success(
+                    batch_product=product,
+                    publish_op=op,
+                    pre_publish_snapshot=original_snapshot,
+                    final_snapshot=final,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to record media versions after publish | op=%s product=%s",
+                    op.id,
+                    op.shopify_product_gid,
+                )
+
             self.db.commit()
             logger.info(
                 "Publish succeeded | op=%s product=%s files=%s",

@@ -24,8 +24,11 @@ from app.models import (
     ShopSettings,
 )
 from app.services.output_storage import checksum_sha256, get_output_storage
-from app.services.shopify_file_upload import sanitize_png_filename, validate_png_file
-
+from app.services.shopify_file_upload import (
+    PublishUploadError,
+    sanitize_png_filename,
+    validate_png_file,
+)
 logger = logging.getLogger("app.services.publish_trigger")
 
 TERMINAL_BATCH_STATUSES = {
@@ -137,7 +140,10 @@ def validate_publishable_outputs(db: Session, batch_product: BatchProduct) -> tu
         if not image.output_storage_key:
             raise PublishEnqueueError("PUBLISH_OUTPUT_MISSING", f"Missing output for media {image.shopify_media_gid}")
         path = storage.resolve_path(image.output_storage_key)
-        size, data = validate_png_file(path)
+        try:
+            size, data = validate_png_file(path)
+        except PublishUploadError as exc:
+            raise PublishEnqueueError(exc.code, str(exc)) from exc
         digest = checksum_sha256(data)
         hashes.append(digest)
         meta = media_meta.get(image.shopify_media_gid) or {}
@@ -392,6 +398,17 @@ class PublishTriggerService:
         )
         if active:
             raise PublishEnqueueError("PUBLISH_ALREADY_QUEUED", "Another publish operation is active for this product")
+
+        from app.services.media_versions import product_has_active_media_op
+
+        media_lock = product_has_active_media_op(
+            self.db, shop_id=self.shop.id, shopify_product_gid=product.shopify_product_gid
+        )
+        if media_lock == "ROLLBACK_ALREADY_ACTIVE":
+            raise PublishEnqueueError(
+                "ROLLBACK_ALREADY_ACTIVE",
+                "A rollback is already active for this product",
+            )
 
         now = datetime.now(timezone.utc)
         op = ProductPublishOperation(

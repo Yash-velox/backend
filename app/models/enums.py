@@ -116,6 +116,21 @@ class PublishTriggerSource(str, enum.Enum):
     RETRY = "RETRY"
 
 
+class MediaVersionType(str, enum.Enum):
+    ORIGINAL = "ORIGINAL"
+    PUBLISHED = "PUBLISHED"
+    ROLLBACK = "ROLLBACK"
+
+
+class RollbackStatus(str, enum.Enum):
+    QUEUED = "QUEUED"
+    ROLLING_BACK = "ROLLING_BACK"
+    ROLLED_BACK = "ROLLED_BACK"
+    ROLLBACK_FAILED = "ROLLBACK_FAILED"
+    ROLLBACK_CONFLICT = "ROLLBACK_CONFLICT"
+    RESTORE_FAILED = "RESTORE_FAILED"
+
+
 # Legacy enums kept for old queue compatibility during transition tests
 class SourceType(str, enum.Enum):
     SHOPIFY_PRODUCT_MEDIA = "SHOPIFY_PRODUCT_MEDIA"

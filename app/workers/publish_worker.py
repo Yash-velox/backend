@@ -1,4 +1,4 @@
-"""Database-backed Shopify publish worker."""
+"""Database-backed Shopify publish + rollback media worker."""
 
 from __future__ import annotations
 
@@ -7,12 +7,20 @@ import logging
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import or_, select
 
 from app.config import settings
 from app.db.session import SessionLocal
-from app.models import ProductPublishOperation, PublishStatus, Shop, ShopStatus
+from app.models import (
+    ProductPublishOperation,
+    ProductRollbackOperation,
+    PublishStatus,
+    RollbackStatus,
+    Shop,
+    ShopStatus,
+)
 from app.services.product_publisher import ProductPublisher
+from app.services.product_rollback import ProductRollbackService
 from app.services.publish_trigger import PublishTriggerService
 
 logger = logging.getLogger("app.workers.publish")
@@ -88,30 +96,31 @@ class PublishWorker:
     async def _process_available_work(self) -> None:
         concurrency = max(1, settings.publish_product_concurrency)
         while not self._stop.is_set():
-            op_ids = await asyncio.to_thread(self._claim_batch, concurrency)
-            if not op_ids:
+            work = await asyncio.to_thread(self._claim_batch, concurrency)
+            if not work:
                 return
-            await asyncio.gather(*(asyncio.to_thread(self._run_one, op_id) for op_id in op_ids))
+            await asyncio.gather(*(asyncio.to_thread(self._run_claimed, kind, op_id) for kind, op_id in work))
 
-    def _claim_batch(self, limit: int) -> list[UUID]:
+    def _claim_batch(self, limit: int) -> list[tuple[str, UUID]]:
         db = SessionLocal()
         try:
             dialect = db.bind.dialect.name if db.bind is not None else ""
-            stmt = (
+            claimed: list[tuple[str, UUID]] = []
+            now = datetime.now(timezone.utc)
+
+            # Prefer publishing first, then rollback, within the concurrency budget.
+            pub_stmt = (
                 select(ProductPublishOperation)
                 .where(ProductPublishOperation.status == PublishStatus.QUEUED)
                 .order_by(ProductPublishOperation.queued_at.asc())
                 .limit(limit)
             )
             if dialect == "postgresql":
-                stmt = stmt.with_for_update(skip_locked=True)
+                pub_stmt = pub_stmt.with_for_update(skip_locked=True)
             else:
-                stmt = stmt.with_for_update()
-            rows = list(db.execute(stmt).scalars().all())
-            now = datetime.now(timezone.utc)
-            ids: list[UUID] = []
-            for op in rows:
-                # Skip if another active op exists for same product gid (different output set)
+                pub_stmt = pub_stmt.with_for_update()
+            pubs = list(db.execute(pub_stmt).scalars().all())
+            for op in pubs:
                 sibling = (
                     db.query(ProductPublishOperation)
                     .filter(
@@ -122,7 +131,18 @@ class PublishWorker:
                     )
                     .first()
                 )
-                if sibling:
+                rb_active = (
+                    db.query(ProductRollbackOperation)
+                    .filter(
+                        ProductRollbackOperation.shop_id == op.shop_id,
+                        ProductRollbackOperation.shopify_product_gid == op.shopify_product_gid,
+                        ProductRollbackOperation.status.in_(
+                            [RollbackStatus.QUEUED, RollbackStatus.ROLLING_BACK]
+                        ),
+                    )
+                    .first()
+                )
+                if sibling or rb_active:
                     continue
                 op.status = PublishStatus.PUBLISHING
                 op.current_stage = "CLAIMED"
@@ -130,13 +150,67 @@ class PublishWorker:
                 op.locked_at = now
                 if op.started_at is None:
                     op.started_at = now
-                ids.append(op.id)
+                claimed.append(("publish", op.id))
+                if len(claimed) >= limit:
+                    break
+
+            remaining = limit - len(claimed)
+            if remaining > 0:
+                rb_stmt = (
+                    select(ProductRollbackOperation)
+                    .where(ProductRollbackOperation.status == RollbackStatus.QUEUED)
+                    .order_by(ProductRollbackOperation.queued_at.asc())
+                    .limit(remaining)
+                )
+                if dialect == "postgresql":
+                    rb_stmt = rb_stmt.with_for_update(skip_locked=True)
+                else:
+                    rb_stmt = rb_stmt.with_for_update()
+                rbs = list(db.execute(rb_stmt).scalars().all())
+                for op in rbs:
+                    pub_active = (
+                        db.query(ProductPublishOperation)
+                        .filter(
+                            ProductPublishOperation.shop_id == op.shop_id,
+                            ProductPublishOperation.shopify_product_gid == op.shopify_product_gid,
+                            ProductPublishOperation.status.in_(
+                                [PublishStatus.QUEUED, PublishStatus.PUBLISHING]
+                            ),
+                        )
+                        .first()
+                    )
+                    sibling = (
+                        db.query(ProductRollbackOperation)
+                        .filter(
+                            ProductRollbackOperation.shop_id == op.shop_id,
+                            ProductRollbackOperation.shopify_product_gid == op.shopify_product_gid,
+                            ProductRollbackOperation.status == RollbackStatus.ROLLING_BACK,
+                            ProductRollbackOperation.id != op.id,
+                        )
+                        .first()
+                    )
+                    if pub_active or sibling:
+                        continue
+                    op.status = RollbackStatus.ROLLING_BACK
+                    op.current_stage = "CLAIMED"
+                    op.locked_by = self.worker_id
+                    op.locked_at = now
+                    if op.started_at is None:
+                        op.started_at = now
+                    claimed.append(("rollback", op.id))
+
             db.commit()
-            return ids
+            return claimed
         finally:
             db.close()
 
-    def _run_one(self, operation_id: UUID) -> None:
+    def _run_claimed(self, kind: str, operation_id: UUID) -> None:
+        if kind == "publish":
+            self._run_publish(operation_id)
+        else:
+            self._run_rollback(operation_id)
+
+    def _run_publish(self, operation_id: UUID) -> None:
         db = SessionLocal()
         try:
             op = db.query(ProductPublishOperation).filter(ProductPublishOperation.id == operation_id).one_or_none()
@@ -173,11 +247,56 @@ class PublishWorker:
         finally:
             db.close()
 
+    def _run_rollback(self, operation_id: UUID) -> None:
+        db = SessionLocal()
+        try:
+            op = (
+                db.query(ProductRollbackOperation)
+                .filter(ProductRollbackOperation.id == operation_id)
+                .one_or_none()
+            )
+            if not op:
+                return
+            shop = db.query(Shop).filter(Shop.id == op.shop_id, Shop.status == ShopStatus.ACTIVE).one_or_none()
+            if not shop:
+                op.status = RollbackStatus.ROLLBACK_FAILED
+                op.last_error_code = "ROLLBACK_FAILED"
+                op.last_error_message = "Shop inactive or missing"
+                op.completed_at = datetime.now(timezone.utc)
+                db.commit()
+                return
+            logger.info(
+                "Rollback starting | op=%s shop=%s product=%s target=%s",
+                op.id,
+                shop.id,
+                op.shopify_product_gid,
+                op.target_version_id,
+            )
+            ProductRollbackService(db, shop).run(op.id)
+        except Exception:
+            logger.exception("Rollback run failed | op=%s", operation_id)
+            try:
+                op = (
+                    db.query(ProductRollbackOperation)
+                    .filter(ProductRollbackOperation.id == operation_id)
+                    .one_or_none()
+                )
+                if op and op.status == RollbackStatus.ROLLING_BACK:
+                    op.status = RollbackStatus.ROLLBACK_FAILED
+                    op.last_error_code = "ROLLBACK_FAILED"
+                    op.last_error_message = "Unexpected rollback worker failure"
+                    op.completed_at = datetime.now(timezone.utc)
+                    db.commit()
+            except Exception:
+                logger.exception("Failed to mark rollback op failed | op=%s", operation_id)
+        finally:
+            db.close()
+
     def _recover_stale(self) -> None:
         db = SessionLocal()
         try:
             cutoff = datetime.now(timezone.utc) - timedelta(seconds=settings.publish_stale_lock_seconds)
-            stale = (
+            stale_pub = (
                 db.query(ProductPublishOperation)
                 .filter(
                     ProductPublishOperation.status == PublishStatus.PUBLISHING,
@@ -188,19 +307,37 @@ class PublishWorker:
                 )
                 .all()
             )
-            for op in stale:
+            for op in stale_pub:
                 logger.warning("Requeueing stale publish op | op=%s locked_at=%s", op.id, op.locked_at)
                 op.status = PublishStatus.QUEUED
                 op.current_stage = "QUEUED"
                 op.locked_by = None
                 op.locked_at = None
                 op.queued_at = datetime.now(timezone.utc)
+
+            stale_rb = (
+                db.query(ProductRollbackOperation)
+                .filter(
+                    ProductRollbackOperation.status == RollbackStatus.ROLLING_BACK,
+                    or_(
+                        ProductRollbackOperation.locked_at.is_(None),
+                        ProductRollbackOperation.locked_at < cutoff,
+                    ),
+                )
+                .all()
+            )
+            for op in stale_rb:
+                logger.warning("Requeueing stale rollback op | op=%s locked_at=%s", op.id, op.locked_at)
+                op.status = RollbackStatus.QUEUED
+                op.current_stage = "QUEUED"
+                op.locked_by = None
+                op.locked_at = None
+                op.queued_at = datetime.now(timezone.utc)
+
             db.commit()
 
-            # Soft recovery: ensure terminal batches with auto-publish get triggered
             shops = db.query(Shop).filter(Shop.status == ShopStatus.ACTIVE).all()
             for shop in shops:
-                # no-op scan placeholder — enqueue is driven from primary_batch terminal hook
                 _ = PublishTriggerService(db, shop)
         finally:
             db.close()

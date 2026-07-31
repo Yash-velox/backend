@@ -16,6 +16,7 @@ from app.api.publishing import router as publishing_router
 from app.api.secondary_queue import router as secondary_queue_router
 from app.api.settings import router as settings_router
 from app.api.sync import router as sync_router
+from app.api.versions import router as versions_router
 from app.config import settings
 from app.core.deps import CurrentShop
 from app.logging_setup import setup_logging
@@ -125,5 +126,6 @@ app.include_router(settings_router)
 app.include_router(secondary_queue_router)
 app.include_router(batches_router)
 app.include_router(publishing_router)
+app.include_router(versions_router)
 app.include_router(prompts_router)
 app.include_router(products_router)

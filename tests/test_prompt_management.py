@@ -380,7 +380,7 @@ def test_processor_runs_sequential_steps_and_retry_resolves_new_config(
 
     calls: list[str] = []
 
-    def fake_edit(*, image_bytes, prompt, job_id, step):
+    def fake_edit(*, image_bytes, prompt, job_id, step, **_kwargs):
         calls.append(prompt)
         return b"out-" + str(step).encode() + image_bytes[:4]
 
