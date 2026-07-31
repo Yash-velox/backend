@@ -91,6 +91,16 @@ class CatalogSyncService:
             run.status = SyncRunStatus.COMPLETED
             run.completed_at = datetime.now(timezone.utc)
             self.db.commit()
+            try:
+                from app.services.prompt_product_types import PromptProductTypeService
+
+                PromptProductTypeService(self.db, self.shop).sync_shopify_product_types()
+                self.db.commit()
+            except Exception:
+                logger.exception(
+                    "Prompt product-type sync after catalog sync failed | shop=%s",
+                    self.shop.id,
+                )
             logger.info(
                 "Full sync completed | shop=%s run=%s products=%s media=%s",
                 self.shop.id,

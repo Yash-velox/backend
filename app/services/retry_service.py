@@ -125,48 +125,92 @@ class RetryService:
         batch_product.locked_at = None
         return BatchProductStatus.FAILED
 
-    def recover_stale_batch_products(self, *, worker_id: str) -> int:
-        threshold = datetime.now(timezone.utc) - timedelta(seconds=settings.processing_stale_lock_seconds)
-        stale = (
+    def recover_stale_batch_products(
+        self,
+        *,
+        worker_id: str,
+        batch_id: UUID | None = None,
+        force: bool = False,
+    ) -> int:
+        age_seconds = 0 if force else settings.processing_stale_lock_seconds
+        threshold = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+        q = (
             self.db.query(BatchProduct)
             .options(selectinload(BatchProduct.images))
             .filter(
                 BatchProduct.status.in_([BatchProductStatus.PROCESSING, BatchProductStatus.RETRYING]),
                 BatchProduct.locked_at.is_not(None),
-                BatchProduct.locked_at < threshold,
+                BatchProduct.locked_at <= threshold,
             )
-            .all()
         )
+        if batch_id is not None:
+            q = q.filter(BatchProduct.batch_id == batch_id)
+        stale = q.all()
         recovered = 0
         batch_ids: set[UUID] = set()
         now = datetime.now(timezone.utc)
 
         for batch_product in stale:
             for image in batch_product.images:
-                if image.status in (BatchImageStatus.DOWNLOADING, BatchImageStatus.PROCESSING):
-                    attempt = ProcessingAttempt(
-                        batch_image_id=image.id,
-                        batch_product_id=batch_product.id,
-                        attempt_number=max(image.attempt_count, 1),
-                        status=AttemptStatus.INTERRUPTED,
-                        provider="system",
-                        shopify_source_url=image.cdn_url,
-                        error_code="STALE_LOCK",
-                        error_message="Previous worker did not finish before the stale lock timeout.",
-                        started_at=image.started_at or batch_product.locked_at or now,
-                        completed_at=now,
+                if image.status not in (BatchImageStatus.DOWNLOADING, BatchImageStatus.PROCESSING):
+                    continue
+                # Prefer closing the open STARTED attempt over inserting a duplicate
+                # (uq_attempt_image_number) — that UniqueViolation previously aborted
+                # recovery and left products stuck in PROCESSING forever.
+                open_attempt = (
+                    self.db.query(ProcessingAttempt)
+                    .filter(
+                        ProcessingAttempt.batch_image_id == image.id,
+                        ProcessingAttempt.status == AttemptStatus.STARTED,
                     )
-                    self.db.add(attempt)
-                    if image.status != BatchImageStatus.PROCESSING:
-                        image.status = BatchImageStatus.PROCESSING
-                    self.schedule_image_retry(
-                        image,
-                        batch_product,
-                        error_code="STALE_LOCK",
-                        error_message="Recovered stale processing lock after worker interruption.",
-                        retryable=True,
+                    .order_by(ProcessingAttempt.attempt_number.desc())
+                    .first()
+                )
+                if open_attempt is not None:
+                    open_attempt.status = AttemptStatus.INTERRUPTED
+                    open_attempt.provider = open_attempt.provider or "system"
+                    open_attempt.error_code = "STALE_LOCK"
+                    open_attempt.error_message = (
+                        "Previous worker did not finish before the stale lock timeout."
                     )
+                    open_attempt.completed_at = now
+                else:
+                    next_number = max(image.attempt_count, 1)
+                    existing_numbers = {
+                        row[0]
+                        for row in self.db.query(ProcessingAttempt.attempt_number)
+                        .filter(ProcessingAttempt.batch_image_id == image.id)
+                        .all()
+                    }
+                    while next_number in existing_numbers:
+                        next_number += 1
+                    self.db.add(
+                        ProcessingAttempt(
+                            batch_image_id=image.id,
+                            batch_product_id=batch_product.id,
+                            attempt_number=next_number,
+                            status=AttemptStatus.INTERRUPTED,
+                            provider="system",
+                            shopify_source_url=image.cdn_url,
+                            error_code="STALE_LOCK",
+                            error_message="Previous worker did not finish before the stale lock timeout.",
+                            started_at=image.started_at or batch_product.locked_at or now,
+                            completed_at=now,
+                        )
+                    )
+                if image.status != BatchImageStatus.PROCESSING:
+                    image.status = BatchImageStatus.PROCESSING
+                self.schedule_image_retry(
+                    image,
+                    batch_product,
+                    error_code="STALE_LOCK",
+                    error_message="Recovered stale processing lock after worker interruption.",
+                    retryable=True,
+                )
 
+            # Image retry already moves the product to RETRYING when it can;
+            # if status is still PROCESSING (no in-flight images, or image
+            # permanently failed), recover at product level.
             if batch_product.status == BatchProductStatus.PROCESSING:
                 self.schedule_product_retry(
                     batch_product,

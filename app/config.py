@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     poc_job_ttl_hours: int = 24
     openai_api_key: str = ""
     openai_image_model: str = "gpt-image-1"
+    # Hard cap so a hung OpenAI call cannot block the worker forever.
+    openai_image_timeout_seconds: float = 180.0
     poc_dev_skip_auth: bool = False
 
     # PostgreSQL (production). SQLite URL allowed for local/tests only.
@@ -42,7 +44,9 @@ class Settings(BaseSettings):
     processing_max_attempts: int = 3
     processing_retry_delay_seconds: int = 60
     processing_item_timeout_seconds: int = 300
-    processing_stale_lock_seconds: int = 600
+    # How long a PROCESSING lock may sit before recover requeues it.
+    # Kept under the OpenAI timeout so dead workers unlock before the next demo waits too long.
+    processing_stale_lock_seconds: int = 240
     processing_worker_id: str = ""
     processing_output_directory: str = "storage/processed"
 
