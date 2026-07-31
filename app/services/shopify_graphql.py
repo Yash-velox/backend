@@ -31,6 +31,7 @@ query ProductMedia($ids: [ID!]!) {
             id
             alt
             updatedAt
+            mimeType
             image {
               url
               width
@@ -38,10 +39,6 @@ query ProductMedia($ids: [ID!]!) {
             }
             originalSource {
               fileSize
-              url
-            }
-            file {
-              id
               url
             }
           }
@@ -100,6 +97,7 @@ query ProductsPage($first: Int!, $cursor: String) {
             id
             alt
             updatedAt
+            mimeType
             image {
               url
               width
@@ -108,11 +106,6 @@ query ProductsPage($first: Int!, $cursor: String) {
             originalSource {
               fileSize
               url
-            }
-            file {
-              id
-              url
-              mimeType
             }
           }
         }
@@ -156,6 +149,7 @@ query ProductByGid($id: ID!) {
           id
           alt
           updatedAt
+          mimeType
           image {
             url
             width
@@ -164,11 +158,6 @@ query ProductByGid($id: ID!) {
           originalSource {
             fileSize
             url
-          }
-          file {
-            id
-            url
-            mimeType
           }
         }
       }

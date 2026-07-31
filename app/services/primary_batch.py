@@ -338,6 +338,11 @@ class PrimaryBatchService:
         return batch
 
     def refresh_batch_counters(self, batch: ProcessingBatch) -> ProcessingBatch:
+        # Session uses autoflush=False; flush so in-transaction status changes are
+        # visible to the aggregate queries below. Without this, counters stay stale
+        # (e.g. product COMPLETED while batch still shows Processing / completed=0).
+        self.db.flush()
+
         rows = (
             self.db.query(BatchProduct.status, func.count(BatchProduct.id))
             .filter(BatchProduct.batch_id == batch.id)

@@ -28,7 +28,15 @@ SECONDARY_TRANSITIONS: dict[SecondaryQueueStatus, set[SecondaryQueueStatus]] = {
 }
 
 BATCH_TRANSITIONS: dict[BatchStatus, set[BatchStatus]] = {
-    BatchStatus.QUEUED: {BatchStatus.PROCESSING, BatchStatus.CANCELLED},
+    # Allow terminal outcomes from QUEUED in case work finishes before the batch
+    # row was transitioned to PROCESSING (defensive; normal path goes via PROCESSING).
+    BatchStatus.QUEUED: {
+        BatchStatus.PROCESSING,
+        BatchStatus.COMPLETED,
+        BatchStatus.PARTIALLY_COMPLETED,
+        BatchStatus.FAILED,
+        BatchStatus.CANCELLED,
+    },
     BatchStatus.PROCESSING: {
         BatchStatus.COMPLETED,
         BatchStatus.PARTIALLY_COMPLETED,
