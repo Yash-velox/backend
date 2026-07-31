@@ -27,6 +27,7 @@ from app.models.enums import (
     BatchProductStatus,
     BatchStatus,
     DeltaType,
+    PublishStatus,
     SecondaryQueueStatus,
     ShopStatus,
     SyncRunStatus,
@@ -75,6 +76,7 @@ class ShopSettings(Base):
         Uuid(as_uuid=True), ForeignKey("shops.id", ondelete="CASCADE"), nullable=False, index=True
     )
     auto_sync_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    auto_publish_processed_images: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     max_products_per_batch: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
     batch_interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=15)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -434,6 +436,11 @@ class BatchProduct(Base):
         Enum(BatchProductStatus, name="batch_product_status", native_enum=False),
         nullable=False,
         default=BatchProductStatus.QUEUED,
+        index=True,
+    )
+    publish_status: Mapped[PublishStatus | None] = mapped_column(
+        Enum(PublishStatus, name="batch_product_publish_status", native_enum=False),
+        nullable=True,
         index=True,
     )
     image_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

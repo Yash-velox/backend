@@ -57,6 +57,7 @@ def _product_out(product) -> BatchProductOut:
         shopifyProductGid=product.shopify_product_gid,
         productId=product.product_id,
         status=product.status.value,
+        publishStatus=product.publish_status.value if product.publish_status else None,
         imageCount=product.image_count,
         retryCount=product.retry_count,
         errorCode=product.error_code,

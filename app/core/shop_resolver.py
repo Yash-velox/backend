@@ -31,6 +31,7 @@ def ensure_shop_settings(db: Session, shop: Shop) -> ShopSettings:
     row = ShopSettings(
         shop_id=shop.id,
         auto_sync_enabled=False,
+        auto_publish_processed_images=False,
         max_products_per_batch=settings.default_max_products_per_batch,
         batch_interval_minutes=settings.default_batch_interval_minutes,
     )

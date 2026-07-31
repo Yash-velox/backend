@@ -174,9 +174,194 @@ query ProductByGid($id: ID!) {
 }
 """
 
+PRODUCT_PUBLISH_SNAPSHOT_QUERY = """
+query ProductPublishSnapshot($id: ID!, $mediaCursor: String) {
+  product(id: $id) {
+    id
+    updatedAt
+    featuredMedia {
+      ... on MediaImage {
+        id
+      }
+    }
+    media(first: 50, after: $mediaCursor) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        id
+        mediaContentType
+        alt
+        ... on MediaImage {
+          id
+          alt
+          updatedAt
+          mimeType
+          image {
+            url
+            width
+            height
+          }
+          originalSource {
+            fileSize
+            url
+          }
+        }
+      }
+    }
+    variants(first: 100) {
+      nodes {
+        id
+        title
+        media(first: 1) {
+          nodes {
+            ... on MediaImage {
+              id
+            }
+          }
+        }
+        image {
+          id
+          url
+        }
+      }
+    }
+  }
+}
+"""
+
+STAGED_UPLOADS_CREATE = """
+mutation StagedUploadsCreate($input: [StagedUploadInput!]!) {
+  stagedUploadsCreate(input: $input) {
+    stagedTargets {
+      url
+      resourceUrl
+      parameters {
+        name
+        value
+      }
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+"""
+
+FILE_CREATE = """
+mutation FileCreate($files: [FileCreateInput!]!) {
+  fileCreate(files: $files) {
+    files {
+      id
+      fileStatus
+      alt
+      ... on MediaImage {
+        id
+        image {
+          url
+          width
+          height
+        }
+      }
+    }
+    userErrors {
+      field
+      message
+      code
+    }
+  }
+}
+"""
+
+FILES_STATUS_QUERY = """
+query FilesStatus($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on MediaImage {
+      id
+      fileStatus
+      alt
+      image {
+        url
+        width
+        height
+      }
+    }
+    ... on GenericFile {
+      id
+      fileStatus
+      alt
+    }
+  }
+}
+"""
+
+FILE_UPDATE = """
+mutation FileUpdate($files: [FileUpdateInput!]!) {
+  fileUpdate(files: $files) {
+    files {
+      id
+      fileStatus
+      alt
+      ... on MediaImage {
+        id
+        image {
+          url
+        }
+      }
+    }
+    userErrors {
+      field
+      message
+      code
+    }
+  }
+}
+"""
+
+PRODUCT_VARIANTS_BULK_UPDATE = """
+mutation ProductVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+  productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+    productVariants {
+      id
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+"""
+
+PRODUCT_REORDER_MEDIA = """
+mutation ProductReorderMedia($id: ID!, $moves: [MoveInput!]!) {
+  productReorderMedia(id: $id, moves: $moves) {
+    job {
+      id
+      done
+    }
+    mediaUserErrors {
+      field
+      message
+      code
+    }
+  }
+}
+"""
+
+JOB_STATUS_QUERY = """
+query JobStatus($id: ID!) {
+  job(id: $id) {
+    id
+    done
+  }
+}
+"""
+
 
 class ShopifyGraphQLClient:
-    """Minimal Admin GraphQL client — read-only for this phase."""
+    """Admin GraphQL client for catalog reads and product media publishing."""
 
     def __init__(self, *, shop_domain: str, access_token: str, api_version: str | None = None) -> None:
         domain = shop_domain.replace("https://", "").replace("http://", "").rstrip("/")
@@ -282,3 +467,119 @@ class ShopifyGraphQLClient:
             return None
         data = self.execute(PRODUCT_BY_GID_QUERY, {"id": gid})
         return data.get("product")
+
+    def get_product_media_snapshot(self, product_gid: str) -> dict[str, Any] | None:
+        """Fetch full product media + variant media associations with media pagination."""
+        if not product_gid:
+            return None
+        media_nodes: list[dict[str, Any]] = []
+        cursor: str | None = None
+        product_meta: dict[str, Any] | None = None
+        while True:
+            data = self.execute(
+                PRODUCT_PUBLISH_SNAPSHOT_QUERY,
+                {"id": product_gid, "mediaCursor": cursor},
+            )
+            product = data.get("product")
+            if not product:
+                return None
+            if product_meta is None:
+                product_meta = {
+                    "id": product.get("id"),
+                    "updatedAt": product.get("updatedAt"),
+                    "featuredMedia": product.get("featuredMedia"),
+                    "variants": product.get("variants"),
+                }
+            block = product.get("media") or {}
+            media_nodes.extend([n for n in (block.get("nodes") or []) if n])
+            page_info = block.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                break
+        assert product_meta is not None
+        return {
+            "id": product_meta["id"],
+            "updatedAt": product_meta["updatedAt"],
+            "featuredMedia": product_meta["featuredMedia"],
+            "media": {"nodes": media_nodes},
+            "variants": product_meta["variants"],
+        }
+
+    def create_staged_image_uploads(self, inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        data = self.execute(STAGED_UPLOADS_CREATE, {"input": inputs})
+        payload = data.get("stagedUploadsCreate") or {}
+        errors = payload.get("userErrors") or []
+        if errors:
+            msg = "; ".join(str(e.get("message", e)) for e in errors)
+            raise ShopifyGraphQLError(f"stagedUploadsCreate failed: {msg}", retryable=False)
+        return [t for t in (payload.get("stagedTargets") or []) if t]
+
+    def create_shopify_files(self, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        data = self.execute(FILE_CREATE, {"files": files})
+        payload = data.get("fileCreate") or {}
+        errors = payload.get("userErrors") or []
+        if errors:
+            msg = "; ".join(str(e.get("message", e)) for e in errors)
+            raise ShopifyGraphQLError(f"fileCreate failed: {msg}", retryable=False)
+        return [f for f in (payload.get("files") or []) if f]
+
+    def get_file_statuses(self, file_gids: list[str]) -> list[dict[str, Any]]:
+        if not file_gids:
+            return []
+        data = self.execute(FILES_STATUS_QUERY, {"ids": file_gids})
+        return [n for n in (data.get("nodes") or []) if n]
+
+    def update_files(self, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        data = self.execute(FILE_UPDATE, {"files": files})
+        payload = data.get("fileUpdate") or {}
+        errors = payload.get("userErrors") or []
+        if errors:
+            msg = "; ".join(str(e.get("message", e)) for e in errors)
+            raise ShopifyGraphQLError(f"fileUpdate failed: {msg}", retryable=False)
+        return [f for f in (payload.get("files") or []) if f]
+
+    def add_file_product_references(self, *, file_gids: list[str], product_gid: str) -> list[dict[str, Any]]:
+        inputs = [{"id": gid, "referencesToAdd": [product_gid]} for gid in file_gids]
+        return self.update_files(inputs)
+
+    def remove_file_product_references(self, *, file_gids: list[str], product_gid: str) -> list[dict[str, Any]]:
+        inputs = [{"id": gid, "referencesToRemove": [product_gid]} for gid in file_gids]
+        return self.update_files(inputs)
+
+    def update_file_alt_text(self, *, file_gid: str, alt: str | None) -> dict[str, Any] | None:
+        results = self.update_files([{"id": file_gid, "alt": alt or ""}])
+        return results[0] if results else None
+
+    def associate_media_to_variants(
+        self,
+        *,
+        product_gid: str,
+        variants: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        data = self.execute(
+            PRODUCT_VARIANTS_BULK_UPDATE,
+            {"productId": product_gid, "variants": variants},
+        )
+        payload = data.get("productVariantsBulkUpdate") or {}
+        errors = payload.get("userErrors") or []
+        if errors:
+            msg = "; ".join(str(e.get("message", e)) for e in errors)
+            raise ShopifyGraphQLError(f"productVariantsBulkUpdate failed: {msg}", retryable=False)
+        return [v for v in (payload.get("productVariants") or []) if v]
+
+    def reorder_product_media(self, *, product_gid: str, moves: list[dict[str, Any]]) -> dict[str, Any]:
+        data = self.execute(PRODUCT_REORDER_MEDIA, {"id": product_gid, "moves": moves})
+        payload = data.get("productReorderMedia") or {}
+        errors = payload.get("mediaUserErrors") or []
+        if errors:
+            msg = "; ".join(str(e.get("message", e)) for e in errors)
+            raise ShopifyGraphQLError(f"productReorderMedia failed: {msg}", retryable=False)
+        job = payload.get("job") or {}
+        return {"id": job.get("id"), "done": bool(job.get("done"))}
+
+    def get_job_status(self, job_gid: str) -> dict[str, Any]:
+        data = self.execute(JOB_STATUS_QUERY, {"id": job_gid})
+        job = data.get("job") or {}
+        return {"id": job.get("id"), "done": bool(job.get("done"))}

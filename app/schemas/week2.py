@@ -30,6 +30,7 @@ class ManualBatchCreateRequest(BaseModel):
 
 class SettingsOut(BaseModel):
     autoSyncEnabled: bool
+    autoPublishProcessedImages: bool
     maxProductsPerBatch: int
     batchIntervalMinutes: int
     createdAt: datetime
@@ -38,6 +39,7 @@ class SettingsOut(BaseModel):
 
 class SettingsUpdateRequest(BaseModel):
     autoSyncEnabled: bool | None = None
+    autoPublishProcessedImages: bool | None = None
     maxProductsPerBatch: int | None = None
     batchIntervalMinutes: int | None = None
 
@@ -109,6 +111,7 @@ class BatchProductOut(BaseModel):
     shopifyProductGid: str
     productId: UUID | None = None
     status: str
+    publishStatus: str | None = None
     imageCount: int
     retryCount: int
     errorCode: str | None = None

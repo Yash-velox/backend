@@ -45,6 +45,10 @@ def _filename_from_url(url: str | None) -> str | None:
         return None
 
 
+# Re-export for publish snapshot helpers
+filename_from_url = _filename_from_url
+
+
 def media_fingerprint(media: dict[str, Any]) -> str:
     """Stable fingerprint from media identity fields (alt text excluded)."""
     parts = [

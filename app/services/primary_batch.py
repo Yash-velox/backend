@@ -379,10 +379,27 @@ class PrimaryBatchService:
                 new_status = BatchStatus.PARTIALLY_COMPLETED
             else:
                 new_status = BatchStatus.FAILED
+            became_terminal = batch.status not in {
+                BatchStatus.COMPLETED,
+                BatchStatus.PARTIALLY_COMPLETED,
+                BatchStatus.FAILED,
+                BatchStatus.CANCELLED,
+            }
             if batch.status != new_status:
                 assert_transition("batch", BATCH_TRANSITIONS, batch.status, new_status)
                 batch.status = new_status
             batch.completed_at = datetime.now(timezone.utc)
+            self.db.flush()
+            if became_terminal:
+                try:
+                    from app.services.publish_trigger import PublishTriggerService
+
+                    PublishTriggerService(self.db, self.shop).on_batch_terminal(batch, commit=False)
+                except Exception:
+                    logger.exception(
+                        "Publish trigger after batch terminal failed | batch=%s",
+                        batch.id,
+                    )
         elif batch.status == BatchStatus.QUEUED and batch.processing_product_count > 0:
             assert_transition("batch", BATCH_TRANSITIONS, batch.status, BatchStatus.PROCESSING)
             batch.status = BatchStatus.PROCESSING

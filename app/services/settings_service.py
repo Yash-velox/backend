@@ -25,12 +25,15 @@ class SettingsService:
         self,
         *,
         auto_sync_enabled: bool | None = None,
+        auto_publish_processed_images: bool | None = None,
         max_products_per_batch: int | None = None,
         batch_interval_minutes: int | None = None,
     ) -> ShopSettings:
         row = self.get()
         if auto_sync_enabled is not None:
             row.auto_sync_enabled = auto_sync_enabled
+        if auto_publish_processed_images is not None:
+            row.auto_publish_processed_images = auto_publish_processed_images
         if max_products_per_batch is not None:
             if max_products_per_batch < 1:
                 raise SettingsValidationError("max_products_per_batch must be at least 1")

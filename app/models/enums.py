@@ -98,6 +98,24 @@ class PromptListStatus(str, enum.Enum):
     NOT_READY = "NOT_READY"
 
 
+class PublishStatus(str, enum.Enum):
+    """Collapsed product publish state machine."""
+
+    READY_TO_PUBLISH = "READY_TO_PUBLISH"
+    QUEUED = "QUEUED"
+    PUBLISHING = "PUBLISHING"
+    PUBLISHED = "PUBLISHED"
+    PUBLISH_FAILED = "PUBLISH_FAILED"
+    PUBLISH_CONFLICT = "PUBLISH_CONFLICT"
+    RESTORE_FAILED = "RESTORE_FAILED"
+
+
+class PublishTriggerSource(str, enum.Enum):
+    AUTO = "AUTO"
+    MANUAL = "MANUAL"
+    RETRY = "RETRY"
+
+
 # Legacy enums kept for old queue compatibility during transition tests
 class SourceType(str, enum.Enum):
     SHOPIFY_PRODUCT_MEDIA = "SHOPIFY_PRODUCT_MEDIA"
