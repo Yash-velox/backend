@@ -128,10 +128,11 @@ def media_snapshots_from_models(
 
 
 def _extract_file_gid(media_node: dict[str, Any]) -> str | None:
+    """MediaImage implements the Shopify File interface, so its own GID is the file identity."""
     file_obj = media_node.get("file")
-    if isinstance(file_obj, dict):
+    if isinstance(file_obj, dict) and file_obj.get("id"):
         return file_obj.get("id")
-    return None
+    return media_node.get("id") or None
 
 
 def _extract_media_image_node(media_node: dict[str, Any]) -> dict[str, Any] | None:
@@ -143,9 +144,9 @@ def _extract_media_image_node(media_node: dict[str, Any]) -> dict[str, Any] | No
             return None
     image = media_node.get("image") or {}
     url = image.get("url") or ((media_node.get("originalSource") or {}).get("url"))
-    if not url and isinstance(media_node.get("file"), dict):
-        file_obj = media_node["file"]
-        url = file_obj.get("url") or ((file_obj.get("image") or {}).get("url"))
+    if not url:
+        preview_image = (media_node.get("preview") or {}).get("image") or {}
+        url = preview_image.get("url")
     if not url:
         return None
     return media_node
@@ -212,7 +213,7 @@ def normalize_shopify_product_node(node: dict[str, Any]) -> dict[str, Any]:
                 "filename": _filename_from_url(url),
                 "width": image.get("width"),
                 "height": image.get("height"),
-                "mime_type": None,
+                "mime_type": media_node.get("mimeType"),
                 "alt_text": media_node.get("alt"),
                 "position": position,
                 "is_primary": bool(featured_id and media_gid == featured_id),

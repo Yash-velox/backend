@@ -5,9 +5,10 @@ import uuid
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 
 from app.core.deps import CurrentShop, DbSession
-from app.models import BatchStatus
+from app.models import BatchImage, BatchStatus
 from app.schemas.queue import AttemptOut
 from app.schemas.week2 import (
     BatchImageOut,
@@ -17,6 +18,7 @@ from app.schemas.week2 import (
     PaginationMeta,
     SuccessEnvelope,
 )
+from app.services.output_storage import get_output_storage
 from app.services.primary_batch import PrimaryBatchError, PrimaryBatchService
 from app.services.retry_service import RetryService
 
@@ -228,6 +230,33 @@ def get_batch_images(batch_id: UUID, request: Request, db: DbSession, shop: Curr
             "batchId": str(batch_id),
             "items": [_image_out(i).model_dump() for i in images],
         },
+    )
+
+
+@router.get("/images/{image_id}/output")
+def get_batch_image_output(image_id: UUID, db: DbSession, shop: CurrentShop):
+    image = (
+        db.query(BatchImage)
+        .filter(BatchImage.id == image_id, BatchImage.shop_id == shop.id)
+        .one_or_none()
+    )
+    if image is None:
+        raise HTTPException(status_code=404, detail="Batch image not found")
+    if not image.output_storage_key:
+        raise HTTPException(status_code=404, detail="Processed output not available yet")
+
+    storage = get_output_storage()
+    try:
+        path = storage.resolve_path(image.output_storage_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid output storage key") from exc
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Processed output file missing")
+
+    return FileResponse(
+        path=str(path),
+        media_type=image.output_mime_type or "image/png",
+        headers={"Cache-Control": "private, max-age=300"},
     )
 
 

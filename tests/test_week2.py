@@ -156,6 +156,7 @@ def test_status_only_and_draft_helpers():
 
 def test_state_machine_rejects_invalid():
     assert_transition("batch", BATCH_TRANSITIONS, BatchStatus.QUEUED, BatchStatus.PROCESSING)
+    assert_transition("batch", BATCH_TRANSITIONS, BatchStatus.QUEUED, BatchStatus.COMPLETED)
     try:
         assert_transition("batch", BATCH_TRANSITIONS, BatchStatus.COMPLETED, BatchStatus.QUEUED)
         assert False, "expected InvalidStateTransition"
@@ -163,10 +164,61 @@ def test_state_machine_rejects_invalid():
         pass
 
 
-def test_prompt_mapping_includes_transparency():
+def test_refresh_batch_counters_sees_unflushed_status(db_session, shop):
+    """Regression: autoflush=False must not leave batch counters stale."""
+    ensure_shop_settings(db_session, shop)
+    batch = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.MANUAL,
+        status=BatchStatus.QUEUED,
+        product_count=1,
+        image_count=1,
+        pending_product_count=1,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    bp = BatchProduct(
+        batch_id=batch.id,
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/counters-1",
+        status=BatchProductStatus.QUEUED,
+        image_count=1,
+    )
+    db_session.add(bp)
+    db_session.commit()
+
+    bp.status = BatchProductStatus.PROCESSING
+    # Intentionally no explicit flush — refresh_batch_counters must flush itself.
+    PrimaryBatchService(db_session, shop).refresh_batch_counters(batch)
+    db_session.commit()
+    db_session.refresh(batch)
+
+    assert batch.status == BatchStatus.PROCESSING
+    assert batch.processing_product_count == 1
+    assert batch.pending_product_count == 0
+    assert batch.completed_product_count == 0
+
+    bp.status = BatchProductStatus.COMPLETED
+    PrimaryBatchService(db_session, shop).refresh_batch_counters(batch)
+    db_session.commit()
+    db_session.refresh(batch)
+
+    assert batch.status == BatchStatus.COMPLETED
+    assert batch.completed_product_count == 1
+    assert batch.processing_product_count == 0
+    assert batch.completed_at is not None
+
+
+def test_prompt_mapping_uses_single_jewelry_prompt():
     prompts = PromptMappingService().resolve_for_product_type("Apparel")
-    assert len(prompts) >= 2
-    assert any("transparent" in (p.get("prompt") or "").lower() for p in prompts)
+    assert len(prompts) == 1
+    assert prompts[0]["step"] == 1
+    assert prompts[0]["preserveTransparency"] is True
+    prompt = prompts[0]["prompt"].lower()
+    assert "jewelry" in prompt
+    assert "transparent" in prompt
+    assert "transparent png" in prompt
+    assert "zero redesign" in prompt
 
 
 def test_settings_validation(db_session, shop, monkeypatch):
@@ -482,6 +534,54 @@ def test_webhook_dedupe(db_session, shop):
     assert first.id == second.id
     events = db_session.query(WebhookEvent).filter(WebhookEvent.shopify_webhook_id == "webhook-unique-1").all()
     assert len(events) == 1
+
+
+def test_batch_image_output_endpoint(client, db_session, shop, tmp_path):
+    batch = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.MANUAL,
+        status=BatchStatus.COMPLETED,
+        product_count=1,
+        image_count=1,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    bp = BatchProduct(
+        batch_id=batch.id,
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/501",
+        status=BatchProductStatus.COMPLETED,
+        image_count=1,
+    )
+    db_session.add(bp)
+    db_session.flush()
+
+    key = f"{shop.id}/{batch.id}/output-test/output.png"
+    output_root = tmp_path / "processed"
+    path = output_root / key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\x89PNG\r\n\x1a\nfake-bytes")
+
+    image = BatchImage(
+        batch_product_id=bp.id,
+        shop_id=shop.id,
+        shopify_media_gid="gid://shopify/MediaImage/501",
+        cdn_url="https://cdn.shopify.com/x.png",
+        delta_type=DeltaType.NEW,
+        status=BatchImageStatus.COMPLETED,
+        output_storage_key=key,
+        output_mime_type="image/png",
+    )
+    db_session.add(image)
+    db_session.commit()
+
+    response = client.get(f"/api/batches/images/{image.id}/output")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content == b"\x89PNG\r\n\x1a\nfake-bytes"
+
+    missing = client.get(f"/api/batches/images/{uuid4()}/output")
+    assert missing.status_code == 404
 
 
 def test_product_atomicity_counters(db_session, shop):
