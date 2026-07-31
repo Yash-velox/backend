@@ -343,6 +343,7 @@ class ImageProcessor:
                     prompt=step.rendered_prompt,
                     job_id=str(image.id),
                     step=index,
+                    transparent_background=True,
                 )
                 if not current:
                     raise ProcessingError("AI provider returned empty output", code="EMPTY_OUTPUT", retryable=True)
