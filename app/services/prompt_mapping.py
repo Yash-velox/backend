@@ -20,12 +20,16 @@ It is not a jewelry redesign, reconstruction, regeneration, restyling, or creati
 
 ## REQUIRED OUTPUT MODE
 
-Use **Transparent-background mode** for this request.
+**MANDATORY: transparent image, no background.**
 
-Create a genuinely transparent background with a clean alpha channel.
-The output must be a transparent PNG.
-Do not use a white, grey, checkerboard, or simulated transparent background.
-Keep only the jewelry and any specifically requested natural contact shadow.
+Use **Transparent-background mode** for every request in this workflow.
+
+- Remove the entire background — there must be no backdrop behind the jewelry.
+- Create a genuinely transparent background with a clean alpha channel.
+- The output must be a transparent PNG (RGBA), not JPEG and not a flattened RGB image.
+- Do not use a white, grey, black, colored, checkerboard, studio, or simulated transparent background.
+- Keep only the jewelry and any specifically requested natural contact shadow.
+- Do not leave residual backdrop pixels, floor planes, or solid fills around the product.
 
 ---
 
@@ -460,13 +464,17 @@ Do not create halos, jagged edges, white outlines, dark outlines, rough masks, t
 
 ### Transparent-background mode (REQUIRED FOR THIS REQUEST)
 
+**Transparent image, no background.**
+
 Create a genuinely transparent background with a clean alpha channel.
 
-The output must be a transparent PNG.
+The output must be a transparent PNG (RGBA).
 
-Do not use a white, grey, checkerboard, or simulated transparent background.
+Do not use a white, grey, black, colored, checkerboard, studio, or simulated transparent background.
 
 Keep only the jewelry and any specifically requested natural contact shadow.
+
+Do not leave residual backdrop pixels or solid fills around the product.
 
 ---
 

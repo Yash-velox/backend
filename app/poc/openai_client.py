@@ -26,24 +26,39 @@ class OpenAIImageClient:
             settings.openai_image_model,
         )
 
-    def edit_image(self, *, image_bytes: bytes, prompt: str, job_id: str = "", step: int = 0) -> bytes:
+    def edit_image(
+        self,
+        *,
+        image_bytes: bytes,
+        prompt: str,
+        job_id: str = "",
+        step: int = 0,
+        transparent_background: bool = True,
+    ) -> bytes:
         logger.info(
-            "OpenAI request start | job=%s step=%s model=%s input_bytes=%s prompt_len=%s prompt=%r",
+            "OpenAI request start | job=%s step=%s model=%s input_bytes=%s prompt_len=%s transparent=%s prompt=%r",
             job_id or "-",
             step or "-",
             settings.openai_image_model,
             len(image_bytes),
             len(prompt),
+            transparent_background,
             prompt,
         )
         started = time.perf_counter()
         try:
-            response = self._client.images.edit(
-                model=settings.openai_image_model,
-                image=("input.png", image_bytes, "image/png"),
-                prompt=prompt,
-                size="1024x1024",
-            )
+            # Prompt text alone is not enough — GPT image models need the API
+            # background flag to emit a real alpha channel (otherwise white fill).
+            edit_kwargs: dict = {
+                "model": settings.openai_image_model,
+                "image": ("input.png", image_bytes, "image/png"),
+                "prompt": prompt,
+                "size": "1024x1024",
+                "output_format": "png",
+            }
+            if transparent_background:
+                edit_kwargs["background"] = "transparent"
+            response = self._client.images.edit(**edit_kwargs)
         except Exception as exc:
             elapsed = time.perf_counter() - started
             logger.exception(

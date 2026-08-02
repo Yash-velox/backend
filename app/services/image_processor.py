@@ -123,21 +123,26 @@ def download_shopify_cdn_to_temp(url: str) -> Path:
     return tmp_path
 
 
-def _prompts_from_snapshot(prompt_snapshot: object | None) -> list[str]:
+def _prompt_steps_from_snapshot(prompt_snapshot: object | None) -> list[tuple[str, bool]]:
+    """Return (prompt_text, transparent_background) steps from the product snapshot."""
     if isinstance(prompt_snapshot, list) and prompt_snapshot:
-        prompts: list[str] = []
+        steps: list[tuple[str, bool]] = []
         for entry in prompt_snapshot:
             if isinstance(entry, str) and entry.strip():
-                prompts.append(entry.strip())
+                steps.append((entry.strip(), True))
             elif isinstance(entry, dict):
                 text = str(entry.get("prompt") or "").strip()
                 if text:
-                    prompts.append(text)
-        if prompts:
-            return prompts
+                    transparent = bool(entry.get("preserveTransparency", True))
+                    steps.append((text, transparent))
+        if steps:
+            return steps
     return [
-        "Enhance this product image for ecommerce: clean background, accurate colors, sharp details. "
-        "Return a transparent PNG when the subject is isolated."
+        (
+            "Enhance this product image for ecommerce: accurate colors, sharp details. "
+            "Return a transparent PNG with no background (clean alpha channel only).",
+            True,
+        )
     ]
 
 
@@ -295,16 +300,17 @@ class ImageProcessor:
             self.db.commit()
 
             input_bytes = temp_path.read_bytes()
-            prompts = _prompts_from_snapshot(batch_product.prompt_snapshot_json)
+            steps = _prompt_steps_from_snapshot(batch_product.prompt_snapshot_json)
             client = self._client()
             current = input_bytes
-            for index, prompt in enumerate(prompts, start=1):
+            for index, (prompt, transparent_background) in enumerate(steps, start=1):
                 image.current_prompt_step = index
                 current = client.edit_image(
                     image_bytes=current,
                     prompt=prompt,
                     job_id=str(image.id),
                     step=index,
+                    transparent_background=transparent_background,
                 )
                 if not current:
                     raise ProcessingError("AI provider returned empty output", code="EMPTY_OUTPUT", retryable=True)
