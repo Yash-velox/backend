@@ -21,10 +21,12 @@ from app.models import (
     ProcessingAttempt,
     ProcessingBaseline,
     Product,
+    Shop,
 )
 from app.poc.openai_client import OpenAIImageClient, OpenAIImageError
 from app.services.output_storage import OutputStorage, checksum_sha256, get_output_storage
 from app.services.primary_batch import PrimaryBatchService
+from app.services.prompt_resolver import PromptResolver, PromptResolverError
 from app.services.retry_service import RetryService
 from app.services.state_machine import BATCH_IMAGE_TRANSITIONS, BATCH_PRODUCT_TRANSITIONS, assert_transition
 
@@ -123,29 +125,6 @@ def download_shopify_cdn_to_temp(url: str) -> Path:
     return tmp_path
 
 
-def _prompt_steps_from_snapshot(prompt_snapshot: object | None) -> list[tuple[str, bool]]:
-    """Return (prompt_text, transparent_background) steps from the product snapshot."""
-    if isinstance(prompt_snapshot, list) and prompt_snapshot:
-        steps: list[tuple[str, bool]] = []
-        for entry in prompt_snapshot:
-            if isinstance(entry, str) and entry.strip():
-                steps.append((entry.strip(), True))
-            elif isinstance(entry, dict):
-                text = str(entry.get("prompt") or "").strip()
-                if text:
-                    transparent = bool(entry.get("preserveTransparency", True))
-                    steps.append((text, transparent))
-        if steps:
-            return steps
-    return [
-        (
-            "Enhance this product image for ecommerce: accurate colors, sharp details. "
-            "Return a transparent PNG with no background (clean alpha channel only).",
-            True,
-        )
-    ]
-
-
 class ImageProcessor:
     def __init__(
         self,
@@ -206,7 +185,23 @@ class ImageProcessor:
         batch_service = self._primary_batch_service(batch_product.shop_id)
         if product_failed:
             any_retrying = any(i.status == BatchImageStatus.RETRYING for i in batch_product.images)
-            if not any_retrying:
+            if any_retrying:
+                # Permanent failure on one image can coexist with earlier RETRYING
+                # rows from stale recovery — never leave the product locked in
+                # PROCESSING or the worker will never reclaim it.
+                if batch_product.status == BatchProductStatus.PROCESSING:
+                    assert_transition(
+                        "batch_product",
+                        BATCH_PRODUCT_TRANSITIONS,
+                        batch_product.status,
+                        BatchProductStatus.RETRYING,
+                    )
+                    batch_product.status = BatchProductStatus.RETRYING
+                if batch_product.next_retry_at is None:
+                    batch_product.next_retry_at = datetime.now(timezone.utc)
+                batch_product.locked_by = None
+                batch_product.locked_at = None
+            else:
                 assert_transition(
                     "batch_product",
                     BATCH_PRODUCT_TRANSITIONS,
@@ -233,6 +228,11 @@ class ImageProcessor:
                 batch_product.error_code = None
                 batch_product.error_message = None
                 self._advance_baseline_on_success(batch_product)
+            else:
+                # Exiting without a terminal state — always drop the lock so
+                # another poll / recover can continue remaining work.
+                batch_product.locked_by = None
+                batch_product.locked_at = None
 
         batch = batch_service.get_batch(batch_product.batch_id)
         if batch:
@@ -294,23 +294,56 @@ class ImageProcessor:
         temp_path: Path | None = None
         started_perf = time.perf_counter()
         try:
+            shop = self.db.get(Shop, batch_product.shop_id)
+            if shop is None:
+                raise ProcessingError("Shop not found", code="SHOP_NOT_FOUND", retryable=False)
+
+            product = None
+            if batch_product.product_id:
+                product = self.db.get(Product, batch_product.product_id)
+            product_type_override = None
+            if product is None and isinstance(batch_product.product_snapshot_json, dict):
+                product_type_override = batch_product.product_snapshot_json.get("product_type")
+            elif product is not None and not (product.product_type or "").strip():
+                if isinstance(batch_product.product_snapshot_json, dict):
+                    product_type_override = batch_product.product_snapshot_json.get("product_type")
+
+            images_sorted = sorted(batch_product.images, key=lambda i: i.created_at)
+            try:
+                image_position = images_sorted.index(image) + 1
+            except ValueError:
+                image_position = 1
+
+            resolver = PromptResolver(self.db, shop)
+            try:
+                resolved = resolver.resolve_for_product(
+                    product,
+                    product_type_override=product_type_override,
+                    image=image,
+                    image_position=image_position,
+                )
+            except PromptResolverError as exc:
+                raise ProcessingError(str(exc), code=exc.code, retryable=exc.retryable) from exc
+
+            batch_product.prompt_snapshot_json = resolver.to_snapshot(resolved)
+            self.db.commit()
+
             temp_path = download_shopify_cdn_to_temp(image.cdn_url)
             assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.PROCESSING)
             image.status = BatchImageStatus.PROCESSING
             self.db.commit()
 
             input_bytes = temp_path.read_bytes()
-            steps = _prompt_steps_from_snapshot(batch_product.prompt_snapshot_json)
             client = self._client()
             current = input_bytes
-            for index, (prompt, transparent_background) in enumerate(steps, start=1):
+            for index, step in enumerate(resolved, start=1):
                 image.current_prompt_step = index
                 current = client.edit_image(
                     image_bytes=current,
-                    prompt=prompt,
+                    prompt=step.rendered_prompt,
                     job_id=str(image.id),
                     step=index,
-                    transparent_background=transparent_background,
+                    transparent_background=True,
                 )
                 if not current:
                     raise ProcessingError("AI provider returned empty output", code="EMPTY_OUTPUT", retryable=True)

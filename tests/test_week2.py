@@ -10,12 +10,14 @@ from uuid import uuid4
 from app.core.crypto import encrypt_token, sign_internal_payload, verify_internal_signature
 from app.core.shop_resolver import ensure_shop_settings, upsert_shop_install
 from app.models import (
+    AttemptStatus,
     BatchImage,
     BatchImageStatus,
     BatchProduct,
     BatchProductStatus,
     BatchStatus,
     DeltaType,
+    ProcessingAttempt,
     ProcessingBaseline,
     ProcessingBatch,
     Product,
@@ -29,7 +31,9 @@ from app.models import (
 )
 from app.services.delta import compare_media_snapshots
 from app.services.primary_batch import PrimaryBatchService
+from app.services.prompt_resolver import PromptResolverError
 from app.services.prompt_mapping import PromptMappingService
+from app.services.retry_service import RetryService
 from app.services.secondary_queue import SecondaryQueueService
 from app.services.settings_service import SettingsService, SettingsValidationError
 from app.services.snapshot import media_fingerprint
@@ -209,16 +213,12 @@ def test_refresh_batch_counters_sees_unflushed_status(db_session, shop):
     assert batch.completed_at is not None
 
 
-def test_prompt_mapping_uses_single_jewelry_prompt():
-    prompts = PromptMappingService().resolve_for_product_type("Apparel")
-    assert len(prompts) == 1
-    assert prompts[0]["step"] == 1
-    assert prompts[0]["preserveTransparency"] is True
-    prompt = prompts[0]["prompt"].lower()
-    assert "jewelry" in prompt
-    assert "transparent" in prompt
-    assert "transparent png" in prompt
-    assert "zero redesign" in prompt
+def test_prompt_mapping_requires_db_configuration():
+    try:
+        PromptMappingService().resolve_for_product_type("Apparel")
+        assert False, "expected PromptResolverError"
+    except PromptResolverError as exc:
+        assert exc.code == "PROMPT_NOT_CONFIGURED"
 
 
 def test_settings_validation(db_session, shop, monkeypatch):
@@ -479,6 +479,40 @@ def test_manual_batch_api(client, shop, db_session):
     assert body["data"]["imageCount"] == 1
 
 
+def test_catalog_products_list_and_select_all(client, shop, db_session):
+    for i, (title, ptype) in enumerate(
+        [("Gold Ring", "Rings"), ("Silver Ring", "Rings"), ("Charm A", "Charms")],
+        start=1,
+    ):
+        db_session.add(
+            Product(
+                shop_id=shop.id,
+                shopify_product_gid=f"gid://shopify/Product/{1000 + i}",
+                title=title,
+                product_type=ptype,
+                status="ACTIVE",
+                is_deleted=False,
+            )
+        )
+    db_session.commit()
+
+    listed = client.get("/api/products?productType=Rings&search=Ring")
+    assert listed.status_code == 200, listed.text
+    data = listed.json()["data"]
+    assert data["total"] == 2
+    assert data["manualBatchProductLimit"] >= 1
+
+    gids = client.get("/api/products/matching-gids?productType=rings")
+    assert gids.status_code == 200
+    payload = gids.json()["data"]
+    assert payload["returned"] == 2
+    assert payload["truncated"] is False
+
+    types = client.get("/api/products/product-types")
+    assert types.status_code == 200
+    assert set(types.json()["data"]["items"]) >= {"Rings", "Charms"}
+
+
 def test_internal_install_hmac(client, monkeypatch, db_session):
     monkeypatch.setattr("app.config.settings.internal_handoff_secret", "handoff-secret")
     monkeypatch.setattr("app.core.crypto.settings.internal_handoff_secret", "handoff-secret")
@@ -608,3 +642,80 @@ def test_product_atomicity_counters(db_session, shop):
     db_session.refresh(batch)
     assert batch.failed_product_count == 1
     assert batch.status in {BatchStatus.FAILED, BatchStatus.PARTIALLY_COMPLETED, BatchStatus.COMPLETED}
+
+
+def test_stale_recovery_closes_open_attempt_without_unique_violation(db_session, shop, monkeypatch):
+    """Regression: recovering a hung PROCESSING image must not insert attempt_number twice."""
+    monkeypatch.setattr("app.services.retry_service.settings.processing_stale_lock_seconds", 1)
+    monkeypatch.setattr("app.services.retry_service.settings.processing_retry_delay_seconds", 1)
+    ensure_shop_settings(db_session, shop)
+
+    locked_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+    batch = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.MANUAL,
+        status=BatchStatus.PROCESSING,
+        product_count=1,
+        image_count=1,
+        processing_product_count=1,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    bp = BatchProduct(
+        batch_id=batch.id,
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/stale-1",
+        status=BatchProductStatus.PROCESSING,
+        image_count=1,
+        locked_by="worker_old",
+        locked_at=locked_at,
+        claimed_at=locked_at,
+        started_at=locked_at,
+    )
+    db_session.add(bp)
+    db_session.flush()
+    image = BatchImage(
+        batch_product_id=bp.id,
+        shop_id=shop.id,
+        shopify_media_gid="gid://shopify/MediaImage/stale-1",
+        cdn_url="https://cdn.shopify.com/stale.png",
+        delta_type=DeltaType.INITIAL,
+        status=BatchImageStatus.PROCESSING,
+        attempt_count=1,
+        started_at=locked_at,
+    )
+    db_session.add(image)
+    db_session.flush()
+    db_session.add(
+        ProcessingAttempt(
+            batch_image_id=image.id,
+            batch_product_id=bp.id,
+            attempt_number=1,
+            status=AttemptStatus.STARTED,
+            provider="openai",
+            shopify_source_url=image.cdn_url,
+            started_at=locked_at,
+        )
+    )
+    db_session.commit()
+
+    recovered = RetryService(db_session).recover_stale_batch_products(worker_id="worker_new")
+    assert recovered == 1
+
+    db_session.refresh(bp)
+    db_session.refresh(image)
+    assert bp.status == BatchProductStatus.RETRYING
+    assert bp.locked_by is None
+    assert image.status == BatchImageStatus.RETRYING
+
+    attempts = (
+        db_session.query(ProcessingAttempt)
+        .filter(ProcessingAttempt.batch_image_id == image.id)
+        .order_by(ProcessingAttempt.attempt_number.asc())
+        .all()
+    )
+    assert len(attempts) == 1
+    assert attempts[0].attempt_number == 1
+    assert attempts[0].status == AttemptStatus.INTERRUPTED
+    assert attempts[0].error_code == "STALE_LOCK"
+

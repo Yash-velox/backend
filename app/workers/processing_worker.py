@@ -31,6 +31,7 @@ class ProcessingWorker:
     def __init__(self) -> None:
         self.worker_id = settings.effective_worker_id
         self._task: asyncio.Task | None = None
+        self._recover_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
     async def start(self) -> None:
@@ -39,27 +40,50 @@ class ProcessingWorker:
             return
         self._stop.clear()
         self._task = asyncio.create_task(self._run_loop(), name=f"processing-worker-{self.worker_id}")
+        self._recover_task = asyncio.create_task(
+            self._recover_loop(),
+            name=f"processing-recover-{self.worker_id}",
+        )
         logger.info(
-            "Processing worker started | worker_id=%s auto=%s poll=%ss concurrency=%s",
+            "Processing worker started | worker_id=%s auto=%s poll=%ss concurrency=%s stale=%ss",
             self.worker_id,
             settings.auto_processing_enabled,
             settings.processing_poll_interval_seconds,
             settings.processing_batch_concurrency,
+            settings.processing_stale_lock_seconds,
         )
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._task:
+        for task in (self._task, self._recover_task):
+            if not task:
+                continue
             try:
-                await asyncio.wait_for(self._task, timeout=15)
+                await asyncio.wait_for(task, timeout=15)
             except asyncio.TimeoutError:
-                self._task.cancel()
+                task.cancel()
                 try:
-                    await self._task
+                    await task
                 except asyncio.CancelledError:
                     pass
-            self._task = None
+        self._task = None
+        self._recover_task = None
         logger.info("Processing worker stopped | worker_id=%s", self.worker_id)
+
+    async def _recover_loop(self) -> None:
+        """Recover stale locks even while the main loop is blocked on OpenAI/CDN."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.to_thread(self._recover_stale)
+            except Exception:
+                logger.exception("Recover loop error | worker_id=%s", self.worker_id)
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(),
+                    timeout=max(5, min(30, settings.processing_stale_lock_seconds // 4 or 5)),
+                )
+            except asyncio.TimeoutError:
+                continue
 
     async def _run_loop(self) -> None:
         await asyncio.to_thread(self._recover_stale)
@@ -68,7 +92,6 @@ class ProcessingWorker:
                 await asyncio.to_thread(self._convert_secondary_queues)
                 if settings.auto_processing_enabled:
                     await self._process_available_work()
-                await asyncio.to_thread(self._recover_stale)
             except Exception:
                 logger.exception("Worker loop error | worker_id=%s", self.worker_id)
             try:
@@ -179,23 +202,62 @@ processing_worker = ProcessingWorker()
 
 async def kickoff_batch_processing(batch_id: UUID) -> None:
     """Process all queued products in a batch after manual creation."""
-    db = SessionLocal()
-    try:
-        products = (
-            db.query(BatchProduct.id)
-            .filter(
-                BatchProduct.batch_id == batch_id,
-                BatchProduct.status == BatchProductStatus.QUEUED,
-            )
-            .all()
-        )
-        product_ids = [p[0] for p in products]
-        batch = db.get(ProcessingBatch, batch_id)
-        if batch and batch.status == BatchStatus.QUEUED:
-            from datetime import datetime, timezone
+    from datetime import datetime, timezone
 
+    from app.services.state_machine import BATCH_PRODUCT_TRANSITIONS, BATCH_TRANSITIONS, assert_transition
+
+    db = SessionLocal()
+    product_ids: list[UUID] = []
+    try:
+        batch = db.get(ProcessingBatch, batch_id)
+        if batch is None:
+            logger.warning("Manual batch kickoff skipped — batch missing | batch_id=%s", batch_id)
+            return
+        shop = db.get(Shop, batch.shop_id)
+        if shop is None:
+            logger.warning("Manual batch kickoff skipped — shop missing | batch_id=%s", batch_id)
+            return
+
+        if batch.status == BatchStatus.QUEUED:
+            assert_transition("batch", BATCH_TRANSITIONS, batch.status, BatchStatus.PROCESSING)
             batch.status = BatchStatus.PROCESSING
             batch.started_at = datetime.now(timezone.utc)
+            db.commit()
+
+        # Claim QUEUED rows into PROCESSING before process_batch_product — that
+        # path only accepts PROCESSING and would otherwise no-op and leave work idle.
+        primary = PrimaryBatchService(db, shop)
+        dialect = db.bind.dialect.name if db.bind is not None else ""
+        while True:
+            q = (
+                db.query(BatchProduct)
+                .filter(
+                    BatchProduct.batch_id == batch_id,
+                    BatchProduct.status == BatchProductStatus.QUEUED,
+                )
+                .order_by(BatchProduct.created_at.asc())
+            )
+            if dialect == "postgresql":
+                q = q.with_for_update(skip_locked=True)
+            else:
+                q = q.with_for_update()
+            claimed = q.first()
+            if claimed is None:
+                break
+            now = datetime.now(timezone.utc)
+            assert_transition(
+                "batch_product",
+                BATCH_PRODUCT_TRANSITIONS,
+                claimed.status,
+                BatchProductStatus.PROCESSING,
+            )
+            claimed.status = BatchProductStatus.PROCESSING
+            claimed.locked_by = processing_worker.worker_id
+            claimed.locked_at = now
+            claimed.claimed_at = claimed.claimed_at or now
+            claimed.started_at = claimed.started_at or now
+            product_ids.append(claimed.id)
+            primary.refresh_batch_counters(batch)
             db.commit()
     finally:
         db.close()

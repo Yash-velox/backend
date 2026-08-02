@@ -4,6 +4,8 @@ from app.models.enums import (
     BatchProductStatus,
     BatchStatus,
     DeltaType,
+    PromptListStatus,
+    PromptProductTypeSource,
     QueueItemStatus,
     SecondaryQueueStatus,
     ShopStatus,
@@ -13,6 +15,7 @@ from app.models.enums import (
     TriggerType,
     WebhookProcessingResult,
 )
+from app.models.prompts import PromptConfiguration, PromptProductType, PromptStep
 from app.models.queue import (
     BatchImage,
     BatchProduct,
@@ -44,6 +47,11 @@ __all__ = [
     "Product",
     "ProductMedia",
     "ProductVariant",
+    "PromptConfiguration",
+    "PromptListStatus",
+    "PromptProductType",
+    "PromptProductTypeSource",
+    "PromptStep",
     "QueueItemStatus",
     "SecondaryQueueItem",
     "SecondaryQueueStatus",

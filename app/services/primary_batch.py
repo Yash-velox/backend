@@ -28,7 +28,6 @@ from app.models import (
 )
 from app.services.catalog_sync import CatalogSyncService
 from app.services.delta import compare_media_snapshots
-from app.services.prompt_mapping import PromptMappingService
 from app.services.shopify_graphql import ShopifyGraphQLClient, ShopifyGraphQLError
 from app.services.snapshot import media_snapshots_from_models, product_snapshot_from_model
 from app.services.state_machine import BATCH_PRODUCT_TRANSITIONS, BATCH_TRANSITIONS, assert_transition
@@ -46,7 +45,6 @@ class PrimaryBatchService:
     def __init__(self, db: Session, shop: Shop) -> None:
         self.db = db
         self.shop = shop
-        self.prompt_mapping = PromptMappingService()
         self.catalog_sync = CatalogSyncService(db, shop)
 
     def _validate_product_gids(self, product_gids: list[str]) -> list[str]:
@@ -146,7 +144,6 @@ class PrimaryBatchService:
 
             product_snapshot = product_snapshot_from_model(product)
             media_snapshot = media_snapshots_from_models(visible_media)
-            prompts = self.prompt_mapping.resolve_for_product_type(product.product_type)
             baseline = self._get_or_create_baseline(product)
 
             batch_product = BatchProduct(
@@ -155,7 +152,7 @@ class PrimaryBatchService:
                 shopify_product_gid=gid,
                 product_id=product.id,
                 product_snapshot_json=product_snapshot,
-                prompt_snapshot_json=prompts,
+                prompt_snapshot_json=None,
                 baseline_snapshot_json={
                     "product": baseline.product_snapshot_json,
                     "media": baseline.media_snapshot_json,
@@ -263,8 +260,6 @@ class PrimaryBatchService:
                     self.db.add(batch)
                     self.db.flush()
 
-                product_type = eligible_product.get("product_type")
-                prompts = self.prompt_mapping.resolve_for_product_type(product_type)
                 delta_images = delta["new"] + delta["replaced"]
 
                 batch_product = BatchProduct(
@@ -273,7 +268,7 @@ class PrimaryBatchService:
                     shopify_product_gid=item.shopify_product_gid,
                     product_id=product.id if product else None,
                     product_snapshot_json=eligible_product,
-                    prompt_snapshot_json=prompts,
+                    prompt_snapshot_json=None,
                     baseline_snapshot_json={
                         "product": baseline.product_snapshot_json if baseline else None,
                         "media": baseline_media,

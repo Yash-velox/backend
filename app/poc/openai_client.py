@@ -20,10 +20,12 @@ class OpenAIImageClient:
     def __init__(self) -> None:
         if not settings.openai_api_key:
             raise OpenAIImageError("OPENAI_API_KEY is not configured")
-        self._client = OpenAI(api_key=settings.openai_api_key)
+        timeout = float(settings.openai_image_timeout_seconds)
+        self._client = OpenAI(api_key=settings.openai_api_key, timeout=timeout)
         logger.info(
-            "OpenAI client ready | model=%s | key_configured=true",
+            "OpenAI client ready | model=%s | timeout_s=%s | key_configured=true",
             settings.openai_image_model,
+            timeout,
         )
 
     def edit_image(

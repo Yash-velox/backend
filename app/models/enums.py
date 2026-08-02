@@ -84,6 +84,20 @@ class WebhookProcessingResult(str, enum.Enum):
     FAILED = "FAILED"
 
 
+class PromptProductTypeSource(str, enum.Enum):
+    SHOPIFY = "SHOPIFY"
+    MANUAL = "MANUAL"
+
+
+class PromptListStatus(str, enum.Enum):
+    """Computed status for Prompt Management list filtering/display."""
+
+    NOT_CONFIGURED = "NOT_CONFIGURED"
+    ENABLED = "ENABLED"
+    DISABLED = "DISABLED"
+    NOT_READY = "NOT_READY"
+
+
 # Legacy enums kept for old queue compatibility during transition tests
 class SourceType(str, enum.Enum):
     SHOPIFY_PRODUCT_MEDIA = "SHOPIFY_PRODUCT_MEDIA"

@@ -10,6 +10,8 @@ from fastapi.responses import JSONResponse
 
 from app.api.batches_v2 import router as batches_router
 from app.api.internal import router as internal_router
+from app.api.products import router as products_router
+from app.api.prompts import router as prompts_router
 from app.api.secondary_queue import router as secondary_queue_router
 from app.api.settings import router as settings_router
 from app.api.sync import router as sync_router
@@ -118,3 +120,5 @@ app.include_router(sync_router)
 app.include_router(settings_router)
 app.include_router(secondary_queue_router)
 app.include_router(batches_router)
+app.include_router(prompts_router)
+app.include_router(products_router)
