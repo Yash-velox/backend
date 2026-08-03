@@ -32,6 +32,16 @@ class Settings(BaseSettings):
     openai_image_model: str = "gpt-image-1"
     # Hard cap so a hung OpenAI call cannot block the worker forever.
     openai_image_timeout_seconds: float = 180.0
+    # Primary Queue AI path: OPENAI_BATCH (production default) or SYNC (dev/emergency).
+    ai_execution_mode: str = "OPENAI_BATCH"
+    openai_batch_enabled: bool = True
+    # Only when true may Primary Queue fall back to SYNC if Batch is unavailable.
+    openai_allow_sync_fallback: bool = False
+    openai_text_model: str = "gpt-4.1"
+    openai_batch_completion_window: str = "24h"
+    openai_batch_poll_interval_seconds: float = 20.0
+    openai_temp_file_retention_hours: int = 48
+    openai_batch_max_requests: int = 50000
     poc_dev_skip_auth: bool = False
 
     # PostgreSQL (production). SQLite URL allowed for local/tests only.
@@ -50,11 +60,11 @@ class Settings(BaseSettings):
     processing_worker_id: str = ""
     processing_output_directory: str = "storage/processed"
 
-    # Week 2 Auto Sync caps (server-side upper bounds; per-shop settings live in DB)
-    max_products_per_batch_cap: int = 50
+    # Week 2 Auto Sync (server-side bounds; per-shop interval lives in DB)
     batch_interval_minutes_cap: int = 1440
-    default_max_products_per_batch: int = 10
     default_batch_interval_minutes: int = 15
+    # Safety cap when claiming Secondary Queue items into one automatic Primary batch
+    auto_batch_claim_limit: int = 500
     manual_batch_product_limit: int = 50
 
     shopify_image_download_timeout_seconds: int = 60
@@ -72,6 +82,17 @@ class Settings(BaseSettings):
     publish_poll_interval_seconds: float = 3.0
     publish_stale_lock_seconds: int = 600
     publish_worker_id: str = ""
+
+    # Shopify generated-image validation / temp retention (CDN versions)
+    shopify_image_preferred_max_mb: int = 10
+    shopify_image_optimize_warn_mb: int = 10
+    shopify_image_optimize_attempt_mb: int = 15
+    shopify_image_reject_mb: int = 20
+    processing_temp_retry_retention_hours: int = 48
+    # Soft warning thresholds for estimated CDN storage (metadata totals only)
+    image_storage_warn_total_versions: int = 5000
+    image_storage_warn_avg_generated_mb: float = 8.0
+    image_storage_warn_versions_per_product: int = 50
 
     @property
     def cors_origin_list(self) -> list[str]:

@@ -12,7 +12,6 @@ from sqlalchemy.orm import Session
 
 from app.core.shop_resolver import resolve_shop_access_token
 from app.models import (
-    MediaVersionType,
     ProductMediaVersion,
     ProductRollbackOperation,
     RollbackStatus,
@@ -52,6 +51,24 @@ def build_rollback_idempotency_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _cdn_identity(url: str | None) -> str | None:
+    """Stable CDN key: path only (strip host/query — MediaImage GIDs rematerialize, ?v= changes)."""
+    if not url or not isinstance(url, str):
+        return None
+    raw = url.strip()
+    if not raw:
+        return None
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+        path = (parsed.path or "").rstrip("/").lower()
+        return path or None
+    except Exception:
+        path = raw.split("?", 1)[0].split("#", 1)[0].rstrip("/").lower()
+        return path or None
+
+
 def _file_keys(snapshot: dict[str, Any]) -> set[str]:
     keys: set[str] = set()
     for m in snapshot.get("media") or []:
@@ -62,48 +79,170 @@ def _file_keys(snapshot: dict[str, Any]) -> set[str]:
     return keys
 
 
+def _is_distinct_file_gid(file_gid: str | None, media_gid: str | None) -> bool:
+    """True when file_gid is a real File identity, not the MediaImage fallback copy."""
+    if not file_gid:
+        return False
+    if media_gid and file_gid == media_gid:
+        return False
+    # Unified Files API often returns MediaImage GIDs for files; treat as non-distinct.
+    if str(file_gid).startswith("gid://shopify/MediaImage/"):
+        return False
+    return True
+
+
+def _media_identity(m: dict[str, Any]) -> str | None:
+    """Best-effort stable identity across detach/reattach rematerialization."""
+    if not isinstance(m, dict):
+        return None
+    media_gid = m.get("media_gid")
+    file_gid = m.get("file_gid")
+    if _is_distinct_file_gid(file_gid, media_gid):
+        return f"file:{file_gid}"
+    cdn = _cdn_identity(m.get("cdn_url"))
+    if cdn:
+        return f"cdn:{cdn}"
+    if media_gid:
+        return f"media:{media_gid}"
+    if file_gid:
+        return f"file:{file_gid}"
+    return None
+
+
+def _identity_index(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for m in snapshot.get("media") or []:
+        key = _media_identity(m)
+        if key and key not in out:
+            out[key] = m
+    return out
+
+
+def _gid_to_identity(snapshot: dict[str, Any]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for m in snapshot.get("media") or []:
+        key = _media_identity(m)
+        if not key:
+            continue
+        for gid in (m.get("media_gid"), m.get("file_gid")):
+            if gid:
+                mapping[str(gid)] = key
+    return mapping
+
+
+def _ordered_identities(snapshot: dict[str, Any]) -> list[str]:
+    rows = sorted(snapshot.get("media") or [], key=lambda x: x.get("position") or 0)
+    return [key for m in rows if (key := _media_identity(m))]
+
+
 def _compare_by_files(expected: dict[str, Any], live: dict[str, Any]) -> dict[str, Any]:
-    """Conflict check using file/media identity (GIDs may rematerialize after attach)."""
-    # Prefer media_gid comparison when both sides share the same IDs; else file sets.
+    """Conflict check resilient to MediaImage GID rematerialization after attach/detach.
+
+    Snapshot `file_gid` often equals `media_gid` (GraphQL has no separate File id), so
+    GID-only fallbacks false-conflict when Shopify rematerializes MediaImage nodes for
+    the same CDN file. Prefer distinct File GIDs, then CDN path, then media GID.
+    """
     media_conflict = compare_publish_snapshots(expected, live)
     if not media_conflict.get("hasConflict"):
         return media_conflict
 
-    exp_files = _file_keys(expected)
-    live_files = _file_keys(live)
-    added = sorted(live_files - exp_files)
-    removed = sorted(exp_files - live_files)
+    exp_map = _identity_index(expected)
+    live_map = _identity_index(live)
+    exp_ids = set(exp_map)
+    live_ids = set(live_map)
+    added = sorted(live_ids - exp_ids)
+    removed = sorted(exp_ids - live_ids)
+    membership_changed = bool(added or removed)
 
-    exp_order = [
-        m.get("file_gid") or m.get("media_gid")
-        for m in sorted(expected.get("media") or [], key=lambda x: x.get("position") or 0)
-    ]
-    live_order = [
-        m.get("file_gid") or m.get("media_gid")
-        for m in sorted(live.get("media") or [], key=lambda x: x.get("position") or 0)
-    ]
-    shared_exp = [g for g in exp_order if g in live_files]
-    shared_live = [g for g in live_order if g in exp_files]
+    exp_order = _ordered_identities(expected)
+    live_order = _ordered_identities(live)
+    shared_exp = [i for i in exp_order if i in live_ids]
+    shared_live = [i for i in live_order if i in exp_ids]
     order_changed = shared_exp != shared_live
 
-    membership_changed = bool(added or removed)
-    has_conflict = membership_changed or order_changed or media_conflict.get("altChanges") or media_conflict.get(
-        "featuredMediaChanged"
-    ) or media_conflict.get("variantChanges")
+    alt_changes: list[dict[str, Any]] = []
+    for key in sorted(exp_ids & live_ids):
+        b_alt = exp_map[key].get("alt_text") or ""
+        l_alt = live_map[key].get("alt_text") or ""
+        if b_alt != l_alt:
+            alt_changes.append({"identity": key, "baseline": b_alt, "live": l_alt})
 
+    exp_gids = _gid_to_identity(expected)
+    live_gids = _gid_to_identity(live)
+    featured_baseline = expected.get("featured_media_gid")
+    featured_live = live.get("featured_media_gid")
+    featured_b_id = exp_gids.get(str(featured_baseline)) if featured_baseline else None
+    featured_l_id = live_gids.get(str(featured_live)) if featured_live else None
+    featured_changed = bool(featured_b_id and featured_l_id and featured_b_id != featured_l_id)
+
+    exp_variants = {
+        v["variant_gid"]: v.get("media_gid")
+        for v in (expected.get("variants") or [])
+        if isinstance(v, dict) and v.get("variant_gid")
+    }
+    live_variants = {
+        v["variant_gid"]: v.get("media_gid")
+        for v in (live.get("variants") or [])
+        if isinstance(v, dict) and v.get("variant_gid")
+    }
+    variant_changes: list[dict[str, Any]] = []
+    for vgid in sorted(set(exp_variants) | set(live_variants)):
+        b_media = exp_variants.get(vgid)
+        l_media = live_variants.get(vgid)
+        b_id = exp_gids.get(str(b_media)) if b_media else None
+        l_id = live_gids.get(str(l_media)) if l_media else None
+        if b_id != l_id:
+            variant_changes.append(
+                {
+                    "variant_gid": vgid,
+                    "baseline_identity": b_id,
+                    "live_identity": l_id,
+                    "baseline_media_gid": b_media,
+                    "live_media_gid": l_media,
+                }
+            )
+
+    has_conflict = bool(
+        membership_changed or order_changed or alt_changes or featured_changed or variant_changes
+    )
     return {
-        "hasConflict": bool(has_conflict),
+        "hasConflict": has_conflict,
         "membershipChanged": membership_changed,
         "addedMediaIds": added,
         "removedMediaIds": removed,
         "orderChanged": order_changed,
-        "altChanges": media_conflict.get("altChanges") or [],
-        "featuredMediaChanged": media_conflict.get("featuredMediaChanged"),
-        "featuredBaseline": media_conflict.get("featuredBaseline"),
-        "featuredLive": media_conflict.get("featuredLive"),
-        "variantChanges": media_conflict.get("variantChanges") or [],
+        "altChanges": alt_changes,
+        "featuredMediaChanged": featured_changed,
+        "featuredBaseline": featured_baseline,
+        "featuredLive": featured_live,
+        "variantChanges": variant_changes,
         "reprocessRequired": membership_changed,
     }
+
+
+def _enrich_media_cdn_from_file_nodes(
+    media: list[dict[str, Any]],
+    by_id: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Copy CDN URLs from Shopify Files nodes onto snapshot media rows."""
+    enriched: list[dict[str, Any]] = []
+    changed = False
+    for m in media:
+        if not isinstance(m, dict):
+            continue
+        row = dict(m)
+        key = row.get("file_gid") or row.get("media_gid")
+        node = by_id.get(key or "") or {}
+        image_node = node.get("image") or {}
+        live_cdn = image_node.get("url")
+        if live_cdn and row.get("cdn_url") != live_cdn:
+            row["cdn_url"] = live_cdn
+            changed = True
+        if not row.get("file_gid") and key:
+            row["file_gid"] = key
+            changed = True
+        enriched.append(row)
+    return enriched, changed
 
 
 class ProductRollbackService:
@@ -276,6 +415,18 @@ class ProductRollbackService:
             self.db.commit()
             return {"eligible": False, "reason": "VERSION_INCOMPLETE", "warnings": []}
 
+        # Rollback restores durable Shopify Files (CDN). Require file identity per item.
+        missing_file_identity = [
+            m
+            for m in media
+            if isinstance(m, dict) and not (m.get("file_gid") or m.get("media_gid"))
+        ]
+        if missing_file_identity:
+            reason = "Version media missing Shopify file/CDN identity"
+            self.versions.mark_unavailable(target, reason)
+            self.db.commit()
+            return {"eligible": False, "reason": reason, "warnings": []}
+
         file_gids = [m.get("file_gid") or m.get("media_gid") for m in media]
         file_gids = [g for g in file_gids if g]
         warnings: list[str] = []
@@ -312,8 +463,18 @@ class ProductRollbackService:
             self.db.commit()
             return {"eligible": False, "reason": reason, "warnings": warnings}
 
+        # Enrich snapshot CDN URLs from live Shopify Files (preview + conflict identity).
+        items = dict(target.items_json or {})
+        enriched_media, changed = _enrich_media_cdn_from_file_nodes(media, by_id)
+        if changed:
+            items["media"] = enriched_media
+            target.items_json = items
+            self.db.flush()
+
         if not target.rollback_eligible:
             self.versions.mark_eligible(target)
+            self.db.commit()
+        else:
             self.db.commit()
         return {"eligible": True, "reason": None, "warnings": warnings}
 
@@ -362,6 +523,30 @@ class ProductRollbackService:
             op.pre_rollback_snapshot_json = live
             self.db.flush()
 
+            # Enrich active CDN from Files so rematerialized MediaImage GIDs can match by path.
+            active_snap = dict(active.items_json or {})
+            active_media = [m for m in (active_snap.get("media") or []) if isinstance(m, dict)]
+            active_file_gids = [
+                m.get("file_gid") or m.get("media_gid") for m in active_media if (m.get("file_gid") or m.get("media_gid"))
+            ]
+            if active_file_gids:
+                try:
+                    active_nodes = self.client.get_file_statuses(active_file_gids)
+                    active_by_id = {n.get("id"): n for n in active_nodes if n.get("id")}
+                    enriched_active, active_changed = _enrich_media_cdn_from_file_nodes(
+                        active_media, active_by_id
+                    )
+                    if active_changed:
+                        active_snap["media"] = enriched_active
+                        active.items_json = active_snap
+                        self.db.flush()
+                except ShopifyGraphQLError:
+                    logger.warning(
+                        "Could not enrich active version CDN before conflict check | product=%s",
+                        op.shopify_product_gid,
+                        exc_info=True,
+                    )
+
             conflict = _compare_by_files(active.items_json or {}, live)
             if conflict.get("hasConflict"):
                 op.conflict_details = conflict
@@ -404,7 +589,15 @@ class ProductRollbackService:
                 source = v.get("media_gid") or v.get("file_gid")
                 if not variant_gid or not source:
                     continue
-                live_media = file_to_live.get(source)
+                live_media = file_to_live.get(source) or _resolve_live_media_id(
+                    file_to_live, {"media_gid": source, "file_gid": source, "cdn_url": None}
+                )
+                # Prefer CDN match from target media row when GID rematerialized
+                if not live_media:
+                    for tm in target_snap.get("media") or []:
+                        if (tm.get("media_gid") or tm.get("file_gid")) == source:
+                            live_media = _resolve_live_media_id(file_to_live, tm)
+                            break
                 if live_media:
                     variant_inputs.append({"id": variant_gid, "mediaId": live_media})
             if variant_inputs:
@@ -415,8 +608,7 @@ class ProductRollbackService:
             self._set_stage(op, "REORDERING_TARGET_SET")
             ordered_ids = []
             for media in sorted(target_snap.get("media") or [], key=lambda x: x.get("position") or 0):
-                key = media.get("file_gid") or media.get("media_gid")
-                mid = file_to_live.get(key or "")
+                mid = _resolve_live_media_id(file_to_live, media)
                 if mid and mid not in ordered_ids:
                     ordered_ids.append(mid)
             if ordered_ids:
@@ -428,7 +620,11 @@ class ProductRollbackService:
             verify_raw = self.client.get_product_media_snapshot(op.shopify_product_gid)
             verify = normalize_publish_snapshot(verify_raw or {})
             verify_files = _file_keys(verify)
-            if not set(target_file_gids).issubset(verify_files):
+            target_ids = set(_identity_index(target_snap))
+            verify_ids = set(_identity_index(verify))
+            if not set(target_file_gids).issubset(verify_files) and not (
+                target_ids and target_ids.issubset(verify_ids)
+            ):
                 raise RollbackError("ROLLBACK_VERIFICATION_FAILED", "Target media not fully attached")
 
             self._set_stage(op, "DETACHING_CURRENT_SET")
@@ -446,8 +642,7 @@ class ProductRollbackService:
             file_to_live = _map_file_to_media(final_mid)
             ordered_ids = []
             for media in sorted(target_snap.get("media") or [], key=lambda x: x.get("position") or 0):
-                key = media.get("file_gid") or media.get("media_gid")
-                mid = file_to_live.get(key or "")
+                mid = _resolve_live_media_id(file_to_live, media)
                 if mid and mid not in ordered_ids:
                     ordered_ids.append(mid)
             if ordered_ids:
@@ -459,25 +654,50 @@ class ProductRollbackService:
             done_raw = self.client.get_product_media_snapshot(op.shopify_product_gid)
             done = normalize_publish_snapshot(done_raw or {})
             done_files = _file_keys(done)
+            done_ids = set(_identity_index(done))
             if set(done_files) != set(target_file_gids):
-                # Allow media_gid aliasing: require all target files present and no extras from current-only
-                if not set(target_file_gids).issubset(done_files):
+                # Allow media_gid aliasing / CDN rematerialization
+                if target_ids and target_ids == done_ids:
+                    pass
+                elif not set(target_file_gids).issubset(done_files) and not (
+                    target_ids and target_ids.issubset(done_ids)
+                ):
                     raise RollbackError("ROLLBACK_VERIFICATION_FAILED", "Final media membership mismatch")
-                extras = done_files - set(target_file_gids)
-                if extras & set(current_file_gids):
-                    raise RollbackError("ROLLBACK_VERIFICATION_FAILED", "Old media still associated after detach")
+                else:
+                    extras = done_files - set(target_file_gids)
+                    if extras & set(current_file_gids):
+                        # Rematerialized current IDs may not be in done_files as originals
+                        extra_ids = done_ids - target_ids
+                        current_snap_ids = set(_identity_index(pre_snapshot or {}))
+                        if extra_ids & current_snap_ids:
+                            raise RollbackError(
+                                "ROLLBACK_VERIFICATION_FAILED",
+                                "Old media still associated after detach",
+                            )
+                    if target_ids and not target_ids.issubset(done_ids):
+                        raise RollbackError("ROLLBACK_VERIFICATION_FAILED", "Final media membership mismatch")
 
-            # Create new ROLLBACK audit version from live state
-            result = self.versions.create_version(
-                product=product,
-                snapshot=done,
-                version_type=MediaVersionType.ROLLBACK,
-                activate=True,
-                source_version_id=target.id,
+            # Reactivate the selected historical version (no new ROLLBACK row).
+            result = self.versions.activate_existing_version(
+                target,
                 rollback_operation_id=op.id,
-                created_by="rollback",
-                skip_duplicate_hash=False,
             )
+            try:
+                from app.services.image_versions import ImageVersionsService
+
+                media_items = list((result.items_json or {}).get("media") or [])
+                ImageVersionsService(self.db, self.shop).mark_published_for_product_version(
+                    product_id=product.id,
+                    product_media_version_id=result.id,
+                    media_items=media_items,
+                    actor_type="rollback",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to link image versions after rollback | op=%s product=%s",
+                    op.id,
+                    op.shopify_product_gid,
+                )
             now = datetime.now(timezone.utc)
             op.result_version_id = result.id
             op.status = RollbackStatus.ROLLED_BACK
@@ -587,7 +807,9 @@ ACTIVE_ROLLBACK_STATUSES_LOCAL = {RollbackStatus.QUEUED, RollbackStatus.ROLLING_
 
 
 def _map_file_to_media(snapshot: dict[str, Any]) -> dict[str, str]:
+    """Map file/media GIDs (and CDN identities) to live product MediaImage GIDs."""
     mapping: dict[str, str] = {}
+    by_identity = _identity_index(snapshot)
     for m in snapshot.get("media") or []:
         mid = m.get("media_gid")
         if not mid:
@@ -595,7 +817,28 @@ def _map_file_to_media(snapshot: dict[str, Any]) -> dict[str, str]:
         mapping[mid] = mid
         if m.get("file_gid"):
             mapping[m["file_gid"]] = mid
+        key = _media_identity(m)
+        if key:
+            mapping[key] = mid
+    # Allow lookup from historical identities that share CDN with live rows
+    for key, m in by_identity.items():
+        mid = m.get("media_gid")
+        if mid:
+            mapping[key] = mid
     return mapping
+
+
+def _resolve_live_media_id(
+    file_to_live: dict[str, str],
+    media: dict[str, Any],
+) -> str | None:
+    key = media.get("file_gid") or media.get("media_gid")
+    if key and key in file_to_live:
+        return file_to_live[key]
+    ident = _media_identity(media)
+    if ident and ident in file_to_live:
+        return file_to_live[ident]
+    return None
 
 
 def _version_summary(version: ProductMediaVersion | None) -> dict[str, Any] | None:

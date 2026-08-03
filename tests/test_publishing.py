@@ -24,7 +24,7 @@ from app.models import (
 )
 from app.services.output_storage import LocalFilesystemOutputStorage
 from app.services.product_publisher import ProductPublisher
-from app.services.publish_conflict import compare_publish_snapshots
+from app.services.publish_conflict import compare_publish_snapshots, heal_empty_publish_baseline
 from app.services.publish_snapshot import normalize_publish_snapshot, snapshot_hash
 from app.services.publish_trigger import (
     PublishEnqueueError,
@@ -108,6 +108,9 @@ def _seed_completed_batch(db, shop, tmp_path, *, product_status=BatchProductStat
         status=BatchImageStatus.COMPLETED if with_png else BatchImageStatus.FAILED,
         output_storage_key=key if with_png else None,
         output_mime_type="image/png" if with_png else None,
+        # CDN path (Option C): completed images are durable in Shopify Files.
+        generated_shopify_file_gid=f"gid://shopify/File/gen-{media_gid.split('/')[-1]}" if with_png else None,
+        generated_shopify_cdn_url="https://cdn.shopify.com/generated-a.png" if with_png else None,
     )
     db.add(image)
     db.commit()
@@ -172,6 +175,8 @@ def test_missing_output_blocks_publish(db_session, shop, tmp_path, monkeypatch):
     monkeypatch.setattr("app.config.settings.processing_output_directory", str(tmp_path / "processed"))
     batch, product, image = _seed_completed_batch(db_session, shop, tmp_path)
     image.output_storage_key = None
+    image.generated_shopify_file_gid = None
+    image.generated_shopify_cdn_url = None
     db_session.commit()
     svc = PublishTriggerService(db_session, shop)
     try:
@@ -181,18 +186,34 @@ def test_missing_output_blocks_publish(db_session, shop, tmp_path, monkeypatch):
         assert exc.code in {"PUBLISH_OUTPUT_MISSING", "PUBLISH_OUTPUT_INCOMPLETE"}
 
 
-def test_invalid_png_blocks_publish(db_session, shop, tmp_path, monkeypatch):
+def test_invalid_png_blocks_publish_when_no_cdn(db_session, shop, tmp_path, monkeypatch):
     monkeypatch.setattr("app.config.settings.processing_output_directory", str(tmp_path / "processed"))
     batch, product, image = _seed_completed_batch(db_session, shop, tmp_path)
+    # Force legacy local-only path (no Shopify CDN file yet).
+    image.generated_shopify_file_gid = None
+    image.generated_shopify_cdn_url = None
     storage = LocalFilesystemOutputStorage(tmp_path / "processed")
     path = storage.resolve_path(image.output_storage_key)
     path.write_bytes(b"not-a-png")
+    db_session.commit()
     svc = PublishTriggerService(db_session, shop)
     try:
         svc.enqueue_product(product.id)
         assert False, "expected error"
     except PublishEnqueueError as exc:
         assert exc.code == "PUBLISH_OUTPUT_NOT_PNG"
+
+
+def test_cdn_ready_allows_publish_without_local_file(db_session, shop, tmp_path, monkeypatch):
+    monkeypatch.setattr("app.config.settings.processing_output_directory", str(tmp_path / "processed"))
+    batch, product, image = _seed_completed_batch(db_session, shop, tmp_path)
+    image.output_storage_key = None  # temp deleted after CDN upload
+    db_session.commit()
+    result = PublishTriggerService(db_session, shop).enqueue_product(product.id)
+    assert result["status"] == PublishStatus.QUEUED.value
+    op = db_session.query(ProductPublishOperation).filter_by(batch_product_id=product.id).one()
+    assert op.assets_json[0]["shopify_file_gid"] == image.generated_shopify_file_gid
+    assert op.assets_json[0]["upload_status"] == "READY"
 
 
 def test_manual_enqueue_idempotent(db_session, shop, tmp_path, monkeypatch):
@@ -258,6 +279,119 @@ def test_conflict_detects_added_removed_reorder_alt(db_session):
     alt = _snapshot([_media("gid://shopify/MediaImage/1", 0, alt="changed"), _media("gid://shopify/MediaImage/2", 1, alt="b")])
     diff4 = compare_publish_snapshots(baseline, alt)
     assert diff4["altChanges"]
+
+
+def test_heal_empty_baseline_when_sources_match_live():
+    empty = {"product_gid": "gid://shopify/Product/1", "media": [], "variants": []}
+    live = _snapshot([_media("gid://shopify/MediaImage/10", 0, alt="front", featured=True)])
+    assets = [{"source_media_gid": "gid://shopify/MediaImage/10"}]
+    healed, did = heal_empty_publish_baseline(empty, live, assets)
+    assert did is True
+    assert len(healed["media"]) == 1
+    assert compare_publish_snapshots(healed, live)["hasConflict"] is False
+
+
+def test_heal_empty_baseline_skips_when_live_differs():
+    empty = {"product_gid": "gid://shopify/Product/1", "media": [], "variants": []}
+    live = _snapshot([_media("gid://shopify/MediaImage/99", 0, alt="other", featured=True)])
+    assets = [{"source_media_gid": "gid://shopify/MediaImage/10"}]
+    healed, did = heal_empty_publish_baseline(empty, live, assets)
+    assert did is False
+    assert healed.get("media") == []
+
+
+def test_publisher_heals_empty_baseline_false_conflict(db_session, shop, tmp_path, monkeypatch):
+    monkeypatch.setattr("app.config.settings.processing_output_directory", str(tmp_path / "processed"))
+    monkeypatch.setattr("app.config.settings.shopify_file_status_poll_seconds", 0.01)
+    monkeypatch.setattr("app.config.settings.shopify_file_ready_timeout_seconds", 1)
+    monkeypatch.setattr("app.config.settings.shopify_reorder_timeout_seconds", 1)
+
+    batch, product, image = _seed_completed_batch(db_session, shop, tmp_path)
+    # Legacy bug: empty ProcessingBaseline copied into publish baseline.
+    product.baseline_snapshot_json = {"product_gid": "gid://shopify/Product/1", "media": []}
+    db_session.commit()
+
+    result = PublishTriggerService(db_session, shop).enqueue_product(product.id)
+    op_id = UUID(result["operationId"])
+    op = db_session.query(ProductPublishOperation).filter_by(id=op_id).one()
+    op.baseline_snapshot_json = {"product_gid": "gid://shopify/Product/1", "media": []}
+    db_session.commit()
+
+    generated_gid = image.generated_shopify_file_gid
+    original_media = {
+        "id": "gid://shopify/MediaImage/10",
+        "mediaContentType": "IMAGE",
+        "alt": "front",
+        "image": {"url": "https://cdn.shopify.com/a.png", "width": 10, "height": 10},
+    }
+    new_media = {
+        "id": generated_gid,
+        "mediaContentType": "IMAGE",
+        "alt": "front",
+        "image": {"url": "https://cdn.shopify.com/generated-a.png", "width": 10, "height": 10},
+    }
+    snap_original = {
+        "id": "gid://shopify/Product/1",
+        "updatedAt": "2026-07-31T00:00:00Z",
+        "featuredMedia": {"id": "gid://shopify/MediaImage/10"},
+        "media": {"nodes": [original_media]},
+        "variants": {
+            "nodes": [
+                {
+                    "id": "gid://shopify/ProductVariant/1",
+                    "media": {"nodes": [{"id": "gid://shopify/MediaImage/10"}]},
+                }
+            ]
+        },
+    }
+    snap_both = {
+        **snap_original,
+        "media": {"nodes": [original_media, new_media]},
+        "featuredMedia": {"id": generated_gid},
+    }
+    snap_final = {
+        **snap_original,
+        "media": {"nodes": [new_media]},
+        "featuredMedia": {"id": generated_gid},
+        "variants": {
+            "nodes": [
+                {
+                    "id": "gid://shopify/ProductVariant/1",
+                    "media": {"nodes": [{"id": generated_gid}]},
+                }
+            ]
+        },
+    }
+
+    client = MagicMock()
+    client.get_product_media_snapshot.side_effect = [
+        snap_original,
+        snap_original,
+        snap_both,
+        snap_both,
+        snap_final,
+    ]
+    client.add_file_product_references.return_value = [{"id": generated_gid}]
+    client.remove_file_product_references.return_value = []
+    client.update_file_alt_text.return_value = {}
+    client.associate_media_to_variants.return_value = []
+    client.reorder_product_media.return_value = {"id": "gid://shopify/Job/1", "done": True}
+    client.get_job_status.return_value = {"id": "gid://shopify/Job/1", "done": True}
+    client.get_file_statuses.return_value = [
+        {
+            "id": generated_gid,
+            "fileStatus": "READY",
+            "image": {"url": "https://cdn.shopify.com/generated-a.png", "width": 10, "height": 10},
+        }
+    ]
+
+    publisher = ProductPublisher(db_session, shop, client=client)
+    with patch.object(publisher.uploader, "upload_png") as upload_mock:
+        out = publisher.run(op_id)
+        upload_mock.assert_not_called()
+
+    assert out.status == PublishStatus.PUBLISHED, (out.last_error_code, out.last_error_message)
+    assert out.baseline_snapshot_json and (out.baseline_snapshot_json.get("media") or [])
 
 
 def test_snapshot_hash_stable():
@@ -395,9 +529,11 @@ def test_publisher_success_never_file_delete(db_session, shop, tmp_path, monkeyp
     monkeypatch.setattr("app.config.settings.shopify_file_ready_timeout_seconds", 1)
     monkeypatch.setattr("app.config.settings.shopify_reorder_timeout_seconds", 1)
 
-    batch, product, _ = _seed_completed_batch(db_session, shop, tmp_path)
+    batch, product, image = _seed_completed_batch(db_session, shop, tmp_path)
     result = PublishTriggerService(db_session, shop).enqueue_product(product.id)
     op_id = UUID(result["operationId"])
+    generated_gid = image.generated_shopify_file_gid
+    assert generated_gid
 
     original_media = {
         "id": "gid://shopify/MediaImage/10",
@@ -406,13 +542,12 @@ def test_publisher_success_never_file_delete(db_session, shop, tmp_path, monkeyp
         "image": {"url": "https://cdn.shopify.com/a.png", "width": 10, "height": 10},
     }
     new_media = {
-        "id": "gid://shopify/MediaImage/999",
+        "id": generated_gid,
         "mediaContentType": "IMAGE",
         "alt": "front",
-        "image": {"url": "https://cdn.shopify.com/new.png", "width": 10, "height": 10},
+        "image": {"url": "https://cdn.shopify.com/generated-a.png", "width": 10, "height": 10},
     }
 
-    # Snapshots: baseline match → after attach both → after detach only new
     snap_original = {
         "id": "gid://shopify/Product/1",
         "updatedAt": "2026-07-31T00:00:00Z",
@@ -430,17 +565,17 @@ def test_publisher_success_never_file_delete(db_session, shop, tmp_path, monkeyp
     snap_both = {
         **snap_original,
         "media": {"nodes": [original_media, new_media]},
-        "featuredMedia": {"id": "gid://shopify/MediaImage/999"},
+        "featuredMedia": {"id": generated_gid},
     }
     snap_final = {
         **snap_original,
         "media": {"nodes": [new_media]},
-        "featuredMedia": {"id": "gid://shopify/MediaImage/999"},
+        "featuredMedia": {"id": generated_gid},
         "variants": {
             "nodes": [
                 {
                     "id": "gid://shopify/ProductVariant/1",
-                    "media": {"nodes": [{"id": "gid://shopify/MediaImage/999"}]},
+                    "media": {"nodes": [{"id": generated_gid}]},
                 }
             ]
         },
@@ -448,33 +583,32 @@ def test_publisher_success_never_file_delete(db_session, shop, tmp_path, monkeyp
 
     client = MagicMock()
     client.get_product_media_snapshot.side_effect = [
-        snap_original,  # conflict check
-        snap_original,  # pre-attach recheck
-        snap_both,  # after attach
-        snap_both,  # verify new
-        snap_final,  # final verify
+        snap_original,
+        snap_original,
+        snap_both,
+        snap_both,
+        snap_final,
     ]
-    client.add_file_product_references.return_value = [{"id": "gid://shopify/MediaImage/999"}]
+    client.add_file_product_references.return_value = [{"id": generated_gid}]
     client.remove_file_product_references.return_value = []
     client.update_file_alt_text.return_value = {}
     client.associate_media_to_variants.return_value = []
     client.reorder_product_media.return_value = {"id": "gid://shopify/Job/1", "done": True}
     client.get_job_status.return_value = {"id": "gid://shopify/Job/1", "done": True}
+    client.get_file_statuses.return_value = [
+        {
+            "id": generated_gid,
+            "fileStatus": "READY",
+            "image": {"url": "https://cdn.shopify.com/generated-a.png", "width": 10, "height": 10},
+        }
+    ]
 
     publisher = ProductPublisher(db_session, shop, client=client)
-
-    def fake_upload(*, path, filename, existing_file_gid=None):
-        return {
-            "file_gid": "gid://shopify/MediaImage/999",
-            "file_status": "READY",
-            "cdn_url": "https://cdn.shopify.com/new.png",
-        }
-
-    with patch.object(publisher.uploader, "upload_png", side_effect=fake_upload):
+    with patch.object(publisher.uploader, "upload_png") as upload_mock:
         out = publisher.run(op_id)
+        upload_mock.assert_not_called()
 
-    assert out.status == PublishStatus.PUBLISHED
-    # Never delete files — only remove product references
+    assert out.status == PublishStatus.PUBLISHED, (out.last_error_code, out.last_error_message)
     assert not hasattr(client, "fileDelete") or not getattr(client, "fileDelete", MagicMock()).called
     remove_calls = client.remove_file_product_references.call_args_list
     assert remove_calls
@@ -482,6 +616,8 @@ def test_publisher_success_never_file_delete(db_session, shop, tmp_path, monkeyp
         kwargs = call.kwargs
         assert kwargs["product_gid"] == "gid://shopify/Product/1"
         assert "gid://shopify/Product/" not in str(kwargs["file_gids"])
+    assert out.assets_json[0]["shopify_file_gid"] == generated_gid
+    assert out.assets_json[0]["shopify_cdn_url"]
 
 
 def test_normalize_publish_snapshot_from_graphql():

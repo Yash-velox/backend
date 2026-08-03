@@ -28,10 +28,19 @@ class ManualBatchCreateRequest(BaseModel):
     productGids: list[str] = Field(min_length=1)
 
 
+class ReprocessPromptStepIn(BaseModel):
+    name: str | None = None
+    promptTemplate: str | None = None
+    prompt: str | None = None
+
+
+class ReprocessRequest(BaseModel):
+    steps: list[ReprocessPromptStepIn] | None = None
+
+
 class SettingsOut(BaseModel):
     autoSyncEnabled: bool
     autoPublishProcessedImages: bool
-    maxProductsPerBatch: int
     batchIntervalMinutes: int
     createdAt: datetime
     updatedAt: datetime
@@ -40,7 +49,6 @@ class SettingsOut(BaseModel):
 class SettingsUpdateRequest(BaseModel):
     autoSyncEnabled: bool | None = None
     autoPublishProcessedImages: bool | None = None
-    maxProductsPerBatch: int | None = None
     batchIntervalMinutes: int | None = None
 
 
@@ -90,6 +98,12 @@ class BatchOut(BaseModel):
     id: UUID
     triggerType: str
     status: str
+    processingPhase: str | None = None
+    currentWorkflowStep: int = 0
+    totalWorkflowSteps: int = 0
+    openaiRequestsTotal: int = 0
+    openaiRequestsCompleted: int = 0
+    openaiRequestsFailed: int = 0
     productCount: int
     imageCount: int
     pendingProductCount: int
@@ -145,6 +159,9 @@ class BatchImageOut(BaseModel):
     outputUrl: str | None = None
     outputMimeType: str | None = None
     outputChecksum: str | None = None
+    generatedShopifyFileGid: str | None = None
+    generatedShopifyCdnUrl: str | None = None
+    generatedImageVersionId: UUID | None = None
     errorCode: str | None = None
     errorMessage: str | None = None
     startedAt: datetime | None = None

@@ -5,7 +5,7 @@ import uuid
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 
 from app.core.deps import CurrentShop, DbSession
 from app.models import BatchImage, BatchStatus
@@ -16,10 +16,12 @@ from app.schemas.week2 import (
     BatchProductOut,
     ManualBatchCreateRequest,
     PaginationMeta,
+    ReprocessRequest,
     SuccessEnvelope,
 )
 from app.services.output_storage import get_output_storage
 from app.services.primary_batch import PrimaryBatchError, PrimaryBatchService
+from app.services.reprocess_service import ReprocessError, ReprocessService
 from app.services.retry_service import RetryService
 
 router = APIRouter(prefix="/api/batches", tags=["batches"])
@@ -34,6 +36,12 @@ def _batch_out(batch) -> BatchOut:
         id=batch.id,
         triggerType=batch.trigger_type.value,
         status=batch.status.value,
+        processingPhase=getattr(batch, "processing_phase", None),
+        currentWorkflowStep=int(getattr(batch, "current_workflow_step", 0) or 0),
+        totalWorkflowSteps=int(getattr(batch, "total_workflow_steps", 0) or 0),
+        openaiRequestsTotal=int(getattr(batch, "openai_requests_total", 0) or 0),
+        openaiRequestsCompleted=int(getattr(batch, "openai_requests_completed", 0) or 0),
+        openaiRequestsFailed=int(getattr(batch, "openai_requests_failed", 0) or 0),
         productCount=batch.product_count,
         imageCount=batch.image_count,
         pendingProductCount=batch.pending_product_count,
@@ -111,6 +119,9 @@ def _image_out(image, *, include_attempts: bool = False) -> BatchImageOut:
         outputUrl=image.output_url,
         outputMimeType=image.output_mime_type,
         outputChecksum=image.output_checksum,
+        generatedShopifyFileGid=image.generated_shopify_file_gid,
+        generatedShopifyCdnUrl=image.generated_shopify_cdn_url,
+        generatedImageVersionId=image.generated_image_version_id,
         errorCode=image.error_code,
         errorMessage=image.error_message,
         startedAt=image.started_at,
@@ -243,6 +254,15 @@ def get_batch_image_output(image_id: UUID, db: DbSession, shop: CurrentShop):
     )
     if image is None:
         raise HTTPException(status_code=404, detail="Batch image not found")
+
+    # Prefer durable Shopify CDN after local temp cleanup.
+    if image.generated_shopify_cdn_url:
+        return RedirectResponse(
+            url=image.generated_shopify_cdn_url,
+            status_code=302,
+            headers={"Cache-Control": "private, max-age=300"},
+        )
+
     if not image.output_storage_key:
         raise HTTPException(status_code=404, detail="Processed output not available yet")
 
@@ -285,6 +305,130 @@ def retry_failed_batch_products(
             "retriedCount": len(products),
             "productIds": [str(p.id) for p in products],
         },
+    )
+
+
+def _reprocess_http(exc: ReprocessError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+@router.get("/{batch_id}/reprocess/preview")
+def preview_batch_reprocess(
+    batch_id: UUID,
+    request: Request,
+    db: DbSession,
+    shop: CurrentShop,
+):
+    try:
+        data = ReprocessService(db, shop).preview_for_batch(batch_id)
+    except ReprocessError as exc:
+        raise _reprocess_http(exc) from exc
+    return SuccessEnvelope(
+        success=True,
+        message="Batch reprocess prompt preview.",
+        requestId=_request_id(request),
+        data=data,
+    )
+
+
+@router.post("/{batch_id}/reprocess")
+def reprocess_batch(
+    batch_id: UUID,
+    payload: ReprocessRequest,
+    request: Request,
+    db: DbSession,
+    shop: CurrentShop,
+):
+    steps = [s.model_dump(exclude_none=True) for s in payload.steps] if payload.steps is not None else None
+    try:
+        data = ReprocessService(db, shop).reprocess_batch(batch_id, steps=steps)
+    except ReprocessError as exc:
+        raise _reprocess_http(exc) from exc
+    return SuccessEnvelope(
+        success=True,
+        message="Batch queued for reprocess.",
+        requestId=_request_id(request),
+        data=data,
+    )
+
+
+@router.get("/products/{product_id}/reprocess/preview")
+def preview_product_reprocess(
+    product_id: UUID,
+    request: Request,
+    db: DbSession,
+    shop: CurrentShop,
+):
+    try:
+        data = ReprocessService(db, shop).preview_for_product(product_id)
+    except ReprocessError as exc:
+        raise _reprocess_http(exc) from exc
+    return SuccessEnvelope(
+        success=True,
+        message="Product reprocess prompt preview.",
+        requestId=_request_id(request),
+        data=data,
+    )
+
+
+@router.post("/products/{product_id}/reprocess")
+def reprocess_product(
+    product_id: UUID,
+    payload: ReprocessRequest,
+    request: Request,
+    db: DbSession,
+    shop: CurrentShop,
+):
+    steps = [s.model_dump(exclude_none=True) for s in payload.steps] if payload.steps is not None else None
+    try:
+        data = ReprocessService(db, shop).reprocess_product(product_id, steps=steps)
+    except ReprocessError as exc:
+        raise _reprocess_http(exc) from exc
+    return SuccessEnvelope(
+        success=True,
+        message="Product queued for reprocess.",
+        requestId=_request_id(request),
+        data=data,
+    )
+
+
+@router.get("/images/{image_id}/reprocess/preview")
+def preview_image_reprocess(
+    image_id: UUID,
+    request: Request,
+    db: DbSession,
+    shop: CurrentShop,
+):
+    try:
+        data = ReprocessService(db, shop).preview_for_image(image_id)
+    except ReprocessError as exc:
+        raise _reprocess_http(exc) from exc
+    return SuccessEnvelope(
+        success=True,
+        message="Image reprocess prompt preview.",
+        requestId=_request_id(request),
+        data=data,
+    )
+
+
+@router.post("/images/{image_id}/reprocess")
+def reprocess_image(
+    image_id: UUID,
+    payload: ReprocessRequest,
+    request: Request,
+    db: DbSession,
+    shop: CurrentShop,
+):
+    steps = [s.model_dump(exclude_none=True) for s in payload.steps] if payload.steps is not None else None
+    try:
+        data = ReprocessService(db, shop).reprocess_image(image_id, steps=steps)
+    except ReprocessError as exc:
+        raise _reprocess_http(exc) from exc
+    return SuccessEnvelope(
+        success=True,
+        message="Image queued for reprocess.",
+        requestId=_request_id(request),
+        data=data,
     )
 
 

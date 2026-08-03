@@ -297,6 +297,12 @@ class CatalogSyncService:
             media.content_fingerprint = fp
             media.shopify_updated_at = updated if isinstance(updated, datetime) else None
             media.is_active = True
+            self.db.flush()
+            from app.services.image_versions import ImageVersionsService
+
+            ImageVersionsService(self.db, self.shop).ensure_original_from_media(
+                media, actor_type="catalog_sync"
+            )
 
         existing = (
             self.db.query(ProductMedia)

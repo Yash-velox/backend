@@ -92,15 +92,47 @@ class MediaVersionsService:
 
     def list_versions(self, product_id: UUID) -> list[ProductMediaVersion]:
         self.get_product(product_id)
+        self._collapse_active_rollback_to_source(product_id)
         return (
             self.db.query(ProductMediaVersion)
             .filter(
                 ProductMediaVersion.shop_id == self.shop.id,
                 ProductMediaVersion.product_id == product_id,
+                ProductMediaVersion.version_type != MediaVersionType.ROLLBACK,
             )
             .order_by(ProductMediaVersion.version_number.desc())
             .all()
         )
+
+    def _collapse_active_rollback_to_source(self, product_id: UUID) -> None:
+        """For older data: if a ROLLBACK row is active, reactivate its source ORIGINAL/PUBLISHED."""
+        active_rollback = (
+            self.db.query(ProductMediaVersion)
+            .filter(
+                ProductMediaVersion.shop_id == self.shop.id,
+                ProductMediaVersion.product_id == product_id,
+                ProductMediaVersion.is_active.is_(True),
+                ProductMediaVersion.version_type == MediaVersionType.ROLLBACK,
+            )
+            .one_or_none()
+        )
+        if not active_rollback or not active_rollback.source_version_id:
+            return
+        source = (
+            self.db.query(ProductMediaVersion)
+            .filter(
+                ProductMediaVersion.id == active_rollback.source_version_id,
+                ProductMediaVersion.shop_id == self.shop.id,
+                ProductMediaVersion.product_id == product_id,
+            )
+            .one_or_none()
+        )
+        if not source or source.version_type == MediaVersionType.ROLLBACK:
+            return
+        active_rollback.is_active = False
+        self.activate_existing_version(source)
+        self.db.commit()
+
 
     def get_version(self, product_id: UUID, version_id: UUID) -> ProductMediaVersion:
         version = (
@@ -224,6 +256,31 @@ class MediaVersionsService:
         )
         for v in versions:
             v.is_active = False
+
+    def activate_existing_version(
+        self,
+        version: ProductMediaVersion,
+        *,
+        rollback_operation_id: UUID | None = None,
+    ) -> ProductMediaVersion:
+        """Mark an existing ORIGINAL/PUBLISHED version active without creating a ROLLBACK row."""
+        if version.shop_id != self.shop.id:
+            raise MediaVersionError("VERSION_NOT_FOUND", "Version not found")
+        if version.is_active:
+            return version
+        self._deactivate_all(version.product_id)
+        version.is_active = True
+        version.activated_at = datetime.now(timezone.utc)
+        if rollback_operation_id is not None:
+            version.rollback_operation_id = rollback_operation_id
+        self.db.flush()
+        logger.info(
+            "Activated existing media version | product=%s number=%s type=%s",
+            version.product_id,
+            version.version_number,
+            version.version_type.value,
+        )
+        return version
 
     def record_publish_success(
         self,

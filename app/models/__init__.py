@@ -1,12 +1,20 @@
 from app.models.enums import (
+    AiExecutionMode,
     AttemptStatus,
     BatchImageStatus,
     BatchProductStatus,
     BatchStatus,
     DeltaType,
+    ImageVersionEventType,
+    ImageVersionType,
     MediaVersionType,
+    OpenAIBatchRequestStatus,
+    OpenAIBatchStatus,
+    OpenAITempFileCleanupStatus,
+    ProcessingPhase,
     PromptListStatus,
     PromptProductTypeSource,
+    PromptStepType,
     PublishStatus,
     PublishTriggerSource,
     QueueItemStatus,
@@ -19,6 +27,8 @@ from app.models.enums import (
     TriggerType,
     WebhookProcessingResult,
 )
+from app.models.image_versions import ImageVersion, ImageVersionEvent
+from app.models.openai_batch import OpenAIBatch, OpenAIBatchRequest, OpenAITemporaryFile
 from app.models.prompts import PromptConfiguration, PromptProductType, PromptStep
 from app.models.publishing import ProductPublishOperation
 from app.models.queue import (
@@ -40,6 +50,7 @@ from app.models.queue import (
 from app.models.versions import ProductMediaVersion, ProductRollbackOperation
 
 __all__ = [
+    "AiExecutionMode",
     "AttemptStatus",
     "BatchImage",
     "BatchImageStatus",
@@ -47,10 +58,21 @@ __all__ = [
     "BatchProductStatus",
     "BatchStatus",
     "DeltaType",
+    "ImageVersion",
+    "ImageVersionEvent",
+    "ImageVersionEventType",
+    "ImageVersionType",
     "MediaVersionType",
+    "OpenAIBatch",
+    "OpenAIBatchRequest",
+    "OpenAIBatchRequestStatus",
+    "OpenAIBatchStatus",
+    "OpenAITempFileCleanupStatus",
+    "OpenAITemporaryFile",
     "ProcessingAttempt",
     "ProcessingBaseline",
     "ProcessingBatch",
+    "ProcessingPhase",
     "Product",
     "ProductMedia",
     "ProductMediaVersion",
@@ -62,6 +84,7 @@ __all__ = [
     "PromptProductType",
     "PromptProductTypeSource",
     "PromptStep",
+    "PromptStepType",
     "PublishStatus",
     "PublishTriggerSource",
     "QueueItemStatus",

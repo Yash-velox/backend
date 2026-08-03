@@ -45,6 +45,7 @@ def _step_out(step) -> dict:
         name=step.name,
         promptText=step.prompt_text,
         stepOrder=step.step_order,
+        stepType=getattr(step.step_type, "value", None) or getattr(step, "step_type", None) or "IMAGE",
         isEnabled=step.is_enabled,
         variables=extract_variables(step.prompt_text),
         createdAt=step.created_at,
@@ -230,6 +231,7 @@ def add_step(
             name=payload.name,
             prompt_text=payload.promptText,
             is_enabled=payload.isEnabled,
+            step_type=payload.stepType,
         )
     except (PromptProductTypeError, PromptConfigurationError) as exc:
         _raise_domain(exc)
@@ -300,6 +302,7 @@ def update_step(
             name=payload.name,
             prompt_text=payload.promptText,
             is_enabled=payload.isEnabled,
+            step_type=payload.stepType,
         )
     except PromptConfigurationError as exc:
         _raise_domain(exc)

@@ -374,15 +374,17 @@ def test_processor_runs_sequential_steps_and_retry_resolves_new_config(
     db_session.commit()
 
     src = tmp_path / "src.png"
-    # Minimal valid-looking PNG header path used only as bytes source after download mock
-    png_bytes = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+    # Valid minimal PNG so post-AI Shopify validation can succeed when upload is mocked
+    from tests.test_publishing import PNG_BYTES
+
+    png_bytes = PNG_BYTES
     src.write_bytes(png_bytes)
 
     calls: list[str] = []
 
     def fake_edit(*, image_bytes, prompt, job_id, step, **_kwargs):
         calls.append(prompt)
-        return b"out-" + str(step).encode() + image_bytes[:4]
+        return PNG_BYTES
 
     openai = MagicMock()
     openai.edit_image.side_effect = fake_edit
@@ -392,6 +394,22 @@ def test_processor_runs_sequential_steps_and_retry_resolves_new_config(
         path.write_bytes(png_bytes)
         return path
 
+    def fake_upload_generated(self, *, shop, image, batch_product, attempt):
+        from datetime import datetime, timezone
+
+        from app.models import AttemptStatus, BatchImageStatus
+        from app.services.state_machine import BATCH_IMAGE_TRANSITIONS, assert_transition
+
+        assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.UPLOADING)
+        image.status = BatchImageStatus.UPLOADING
+        assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.COMPLETED)
+        image.status = BatchImageStatus.COMPLETED
+        image.generated_shopify_file_gid = "gid://shopify/File/fake"
+        image.generated_shopify_cdn_url = "https://cdn.shopify.com/fake.png"
+        image.completed_at = datetime.now(timezone.utc)
+        attempt.status = AttemptStatus.COMPLETED
+        attempt.completed_at = datetime.now(timezone.utc)
+
     monkeypatch.setattr(
         "app.services.image_processor.download_shopify_cdn_to_temp",
         fake_download,
@@ -399,6 +417,11 @@ def test_processor_runs_sequential_steps_and_retry_resolves_new_config(
     monkeypatch.setattr(
         "app.services.image_processor.settings.processing_output_directory",
         str(tmp_path / "out"),
+    )
+    monkeypatch.setattr(
+        ImageProcessor,
+        "_upload_generated_output",
+        fake_upload_generated,
     )
 
     processor = ImageProcessor(db_session, openai_client=openai)
@@ -417,6 +440,7 @@ def test_processor_runs_sequential_steps_and_retry_resolves_new_config(
     image.error_message = None
     image.completed_at = None
     image.output_storage_key = None
+    image.generated_shopify_file_gid = None
     image.current_prompt_step = 0
     bp.status = BatchProductStatus.PROCESSING
     bp.prompt_snapshot_json = None

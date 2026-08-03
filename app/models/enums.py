@@ -59,6 +59,7 @@ class BatchImageStatus(str, enum.Enum):
     DOWNLOADING = "DOWNLOADING"
     PROCESSING = "PROCESSING"
     WAITING_FOR_PROVIDER = "WAITING_FOR_PROVIDER"
+    UPLOADING = "UPLOADING"
     RETRYING = "RETRYING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
@@ -75,6 +76,66 @@ class AttemptStatus(str, enum.Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     INTERRUPTED = "INTERRUPTED"
+
+
+class PromptStepType(str, enum.Enum):
+    """Discriminates OpenAI endpoint used for a workflow step."""
+
+    IMAGE = "IMAGE"
+    DESCRIPTION = "DESCRIPTION"
+
+
+class AiExecutionMode(str, enum.Enum):
+    """Server-side execution path for Primary Queue AI work."""
+
+    SYNC = "SYNC"
+    OPENAI_BATCH = "OPENAI_BATCH"
+
+
+class ProcessingPhase(str, enum.Enum):
+    """Detailed Primary Queue phase while top-level status stays PROCESSING."""
+
+    PREPARING_OPENAI_STAGE = "PREPARING_OPENAI_STAGE"
+    UPLOADING_BATCH_INPUT = "UPLOADING_BATCH_INPUT"
+    OPENAI_BATCH_SUBMITTED = "OPENAI_BATCH_SUBMITTED"
+    WAITING_FOR_OPENAI = "WAITING_FOR_OPENAI"
+    COLLECTING_OPENAI_RESULTS = "COLLECTING_OPENAI_RESULTS"
+    IMPORTING_STAGE_RESULTS = "IMPORTING_STAGE_RESULTS"
+    RETRYING_FAILED_REQUESTS = "RETRYING_FAILED_REQUESTS"
+    PREPARING_NEXT_STAGE = "PREPARING_NEXT_STAGE"
+    AI_WORKFLOW_COMPLETE = "AI_WORKFLOW_COMPLETE"
+    UPLOADING_TO_SHOPIFY_FILES = "UPLOADING_TO_SHOPIFY_FILES"
+    READY_TO_PUBLISH = "READY_TO_PUBLISH"
+
+
+class OpenAIBatchStatus(str, enum.Enum):
+    """Mirror of OpenAI Platform Batch API statuses plus local draft states."""
+
+    DRAFT = "draft"
+    VALIDATING = "validating"
+    IN_PROGRESS = "in_progress"
+    FINALIZING = "finalizing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    EXPIRED = "expired"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
+
+
+class OpenAIBatchRequestStatus(str, enum.Enum):
+    PENDING = "pending"
+    SUBMITTED = "submitted"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+
+
+class OpenAITempFileCleanupStatus(str, enum.Enum):
+    ACTIVE = "ACTIVE"
+    PENDING_DELETE = "PENDING_DELETE"
+    DELETED = "DELETED"
+    DELETE_FAILED = "DELETE_FAILED"
 
 
 class WebhookProcessingResult(str, enum.Enum):
@@ -120,6 +181,24 @@ class MediaVersionType(str, enum.Enum):
     ORIGINAL = "ORIGINAL"
     PUBLISHED = "PUBLISHED"
     ROLLBACK = "ROLLBACK"
+
+
+class ImageVersionType(str, enum.Enum):
+    """Per-image lineage version types (product-level still owns PUBLISHED/ROLLBACK)."""
+
+    ORIGINAL = "ORIGINAL"
+    GENERATED = "GENERATED"
+
+
+class ImageVersionEventType(str, enum.Enum):
+    ORIGINAL_REGISTERED = "ORIGINAL_REGISTERED"
+    VERSION_GENERATED = "VERSION_GENERATED"
+    VERSION_UPLOADED = "VERSION_UPLOADED"
+    VERSION_PUBLISHED = "VERSION_PUBLISHED"
+    VERSION_SUPERSEDED = "VERSION_SUPERSEDED"
+    VERSION_INCLUDED_IN_PRODUCT_SNAPSHOT = "VERSION_INCLUDED_IN_PRODUCT_SNAPSHOT"
+    UPLOAD_FAILED = "UPLOAD_FAILED"
+    PUBLISH_FAILED = "PUBLISH_FAILED"
 
 
 class RollbackStatus(str, enum.Enum):

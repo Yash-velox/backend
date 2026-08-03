@@ -7,6 +7,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models import (
     Product,
     SecondaryQueueItem,
@@ -164,7 +165,8 @@ class SecondaryQueueService:
         }
 
     def claim_pending_for_conversion(self, *, limit: int, worker_id: str) -> list[SecondaryQueueItem]:
-        limit = min(max(limit, 1), 100)
+        hard_cap = max(settings.auto_batch_claim_limit, 1)
+        limit = min(max(limit, 1), hard_cap)
         now = datetime.now(timezone.utc)
         dialect = self.db.bind.dialect.name if self.db.bind is not None else ""
 

@@ -245,36 +245,41 @@ class WebhookIntakeService:
         status_only = detect_status_only(old_product, payload)
         draft_transition = is_draft_transition(previous_status=previous_status, new_status=new_status)
 
+        # REST webhook images use ProductImage GIDs; catalog/baselines use MediaImage.
+        # Always refresh media via GraphQL so Secondary Queue delta identity matches.
         product_snapshot = _product_snapshot_from_webhook(payload, product_gid)
-        media_snapshot = _media_snapshot_from_webhook(payload)
+        media_snapshot: list[dict[str, Any]] = []
+        graphql_ok = False
 
-        if media_snapshot is None:
-            try:
-                token = resolve_shop_access_token(shop)
-                client = ShopifyGraphQLClient(shop_domain=shop.shop_domain, access_token=token)
-                node = client.fetch_product_by_gid(product_gid)
-                if node:
-                    normalized = normalize_shopify_product_node(node)
-                    product_snapshot = product_snapshot_from_shopify(normalized["product"])
-                    media_snapshot = media_snapshots_from_shopify(normalized["media"])
-                    catalog.upsert_product_from_shopify_node(node)
-                elif old_product is None:
-                    event.processing_result = WebhookProcessingResult.FAILED
-                    event.error_summary = "Product not found via GraphQL"
-                    return
-            except ShopifyGraphQLError as exc:
-                logger.error(
-                    "GraphQL refresh failed during webhook | shop=%s product=%s error=%s",
-                    shop.id,
-                    product_gid,
-                    exc,
-                )
-                if old_product is None:
-                    event.processing_result = WebhookProcessingResult.FAILED
-                    event.error_summary = str(exc)[:2000]
-                    return
-                media_snapshot = []
-        else:
+        try:
+            token = resolve_shop_access_token(shop)
+            client = ShopifyGraphQLClient(shop_domain=shop.shop_domain, access_token=token)
+            node = client.fetch_product_by_gid(product_gid)
+            if node:
+                normalized = normalize_shopify_product_node(node)
+                # Prefer GraphQL product fields when available; keep REST for status-only compare above.
+                product_snapshot = product_snapshot_from_shopify(normalized["product"])
+                media_snapshot = media_snapshots_from_shopify(normalized["media"])
+                catalog.upsert_product_from_shopify_node(node)
+                graphql_ok = True
+            elif old_product is None:
+                event.processing_result = WebhookProcessingResult.FAILED
+                event.error_summary = "Product not found via GraphQL"
+                return
+        except ShopifyGraphQLError as exc:
+            logger.error(
+                "GraphQL refresh failed during webhook | shop=%s product=%s error=%s",
+                shop.id,
+                product_gid,
+                exc,
+            )
+            if old_product is None:
+                event.processing_result = WebhookProcessingResult.FAILED
+                event.error_summary = str(exc)[:2000]
+                return
+
+        if not graphql_ok:
+            # Known product: apply REST product fields; fall back to REST media only if needed.
             if old_product:
                 old_product.title = product_snapshot.get("title") or old_product.title
                 old_product.description_html = product_snapshot.get("description_html") or old_product.description_html
@@ -283,18 +288,8 @@ class WebhookIntakeService:
                 old_product.product_type = product_snapshot.get("product_type") or old_product.product_type
                 old_product.vendor = product_snapshot.get("vendor") or old_product.vendor
                 old_product.tags = product_snapshot.get("tags") or old_product.tags
-            else:
-                try:
-                    token = resolve_shop_access_token(shop)
-                    client = ShopifyGraphQLClient(shop_domain=shop.shop_domain, access_token=token)
-                    node = client.fetch_product_by_gid(product_gid)
-                    if node:
-                        catalog.upsert_product_from_shopify_node(node)
-                except ShopifyGraphQLError:
-                    pass
-
-        if media_snapshot is None:
-            media_snapshot = []
+            rest_media = _media_snapshot_from_webhook(payload)
+            media_snapshot = rest_media if rest_media is not None else []
 
         if old_product and new_status is not None:
             old_product.status = str(new_status)

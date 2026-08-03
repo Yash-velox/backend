@@ -19,7 +19,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import Uuid
 
 from app.db.base import Base
-from app.models.enums import PromptProductTypeSource
+from app.models.enums import PromptProductTypeSource, PromptStepType
 
 
 class PromptProductType(Base):
@@ -105,6 +105,11 @@ class PromptStep(Base):
     name: Mapped[str] = mapped_column(String(150), nullable=False)
     prompt_text: Mapped[str] = mapped_column(Text, nullable=False)
     step_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    step_type: Mapped[PromptStepType] = mapped_column(
+        Enum(PromptStepType, name="prompt_step_type", native_enum=False),
+        nullable=False,
+        default=PromptStepType.IMAGE,
+    )
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

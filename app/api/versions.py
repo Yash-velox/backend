@@ -25,9 +25,32 @@ class RollbackConfirmBody(BaseModel):
     confirm: bool = Field(default=False)
 
 
-def _version_out(version: ProductMediaVersion, *, include_items: bool = False) -> dict:
+def _cdn_lookup_from_linked(linked_images: list | None) -> dict[str, str]:
+    """Map Shopify file/media GIDs → CDN URL from linked image_versions."""
+    out: dict[str, str] = {}
+    for iv in linked_images or []:
+        if not isinstance(iv, dict):
+            continue
+        cdn = iv.get("shopifyCdnUrl") or iv.get("shopify_cdn_url")
+        if not cdn:
+            continue
+        for key in (
+            iv.get("shopifyFileGid"),
+            iv.get("shopify_file_gid"),
+            iv.get("shopifyMediaGid"),
+            iv.get("shopify_media_gid"),
+            iv.get("sourceMediaGid"),
+            iv.get("source_media_gid"),
+        ):
+            if key:
+                out[str(key)] = str(cdn)
+    return out
+
+
+def _version_out(version: ProductMediaVersion, *, include_items: bool = False, linked_images: list | None = None) -> dict:
     items = version.items_json or {}
     media = items.get("media") or []
+    cdn_by_gid = _cdn_lookup_from_linked(linked_images)
     data = {
         "versionId": str(version.id),
         "productId": str(version.product_id),
@@ -51,23 +74,33 @@ def _version_out(version: ProductMediaVersion, *, include_items: bool = False) -
         "updatedAt": version.updated_at.isoformat() if version.updated_at else None,
     }
     if include_items:
-        data["media"] = [
-            {
-                "mediaGid": m.get("media_gid"),
-                "fileGid": m.get("file_gid"),
-                "position": m.get("position"),
-                "isPrimary": m.get("is_primary"),
-                "altText": m.get("alt_text"),
-                "cdnUrl": m.get("cdn_url"),
-                "filename": m.get("filename"),
-                "width": m.get("width"),
-                "height": m.get("height"),
-                "mimeType": m.get("mime_type"),
-            }
-            for m in media
-        ]
+        data["media"] = []
+        for m in media:
+            file_gid = m.get("file_gid")
+            media_gid = m.get("media_gid")
+            cdn = (
+                m.get("cdn_url")
+                or (cdn_by_gid.get(str(file_gid)) if file_gid else None)
+                or (cdn_by_gid.get(str(media_gid)) if media_gid else None)
+            )
+            data["media"].append(
+                {
+                    "mediaGid": media_gid,
+                    "fileGid": file_gid,
+                    "position": m.get("position"),
+                    "isPrimary": m.get("is_primary"),
+                    "altText": m.get("alt_text"),
+                    "cdnUrl": cdn,
+                    "filename": m.get("filename"),
+                    "width": m.get("width"),
+                    "height": m.get("height"),
+                    "mimeType": m.get("mime_type"),
+                }
+            )
         data["variants"] = items.get("variants") or []
         data["promptSnapshot"] = version.prompt_snapshot_json
+        if linked_images is not None:
+            data["linkedImageVersions"] = linked_images
     return data
 
 
@@ -145,11 +178,34 @@ def get_media_version(product_id: UUID, version_id: UUID, request: Request, db: 
         version = MediaVersionsService(db, shop).get_version(product_id, version_id)
     except MediaVersionError as exc:
         raise _http_from_media(exc) from exc
+    linked = []
+    try:
+        from app.services.image_versions import ImageVersionsService
+
+        for iv in ImageVersionsService(db, shop).versions_for_product_media_version(version.id):
+            linked.append(
+                {
+                    "versionId": str(iv.id),
+                    "sourceMediaGid": iv.source_media_gid,
+                    "versionNumber": iv.version_number,
+                    "versionType": iv.version_type.value,
+                    "shopifyFileGid": iv.shopify_file_gid,
+                    "shopifyCdnUrl": iv.shopify_cdn_url,
+                    "fileSizeBytes": iv.file_size_bytes,
+                    "width": iv.width,
+                    "height": iv.height,
+                    "isCurrent": iv.is_current,
+                    "isPublished": iv.is_published,
+                    "isOriginal": iv.is_original,
+                }
+            )
+    except Exception:
+        linked = []
     return SuccessEnvelope(
         success=True,
         message="Media version detail.",
         requestId=_request_id(request),
-        data=_version_out(version, include_items=True),
+        data=_version_out(version, include_items=True, linked_images=linked),
     )
 
 

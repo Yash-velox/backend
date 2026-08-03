@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import struct
 import time
 from pathlib import Path
 from typing import Any
@@ -10,11 +11,14 @@ from typing import Any
 import httpx
 
 from app.config import settings
+from app.services.output_storage import checksum_sha256
 from app.services.shopify_graphql import ShopifyGraphQLClient, ShopifyGraphQLError
 
 logger = logging.getLogger("app.services.shopify_file_upload")
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# Soft Shopify-safe pixel budget
+DEFAULT_MAX_PIXELS = 25_000_000
 
 
 class PublishUploadError(RuntimeError):
@@ -22,6 +26,25 @@ class PublishUploadError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+
+
+def read_png_dimensions(data: bytes) -> tuple[int, int]:
+    if len(data) < 24 or not data.startswith(PNG_SIGNATURE):
+        raise PublishUploadError("PUBLISH_OUTPUT_NOT_PNG", "Output is not a valid PNG")
+    if data[12:16] != b"IHDR":
+        raise PublishUploadError("PUBLISH_OUTPUT_INVALID", "PNG missing IHDR chunk")
+    width, height = struct.unpack(">II", data[16:24])
+    if width <= 0 or height <= 0:
+        raise PublishUploadError("PUBLISH_OUTPUT_INVALID", "PNG has invalid dimensions")
+    return int(width), int(height)
+
+
+def png_has_alpha(data: bytes) -> bool:
+    """True when color type includes alpha (4 or 6) in IHDR."""
+    if len(data) < 26 or not data.startswith(PNG_SIGNATURE) or data[12:16] != b"IHDR":
+        return False
+    color_type = data[25]
+    return color_type in {4, 6}
 
 
 def validate_png_file(path: Path) -> tuple[int, bytes]:
@@ -33,6 +56,49 @@ def validate_png_file(path: Path) -> tuple[int, bytes]:
     if not data.startswith(PNG_SIGNATURE):
         raise PublishUploadError("PUBLISH_OUTPUT_NOT_PNG", f"Output is not a PNG: {path.name}")
     return len(data), data
+
+
+def validate_generated_png_for_shopify(path: Path) -> dict[str, Any]:
+    """Validate generated PNG before Shopify Files upload. Returns metadata dict."""
+    size, data = validate_png_file(path)
+    reject_bytes = settings.shopify_image_reject_mb * 1024 * 1024
+    warn_bytes = settings.shopify_image_optimize_warn_mb * 1024 * 1024
+    attempt_bytes = settings.shopify_image_optimize_attempt_mb * 1024 * 1024
+
+    if size >= reject_bytes:
+        raise PublishUploadError(
+            "GENERATED_IMAGE_TOO_LARGE",
+            f"Generated image is {size} bytes which exceeds the {settings.shopify_image_reject_mb} MB reject limit",
+            retryable=False,
+        )
+
+    width, height = read_png_dimensions(data)
+    pixels = width * height
+    if pixels > DEFAULT_MAX_PIXELS:
+        raise PublishUploadError(
+            "GENERATED_IMAGE_PIXEL_LIMIT",
+            f"Generated image pixel count {pixels} exceeds Shopify-safe limit {DEFAULT_MAX_PIXELS}",
+            retryable=False,
+        )
+
+    warnings: list[str] = []
+    if size >= warn_bytes:
+        warnings.append("FILE_SIZE_ABOVE_PREFERRED")
+    if size >= attempt_bytes:
+        warnings.append("FILE_SIZE_OPTIMIZE_CANDIDATE")
+        if png_has_alpha(data):
+            warnings.append("TRANSPARENCY_PRESERVED_NO_LOSSY_OPTIMIZE")
+
+    return {
+        "size_bytes": size,
+        "data": data,
+        "width": width,
+        "height": height,
+        "checksum": checksum_sha256(data),
+        "has_alpha": png_has_alpha(data),
+        "mime_type": "image/png",
+        "warnings": warnings,
+    }
 
 
 def sanitize_png_filename(original: str | None, fallback: str = "image") -> str:
@@ -54,7 +120,7 @@ class ShopifyFileUploadService:
         filename: str,
         existing_file_gid: str | None = None,
     ) -> dict[str, Any]:
-        """Upload a PNG (or reuse existing READY file). Returns {file_gid, file_status, cdn_url}."""
+        """Upload a PNG (or reuse existing READY file). Returns {file_gid, file_status, cdn_url, width, height}."""
         if existing_file_gid:
             reused = self._reuse_or_none(existing_file_gid)
             if reused is not None:

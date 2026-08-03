@@ -13,7 +13,7 @@ from app.core.shop_resolver import resolve_shop_access_token
 from app.models import BatchProduct, ProductPublishOperation, PublishStatus, Shop
 from app.services.output_storage import get_output_storage
 from app.services.publish_compensation import PublishCompensationError, PublishCompensationService
-from app.services.publish_conflict import compare_publish_snapshots
+from app.services.publish_conflict import compare_publish_snapshots, heal_empty_publish_baseline
 from app.services.publish_snapshot import (
     normalize_publish_snapshot,
     snapshot_from_baseline,
@@ -85,8 +85,12 @@ class ProductPublisher:
 
             storage = get_output_storage()
             for asset in assets:
+                if asset.get("shopify_file_gid") and (asset.get("upload_status") or "").upper() == "READY":
+                    continue
                 key = asset.get("processed_output_key")
                 if not key:
+                    if asset.get("shopify_file_gid"):
+                        continue
                     raise ProductPublisherError("PUBLISH_OUTPUT_MISSING", "Missing processed output key")
                 path = storage.resolve_path(key)
                 validate_png_file(path)
@@ -99,6 +103,18 @@ class ProductPublisher:
             live = normalize_publish_snapshot(live_raw)
             op.pre_publish_snapshot_json = live
             original_snapshot = live
+            baseline, healed = heal_empty_publish_baseline(baseline, live, assets)
+            if healed:
+                op.baseline_snapshot_json = baseline
+                product.baseline_snapshot_json = {
+                    **(product.baseline_snapshot_json or {}),
+                    "media": baseline.get("media") or [],
+                    "product": (product.baseline_snapshot_json or {}).get("product"),
+                    "product_gid": baseline.get("product_gid"),
+                    "featured_media_gid": baseline.get("featured_media_gid"),
+                    "variants": baseline.get("variants") or [],
+                }
+                self.db.flush()
             conflict = compare_publish_snapshots(baseline, live)
             if conflict.get("hasConflict"):
                 op.conflict_details = conflict
@@ -111,14 +127,31 @@ class ProductPublisher:
                 self.db.commit()
                 return op
 
-            # Upload all PNGs
+            # Upload (or verify READY) PNGs
             self._set_stage(op, product, PublishStatus.PUBLISHING, "UPLOADING")
             for asset in assets:
-                path = storage.resolve_path(asset["processed_output_key"])
+                existing_gid = asset.get("shopify_file_gid")
+                if existing_gid and (asset.get("upload_status") or "").upper() == "READY":
+                    verified = self.uploader.poll_until_ready(existing_gid)
+                    asset["shopify_file_gid"] = verified["file_gid"]
+                    asset["shopify_file_status"] = verified["file_status"]
+                    asset["shopify_cdn_url"] = verified.get("cdn_url") or asset.get("shopify_cdn_url")
+                    asset["upload_status"] = "READY"
+                    op.assets_json = assets
+                    self.db.flush()
+                    continue
+
+                key = asset.get("processed_output_key")
+                if not key:
+                    raise ProductPublisherError(
+                        "PUBLISH_OUTPUT_MISSING",
+                        "Missing local output and no READY Shopify file for asset",
+                    )
+                path = storage.resolve_path(key)
                 result = self.uploader.upload_png(
                     path=path,
                     filename=asset.get("processed_filename") or "image.png",
-                    existing_file_gid=asset.get("shopify_file_gid"),
+                    existing_file_gid=existing_gid,
                 )
                 asset["shopify_file_gid"] = result["file_gid"]
                 asset["shopify_file_status"] = result["file_status"]
@@ -288,14 +321,23 @@ class ProductPublisher:
             product.publish_status = PublishStatus.PUBLISHED
 
             try:
+                from app.services.image_versions import ImageVersionsService
                 from app.services.media_versions import MediaVersionsService
 
-                MediaVersionsService(self.db, self.shop).record_publish_success(
+                published = MediaVersionsService(self.db, self.shop).record_publish_success(
                     batch_product=product,
                     publish_op=op,
                     pre_publish_snapshot=original_snapshot,
                     final_snapshot=final,
                 )
+                if published is not None:
+                    media_items = list((published.items_json or {}).get("media") or [])
+                    ImageVersionsService(self.db, self.shop).mark_published_for_product_version(
+                        product_id=published.product_id,
+                        product_media_version_id=published.id,
+                        media_items=media_items,
+                        actor_type="publish",
+                    )
             except Exception:
                 logger.exception(
                     "Failed to record media versions after publish | op=%s product=%s",

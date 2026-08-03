@@ -12,22 +12,31 @@ import httpx
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
+from app.core.shop_resolver import resolve_shop_access_token
 from app.models import (
     AttemptStatus,
     BatchImage,
     BatchImageStatus,
     BatchProduct,
     BatchProductStatus,
+    BatchStatus,
     ProcessingAttempt,
     ProcessingBaseline,
     Product,
     Shop,
 )
 from app.poc.openai_client import OpenAIImageClient, OpenAIImageError
+from app.services.image_versions import ImageVersionsService, build_generated_filename
 from app.services.output_storage import OutputStorage, checksum_sha256, get_output_storage
 from app.services.primary_batch import PrimaryBatchService
 from app.services.prompt_resolver import PromptResolver, PromptResolverError
 from app.services.retry_service import RetryService
+from app.services.shopify_file_upload import (
+    PublishUploadError,
+    ShopifyFileUploadService,
+    validate_generated_png_for_shopify,
+)
+from app.services.shopify_graphql import ShopifyGraphQLClient
 from app.services.state_machine import BATCH_IMAGE_TRANSITIONS, BATCH_PRODUCT_TRANSITIONS, assert_transition
 
 logger = logging.getLogger("app.services.image_processor")
@@ -212,6 +221,7 @@ class ImageProcessor:
                 batch_product.completed_at = datetime.now(timezone.utc)
                 batch_product.locked_by = None
                 batch_product.locked_at = None
+                batch_product.prompt_override_json = None
         else:
             all_complete = all(i.status == BatchImageStatus.COMPLETED for i in batch_product.images)
             if all_complete:
@@ -227,6 +237,7 @@ class ImageProcessor:
                 batch_product.locked_at = None
                 batch_product.error_code = None
                 batch_product.error_message = None
+                batch_product.prompt_override_json = None
                 self._advance_baseline_on_success(batch_product)
             else:
                 # Exiting without a terminal state — always drop the lock so
@@ -255,6 +266,299 @@ class ImageProcessor:
             batch_service.refresh_batch_counters(batch)
         self.db.commit()
 
+    def finalize_local_output(self, batch_image_id: UUID, *, worker_id: str) -> bool:
+        """Upload an already-generated local output to Shopify Files (OpenAI Batch path)."""
+        image = self.db.get(BatchImage, batch_image_id)
+        if not image or not image.output_storage_key:
+            return False
+        if image.generated_shopify_file_gid:
+            return True
+        batch_product = self.db.get(BatchProduct, image.batch_product_id)
+        if not batch_product:
+            return False
+        shop = self.db.get(Shop, image.shop_id)
+        if not shop:
+            return False
+        if not self._local_output_usable(image):
+            raise ProcessingError(
+                "Local AI output missing for Shopify upload",
+                code="PUBLISH_OUTPUT_MISSING",
+                retryable=True,
+            )
+        attempt_number = max(image.attempt_count, 1)
+        existing_numbers = {
+            row[0]
+            for row in self.db.query(ProcessingAttempt.attempt_number)
+            .filter(ProcessingAttempt.batch_image_id == image.id)
+            .all()
+        }
+        while attempt_number in existing_numbers:
+            attempt_number += 1
+        attempt = ProcessingAttempt(
+            batch_image_id=image.id,
+            batch_product_id=batch_product.id,
+            attempt_number=attempt_number,
+            status=AttemptStatus.STARTED,
+            provider="shopify_upload",
+            shopify_source_url=image.cdn_url,
+            output_storage_key=image.output_storage_key,
+        )
+        self.db.add(attempt)
+        self.db.flush()
+        if image.status in {BatchImageStatus.PROCESSING, BatchImageStatus.WAITING_FOR_PROVIDER}:
+            if image.status == BatchImageStatus.WAITING_FOR_PROVIDER:
+                assert_transition(
+                    "batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.PROCESSING
+                )
+                image.status = BatchImageStatus.PROCESSING
+            assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.UPLOADING)
+            image.status = BatchImageStatus.UPLOADING
+            self.db.commit()
+        self._upload_generated_output(
+            shop=shop,
+            image=image,
+            batch_product=batch_product,
+            attempt=attempt,
+        )
+        attempt.status = AttemptStatus.COMPLETED
+        attempt.completed_at = datetime.now(timezone.utc)
+        self.db.commit()
+
+        # Product rollup
+        self.db.refresh(batch_product)
+        images = sorted(batch_product.images, key=lambda i: i.created_at)
+        if all(i.status == BatchImageStatus.COMPLETED for i in images):
+            if batch_product.status == BatchProductStatus.PROCESSING:
+                assert_transition(
+                    "batch_product",
+                    BATCH_PRODUCT_TRANSITIONS,
+                    batch_product.status,
+                    BatchProductStatus.COMPLETED,
+                )
+                batch_product.status = BatchProductStatus.COMPLETED
+                batch_product.completed_at = datetime.now(timezone.utc)
+                batch_product.locked_by = None
+                batch_product.locked_at = None
+                batch_product.prompt_override_json = None
+                self._advance_baseline_on_success(batch_product)
+            batch = self._primary_batch_service(batch_product.shop_id).get_batch(batch_product.batch_id)
+            if batch:
+                self._primary_batch_service(batch_product.shop_id).refresh_batch_counters(batch)
+                if batch.status == BatchStatus.PROCESSING and batch.pending_product_count == 0 and batch.processing_product_count == 0:
+                    batch.processing_phase = "READY_TO_PUBLISH"
+            self.db.commit()
+        return True
+
+    def _local_output_usable(self, image: BatchImage) -> bool:
+        key = image.output_storage_key
+        if not key:
+            return False
+        try:
+            return self.storage.exists(key)
+        except Exception:
+            return False
+
+    def _upload_generated_output(
+        self,
+        *,
+        shop: Shop,
+        image: BatchImage,
+        batch_product: BatchProduct,
+        attempt: ProcessingAttempt,
+    ) -> None:
+        """Validate local output, upload to Shopify Files, create image_version, delete local file."""
+        if not batch_product.product_id:
+            raise ProcessingError(
+                "Catalog product id required before Shopify Files upload",
+                code="PRODUCT_NOT_LINKED",
+                retryable=False,
+            )
+        if not image.output_storage_key:
+            raise ProcessingError(
+                "Missing local output for Shopify upload",
+                code="PUBLISH_OUTPUT_MISSING",
+                retryable=False,
+            )
+
+        path = self.storage.resolve_path(image.output_storage_key)
+        meta = validate_generated_png_for_shopify(path)
+
+        assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.UPLOADING)
+        image.status = BatchImageStatus.UPLOADING
+        self.db.commit()
+
+        version_hint = ImageVersionsService(self.db, shop).next_version_number(
+            product_id=batch_product.product_id,
+            source_media_gid=image.shopify_media_gid,
+        )
+        stored_filename = build_generated_filename(
+            product_id=batch_product.product_id,
+            source_media_gid=image.shopify_media_gid,
+            version_number=version_hint,
+        )
+        idempotency_key = f"upload:{image.id}:{image.output_checksum or meta['checksum']}"
+
+        existing_gid = image.generated_shopify_file_gid
+        prior_version = ImageVersionsService(self.db, shop).find_by_idempotency_key(idempotency_key)
+        if prior_version and prior_version.shopify_file_gid:
+            existing_gid = prior_version.shopify_file_gid
+
+        try:
+            token = resolve_shop_access_token(shop)
+        except RuntimeError as exc:
+            raise ProcessingError(str(exc), code="SHOPIFY_TOKEN_MISSING", retryable=True) from exc
+
+        client = ShopifyGraphQLClient(shop_domain=shop.shop_domain, access_token=token)
+        uploader = ShopifyFileUploadService(client)
+        try:
+            result = uploader.upload_png(
+                path=path,
+                filename=stored_filename,
+                existing_file_gid=existing_gid,
+            )
+        except PublishUploadError as exc:
+            ImageVersionsService(self.db, shop).record_upload_failed(
+                product_id=batch_product.product_id,
+                source_media_gid=image.shopify_media_gid,
+                batch_id=batch_product.batch_id,
+                batch_image_id=image.id,
+                error_code=exc.code,
+                error_message=str(exc),
+            )
+            raise ProcessingError(str(exc), code=exc.code, retryable=exc.retryable) from exc
+
+        version = ImageVersionsService(self.db, shop).create_generated_after_upload(
+            product_id=batch_product.product_id,
+            source_media_gid=image.shopify_media_gid,
+            shopify_file_gid=result["file_gid"],
+            shopify_cdn_url=result.get("cdn_url"),
+            width=result.get("width") or meta.get("width"),
+            height=result.get("height") or meta.get("height"),
+            file_size_bytes=meta.get("size_bytes"),
+            checksum=meta.get("checksum") or image.output_checksum,
+            mime_type="image/png",
+            original_filename=image.original_filename,
+            stored_filename=stored_filename,
+            upload_idempotency_key=idempotency_key,
+            batch_id=batch_product.batch_id,
+            batch_image_id=image.id,
+            attempt_id=attempt.id,
+            metadata_json={"validation_warnings": meta.get("warnings") or []},
+        )
+
+        image.generated_shopify_file_gid = result["file_gid"]
+        image.generated_shopify_cdn_url = result.get("cdn_url")
+        image.generated_image_version_id = version.id
+        image.output_checksum = meta.get("checksum") or image.output_checksum
+        image.output_mime_type = "image/png"
+
+        assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.COMPLETED)
+        image.status = BatchImageStatus.COMPLETED
+        image.completed_at = datetime.now(timezone.utc)
+        image.error_code = None
+        image.error_message = None
+
+        attempt.status = AttemptStatus.COMPLETED
+        attempt.output_storage_key = image.output_storage_key
+        attempt.completed_at = datetime.now(timezone.utc)
+        self.db.flush()
+
+        key = image.output_storage_key
+        if key:
+            self.storage.delete(key)
+            image.output_storage_key = None
+            image.output_url = None
+
+    def retry_upload_only(self, batch_image_id: UUID, *, worker_id: str = "api") -> BatchImage:
+        """Retry Shopify Files upload without re-running AI when local output remains."""
+        image = self.db.get(BatchImage, batch_image_id)
+        if not image:
+            raise ProcessingError("Batch image not found", code="BATCH_IMAGE_NOT_FOUND", retryable=False)
+        batch_product = self.db.get(BatchProduct, image.batch_product_id)
+        if not batch_product:
+            raise ProcessingError("Batch product not found", code="BATCH_PRODUCT_NOT_FOUND", retryable=False)
+        shop = self.db.get(Shop, image.shop_id)
+        if not shop:
+            raise ProcessingError("Shop not found", code="SHOP_NOT_FOUND", retryable=False)
+        if not self._local_output_usable(image):
+            raise ProcessingError(
+                "Local generated output is no longer available; full reprocess required",
+                code="UPLOAD_RETRY_OUTPUT_MISSING",
+                retryable=False,
+            )
+        if image.status not in {
+            BatchImageStatus.FAILED,
+            BatchImageStatus.RETRYING,
+            BatchImageStatus.UPLOADING,
+            BatchImageStatus.QUEUED,
+        }:
+            raise ProcessingError(
+                f"Image status {image.status.value} cannot retry upload",
+                code="UPLOAD_RETRY_INVALID_STATUS",
+                retryable=False,
+            )
+
+        now = datetime.now(timezone.utc)
+        image.attempt_count += 1
+        image.error_code = None
+        image.error_message = None
+        attempt = ProcessingAttempt(
+            batch_image_id=image.id,
+            batch_product_id=batch_product.id,
+            attempt_number=image.attempt_count,
+            status=AttemptStatus.STARTED,
+            provider="shopify_upload",
+            shopify_source_url=image.cdn_url,
+            output_storage_key=image.output_storage_key,
+            started_at=now,
+        )
+        self.db.add(attempt)
+        self.db.commit()
+        self.db.refresh(attempt)
+
+        started_perf = time.perf_counter()
+        try:
+            if image.status == BatchImageStatus.FAILED:
+                assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.RETRYING)
+                image.status = BatchImageStatus.RETRYING
+            if image.status in {BatchImageStatus.QUEUED, BatchImageStatus.RETRYING}:
+                assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.UPLOADING)
+            self._upload_generated_output(
+                shop=shop,
+                image=image,
+                batch_product=batch_product,
+                attempt=attempt,
+            )
+            attempt.duration_ms = (time.perf_counter() - started_perf) * 1000
+            self.db.commit()
+            return image
+        except Exception as exc:
+            retryable = True
+            code = "SHOPIFY_UPLOAD_FAILED"
+            message = "Shopify Files upload failed"
+            if isinstance(exc, ProcessingError):
+                retryable = exc.retryable
+                code = exc.code
+                message = str(exc)
+            elif isinstance(exc, PublishUploadError):
+                retryable = exc.retryable
+                code = exc.code
+                message = str(exc)
+            attempt.status = AttemptStatus.FAILED
+            attempt.error_code = code
+            attempt.error_message = message
+            attempt.duration_ms = (time.perf_counter() - started_perf) * 1000
+            attempt.completed_at = datetime.now(timezone.utc)
+            self.retry_service.schedule_image_retry(
+                image,
+                batch_product,
+                error_code=code,
+                error_message=message,
+                retryable=retryable,
+            )
+            self.db.commit()
+            raise
+
     def _process_single_batch_image(
         self,
         image: BatchImage,
@@ -266,12 +570,15 @@ class ImageProcessor:
         if image.status not in (
             BatchImageStatus.QUEUED,
             BatchImageStatus.RETRYING,
+            BatchImageStatus.UPLOADING,
         ):
             return image.status == BatchImageStatus.COMPLETED
 
-        target = BatchImageStatus.DOWNLOADING
-        assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, target)
-        image.status = target
+        # Prefer upload-only whenever local AI output still exists on retry/upload.
+        upload_only = image.status in {BatchImageStatus.RETRYING, BatchImageStatus.UPLOADING} and self._local_output_usable(
+            image
+        )
+
         image.attempt_count += 1
         image.started_at = image.started_at or now
         image.error_code = None
@@ -282,8 +589,9 @@ class ImageProcessor:
             batch_product_id=batch_product.id,
             attempt_number=image.attempt_count,
             status=AttemptStatus.STARTED,
-            provider="openai",
+            provider="shopify_upload" if upload_only else "openai",
             shopify_source_url=image.cdn_url,
+            output_storage_key=image.output_storage_key if upload_only else None,
             started_at=now,
         )
         self.db.add(attempt)
@@ -297,6 +605,32 @@ class ImageProcessor:
             shop = self.db.get(Shop, batch_product.shop_id)
             if shop is None:
                 raise ProcessingError("Shop not found", code="SHOP_NOT_FOUND", retryable=False)
+
+            if upload_only:
+                if image.status == BatchImageStatus.RETRYING:
+                    assert_transition(
+                        "batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.UPLOADING
+                    )
+                self._upload_generated_output(
+                    shop=shop,
+                    image=image,
+                    batch_product=batch_product,
+                    attempt=attempt,
+                )
+                attempt.duration_ms = (time.perf_counter() - started_perf) * 1000
+                self.db.commit()
+                logger.info(
+                    "Batch image upload-only completed | image=%s product=%s attempt=%s",
+                    image.id,
+                    batch_product.id,
+                    image.attempt_count,
+                )
+                return True
+
+            target = BatchImageStatus.DOWNLOADING
+            assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, target)
+            image.status = target
+            self.db.commit()
 
             product = None
             if batch_product.product_id:
@@ -315,13 +649,34 @@ class ImageProcessor:
                 image_position = 1
 
             resolver = PromptResolver(self.db, shop)
+            override = image.prompt_override_json or batch_product.prompt_override_json
             try:
-                resolved = resolver.resolve_for_product(
-                    product,
-                    product_type_override=product_type_override,
-                    image=image,
-                    image_position=image_position,
-                )
+                if isinstance(override, list) and override:
+                    product_type_display = (
+                        (product.product_type if product else None)
+                        or (
+                            batch_product.product_snapshot_json.get("product_type")
+                            if isinstance(batch_product.product_snapshot_json, dict)
+                            else None
+                        )
+                        or "product"
+                    )
+                    resolved = resolver.resolve_from_override(
+                        override,
+                        product=product,
+                        product_type_display=str(product_type_display),
+                        image=image,
+                        image_position=image_position,
+                    )
+                    if image.prompt_override_json is not None:
+                        image.prompt_override_json = None
+                else:
+                    resolved = resolver.resolve_for_product(
+                        product,
+                        product_type_override=product_type_override,
+                        image=image,
+                        image_position=image_position,
+                    )
             except PromptResolverError as exc:
                 raise ProcessingError(str(exc), code=exc.code, retryable=exc.retryable) from exc
 
@@ -351,25 +706,27 @@ class ImageProcessor:
             key = f"{batch_product.shop_id}/{batch_product.batch_id}/{image.id}/output.png"
             output_ref = self.storage.save_bytes(key=key, data=current, content_type="image/png")
             checksum = checksum_sha256(current)
-
-            assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.COMPLETED)
-            image.status = BatchImageStatus.COMPLETED
             image.output_storage_key = key
             image.output_url = output_ref
             image.output_mime_type = "image/png"
             image.output_checksum = checksum
-            image.completed_at = datetime.now(timezone.utc)
-
-            attempt.status = AttemptStatus.COMPLETED
             attempt.output_storage_key = key
+            self.db.commit()
+
+            self._upload_generated_output(
+                shop=shop,
+                image=image,
+                batch_product=batch_product,
+                attempt=attempt,
+            )
             attempt.duration_ms = (time.perf_counter() - started_perf) * 1000
-            attempt.completed_at = datetime.now(timezone.utc)
             self.db.commit()
             logger.info(
-                "Batch image completed | image=%s product=%s attempt=%s",
+                "Batch image completed | image=%s product=%s attempt=%s file=%s",
                 image.id,
                 batch_product.id,
                 image.attempt_count,
+                image.generated_shopify_file_gid,
             )
             return True
         except Exception as exc:
@@ -377,6 +734,10 @@ class ImageProcessor:
             code = "PROCESSING_ERROR"
             message = "Image processing failed"
             if isinstance(exc, ProcessingError):
+                retryable = exc.retryable
+                code = exc.code
+                message = str(exc)
+            elif isinstance(exc, PublishUploadError):
                 retryable = exc.retryable
                 code = exc.code
                 message = str(exc)
@@ -401,8 +762,19 @@ class ImageProcessor:
             attempt.duration_ms = (time.perf_counter() - started_perf) * 1000
             attempt.completed_at = datetime.now(timezone.utc)
 
-            if image.status != BatchImageStatus.PROCESSING:
-                image.status = BatchImageStatus.PROCESSING
+            # Keep local output for Shopify upload retries.
+            if not (
+                code.startswith("SHOPIFY_")
+                or code
+                in {
+                    "GENERATED_IMAGE_TOO_LARGE",
+                    "GENERATED_IMAGE_PIXEL_LIMIT",
+                    "SHOPIFY_TOKEN_MISSING",
+                }
+            ):
+                if not self._local_output_usable(image):
+                    image.output_storage_key = None
+                    image.output_url = None
 
             self.retry_service.schedule_image_retry(
                 image,

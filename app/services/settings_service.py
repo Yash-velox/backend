@@ -26,7 +26,6 @@ class SettingsService:
         *,
         auto_sync_enabled: bool | None = None,
         auto_publish_processed_images: bool | None = None,
-        max_products_per_batch: int | None = None,
         batch_interval_minutes: int | None = None,
     ) -> ShopSettings:
         row = self.get()
@@ -34,13 +33,6 @@ class SettingsService:
             row.auto_sync_enabled = auto_sync_enabled
         if auto_publish_processed_images is not None:
             row.auto_publish_processed_images = auto_publish_processed_images
-        if max_products_per_batch is not None:
-            if max_products_per_batch < 1:
-                raise SettingsValidationError("max_products_per_batch must be at least 1")
-            cap = settings.max_products_per_batch_cap
-            if max_products_per_batch > cap:
-                raise SettingsValidationError(f"max_products_per_batch cannot exceed {cap}")
-            row.max_products_per_batch = max_products_per_batch
         if batch_interval_minutes is not None:
             if batch_interval_minutes < 1:
                 raise SettingsValidationError("batch_interval_minutes must be at least 1")

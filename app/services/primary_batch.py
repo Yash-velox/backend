@@ -124,7 +124,6 @@ class PrimaryBatchService:
             trigger_type=TriggerType.MANUAL,
             status=BatchStatus.QUEUED,
             settings_snapshot_json={
-                "max_products_per_batch": shop_settings.max_products_per_batch,
                 "batch_interval_minutes": shop_settings.batch_interval_minutes,
                 "manual_batch_product_limit": settings.manual_batch_product_limit,
             },
@@ -144,7 +143,10 @@ class PrimaryBatchService:
 
             product_snapshot = product_snapshot_from_model(product)
             media_snapshot = media_snapshots_from_models(visible_media)
-            baseline = self._get_or_create_baseline(product)
+            # Publish conflict baseline must be the live media set at enqueue time.
+            # ProcessingBaseline may be empty on first run (delta tracking only) — do not
+            # copy its null media into baseline_snapshot_json or publish always conflicts.
+            self._get_or_create_baseline(product)
 
             batch_product = BatchProduct(
                 batch_id=batch.id,
@@ -154,8 +156,8 @@ class PrimaryBatchService:
                 product_snapshot_json=product_snapshot,
                 prompt_snapshot_json=None,
                 baseline_snapshot_json={
-                    "product": baseline.product_snapshot_json,
-                    "media": baseline.media_snapshot_json,
+                    "product": product_snapshot,
+                    "media": media_snapshot,
                 },
                 status=BatchProductStatus.QUEUED,
                 image_count=len(visible_media),
@@ -211,10 +213,16 @@ class PrimaryBatchService:
             try:
                 product = None
                 if item.product_id:
-                    product = self.db.get(Product, item.product_id)
+                    product = (
+                        self.db.query(Product)
+                        .options(selectinload(Product.media))
+                        .filter(Product.id == item.product_id)
+                        .one_or_none()
+                    )
                 if product is None:
                     product = (
                         self.db.query(Product)
+                        .options(selectinload(Product.media))
                         .filter(
                             Product.shop_id == self.shop.id,
                             Product.shopify_product_gid == item.shopify_product_gid,
@@ -229,6 +237,21 @@ class PrimaryBatchService:
                 if product:
                     baseline = self._get_or_create_baseline(product)
                     baseline_media = baseline.media_snapshot_json or []
+                    # Manual batches leave ProcessingBaseline media empty; seed from catalog
+                    # so title-only webhooks do not look like first-seen NEW images.
+                    if not baseline_media:
+                        catalog_media = media_snapshots_from_models(
+                            [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
+                        )
+                        if catalog_media:
+                            baseline.media_snapshot_json = catalog_media
+                            baseline.product_snapshot_json = (
+                                baseline.product_snapshot_json
+                                or product_snapshot_from_model(product)
+                            )
+                            baseline.evaluated_at = now
+                            baseline_media = catalog_media
+                            self.db.flush()
                 else:
                     baseline = None
 
@@ -252,7 +275,6 @@ class PrimaryBatchService:
                         trigger_type=TriggerType.AUTOMATIC,
                         status=BatchStatus.QUEUED,
                         settings_snapshot_json={
-                            "max_products_per_batch": shop_settings.max_products_per_batch,
                             "batch_interval_minutes": shop_settings.batch_interval_minutes,
                         },
                         started_at=now,
@@ -269,9 +291,11 @@ class PrimaryBatchService:
                     product_id=product.id if product else None,
                     product_snapshot_json=eligible_product,
                     prompt_snapshot_json=None,
+                    # Conflict check compares against media at process start (eligible),
+                    # not prior ProcessingBaseline (used only for delta detection above).
                     baseline_snapshot_json={
-                        "product": baseline.product_snapshot_json if baseline else None,
-                        "media": baseline_media,
+                        "product": eligible_product,
+                        "media": eligible_media,
                     },
                     status=BatchProductStatus.QUEUED,
                     image_count=len(delta_images),
@@ -366,7 +390,23 @@ class PrimaryBatchService:
             + batch.processing_product_count
             + batch.retrying_product_count
         )
-        if active == 0 and batch.product_count > 0:
+        if active > 0:
+            batch.completed_at = None
+            if batch.status in {
+                BatchStatus.COMPLETED,
+                BatchStatus.PARTIALLY_COMPLETED,
+                BatchStatus.FAILED,
+            }:
+                assert_transition("batch", BATCH_TRANSITIONS, batch.status, BatchStatus.PROCESSING)
+                batch.status = BatchStatus.PROCESSING
+                if batch.started_at is None:
+                    batch.started_at = datetime.now(timezone.utc)
+            elif batch.status == BatchStatus.QUEUED and batch.processing_product_count > 0:
+                assert_transition("batch", BATCH_TRANSITIONS, batch.status, BatchStatus.PROCESSING)
+                batch.status = BatchStatus.PROCESSING
+                if batch.started_at is None:
+                    batch.started_at = datetime.now(timezone.utc)
+        elif active == 0 and batch.product_count > 0:
             completed = batch.completed_product_count
             failed = batch.failed_product_count
             if completed == batch.product_count:
@@ -400,11 +440,6 @@ class PrimaryBatchService:
                         "Publish trigger after batch terminal failed | batch=%s",
                         batch.id,
                     )
-        elif batch.status == BatchStatus.QUEUED and batch.processing_product_count > 0:
-            assert_transition("batch", BATCH_TRANSITIONS, batch.status, BatchStatus.PROCESSING)
-            batch.status = BatchStatus.PROCESSING
-            if batch.started_at is None:
-                batch.started_at = datetime.now(timezone.utc)
 
         self.db.flush()
         return batch
@@ -516,23 +551,10 @@ class PrimaryBatchService:
         )
 
     def should_create_automatic_batch(self, shop_settings: ShopSettings) -> bool:
+        """True when Auto Sync is on and the oldest pending Secondary Queue item
+        has waited at least ``batch_interval_minutes`` (time-only trigger)."""
         if not shop_settings.auto_sync_enabled:
             return False
-
-        pending_count = (
-            self.db.query(func.count(SecondaryQueueItem.id))
-            .filter(
-                SecondaryQueueItem.shop_id == self.shop.id,
-                SecondaryQueueItem.status == SecondaryQueueStatus.PENDING,
-            )
-            .scalar()
-            or 0
-        )
-        if pending_count <= 0:
-            return False
-
-        if pending_count >= shop_settings.max_products_per_batch:
-            return True
 
         oldest = (
             self.db.query(func.min(SecondaryQueueItem.first_queued_at))

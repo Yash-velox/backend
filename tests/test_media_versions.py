@@ -28,10 +28,14 @@ def _seed_catalog_product(db, shop, *, gid="gid://shopify/Product/1", title="Rin
 
 def test_record_publish_creates_original_and_published(db_session, shop, tmp_path, monkeypatch):
     monkeypatch.setattr("app.config.settings.processing_output_directory", str(tmp_path / "processed"))
+    monkeypatch.setattr("app.config.settings.shopify_file_status_poll_seconds", 0.01)
+    monkeypatch.setattr("app.config.settings.shopify_file_ready_timeout_seconds", 1)
     catalog = _seed_catalog_product(db_session, shop)
-    batch, batch_product, _ = _seed_completed_batch(db_session, shop, tmp_path)
+    batch, batch_product, image = _seed_completed_batch(db_session, shop, tmp_path)
     batch_product.product_id = catalog.id
     db_session.commit()
+    generated_gid = image.generated_shopify_file_gid
+    assert generated_gid
 
     svc = PublishTriggerService(db_session, shop)
     result = svc.enqueue_product(batch_product.id)
@@ -44,10 +48,10 @@ def test_record_publish_creates_original_and_published(db_session, shop, tmp_pat
         "image": {"url": "https://cdn.shopify.com/a.png", "width": 10, "height": 10},
     }
     new_media = {
-        "id": "gid://shopify/MediaImage/999",
+        "id": generated_gid,
         "mediaContentType": "IMAGE",
         "alt": "front",
-        "image": {"url": "https://cdn.shopify.com/new.png", "width": 10, "height": 10},
+        "image": {"url": "https://cdn.shopify.com/generated-a.png", "width": 10, "height": 10},
     }
     snap_original = {
         "id": "gid://shopify/Product/1",
@@ -60,7 +64,7 @@ def test_record_publish_creates_original_and_published(db_session, shop, tmp_pat
     snap_final = {
         **snap_original,
         "media": {"nodes": [new_media]},
-        "featuredMedia": {"id": "gid://shopify/MediaImage/999"},
+        "featuredMedia": {"id": generated_gid},
     }
 
     client = MagicMock()
@@ -77,20 +81,21 @@ def test_record_publish_creates_original_and_published(db_session, shop, tmp_pat
     client.associate_media_to_variants.return_value = []
     client.reorder_product_media.return_value = {"id": "gid://shopify/Job/1", "done": True}
     client.get_job_status.return_value = {"id": "gid://shopify/Job/1", "done": True}
+    client.get_file_statuses.return_value = [
+        {
+            "id": generated_gid,
+            "fileStatus": "READY",
+            "image": {"url": "https://cdn.shopify.com/generated-a.png", "width": 10, "height": 10},
+        }
+    ]
 
     publisher = ProductPublisher(db_session, shop, client=client)
 
-    def fake_upload(*, path, filename, existing_file_gid=None):
-        return {
-            "file_gid": "gid://shopify/MediaImage/999",
-            "file_status": "READY",
-            "cdn_url": "https://cdn.shopify.com/new.png",
-        }
-
-    with patch.object(publisher.uploader, "upload_png", side_effect=fake_upload):
+    with patch.object(publisher.uploader, "upload_png") as upload_mock:
         out = publisher.run(op_id)
+        upload_mock.assert_not_called()
 
-    assert out.status == PublishStatus.PUBLISHED
+    assert out.status == PublishStatus.PUBLISHED, (out.last_error_code, out.last_error_message)
     versions = (
         db_session.query(ProductMediaVersion)
         .filter(ProductMediaVersion.product_id == catalog.id)

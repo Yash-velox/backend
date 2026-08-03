@@ -68,7 +68,12 @@ def build_output_set_checksum(images: list[BatchImage], storage=None) -> str:
     storage = storage or get_output_storage()
     hashes: list[str] = []
     for image in sorted(images, key=lambda i: (i.id.hex if i.id else "")):
-        # Prefer media order via a stable secondary key if position not stored on BatchImage.
+        if image.output_checksum:
+            hashes.append(image.output_checksum)
+            continue
+        if image.generated_shopify_file_gid:
+            hashes.append(f"shopify-file:{image.generated_shopify_file_gid}")
+            continue
         key = image.output_storage_key
         if not key:
             hashes.append("MISSING")
@@ -137,35 +142,57 @@ def validate_publishable_outputs(db: Session, batch_product: BatchProduct) -> tu
                 media_meta[gid] = m
 
     for position, image in enumerate(completed):
-        if not image.output_storage_key:
-            raise PublishEnqueueError("PUBLISH_OUTPUT_MISSING", f"Missing output for media {image.shopify_media_gid}")
-        path = storage.resolve_path(image.output_storage_key)
-        try:
-            size, data = validate_png_file(path)
-        except PublishUploadError as exc:
-            raise PublishEnqueueError(exc.code, str(exc)) from exc
-        digest = checksum_sha256(data)
-        hashes.append(digest)
         meta = media_meta.get(image.shopify_media_gid) or {}
         alt = meta.get("alt_text") or meta.get("alt")
         filename = sanitize_png_filename(image.original_filename or meta.get("filename"))
+        file_gid = image.generated_shopify_file_gid
+        cdn_url = image.generated_shopify_cdn_url
+        digest = image.output_checksum
+        size = None
+        local_key = image.output_storage_key
+
+        if file_gid:
+            # Preferred path: durable Shopify Files / CDN already uploaded during processing.
+            if not digest:
+                digest = f"shopify-file:{file_gid}"
+            size = 0
+            upload_status = "READY"
+        elif local_key and storage.exists(local_key):
+            # Legacy fallback only — new COMPLETED images must have Shopify Files.
+            path = storage.resolve_path(local_key)
+            try:
+                size, data = validate_png_file(path)
+            except PublishUploadError as exc:
+                raise PublishEnqueueError(exc.code, str(exc)) from exc
+            digest = checksum_sha256(data)
+            upload_status = "PENDING"
+        else:
+            raise PublishEnqueueError(
+                "PUBLISH_OUTPUT_MISSING",
+                f"Missing Shopify CDN file for media {image.shopify_media_gid}",
+            )
+
+        hashes.append(digest or "")
         assets.append(
             {
                 "batch_image_id": str(image.id),
+                "image_version_id": str(image.generated_image_version_id)
+                if image.generated_image_version_id
+                else None,
                 "source_media_gid": image.shopify_media_gid,
                 "source_file_gid": image.shopify_file_gid,
                 "source_position": meta.get("position", position),
                 "source_alt_text": alt,
                 "source_filename": image.original_filename,
-                "processed_output_key": image.output_storage_key,
+                "processed_output_key": local_key,
                 "processed_filename": filename,
                 "processed_sha256": digest,
                 "processed_size_bytes": size,
-                "shopify_file_gid": None,
+                "shopify_file_gid": file_gid,
                 "shopify_media_gid": None,
-                "shopify_file_status": None,
-                "shopify_cdn_url": None,
-                "upload_status": "PENDING",
+                "shopify_file_status": "READY" if file_gid else None,
+                "shopify_cdn_url": cdn_url,
+                "upload_status": upload_status,
                 "association_status": "PENDING",
                 "target_position": position,
                 "target_alt_text": alt,

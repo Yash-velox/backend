@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.batches_v2 import router as batches_router
+from app.api.image_versions import router as image_versions_router
 from app.api.internal import router as internal_router
 from app.api.products import router as products_router
 from app.api.prompts import router as prompts_router
@@ -109,7 +110,7 @@ def health():
 @app.get("/tenant/checkConfig", dependencies=[Depends(require_shopify_jwt)])
 def tenant_check_config(shop: CurrentShop):
     installed = bool(shop.encrypted_access_token) or (
-        settings.app_env == "dev" and bool(settings.shopify_dev_access_token)
+        settings.app_env in {"dev", "uat"} and bool(settings.shopify_dev_access_token)
     )
     return {
         "status": "ok",
@@ -127,5 +128,6 @@ app.include_router(secondary_queue_router)
 app.include_router(batches_router)
 app.include_router(publishing_router)
 app.include_router(versions_router)
+app.include_router(image_versions_router)
 app.include_router(prompts_router)
 app.include_router(products_router)

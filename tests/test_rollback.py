@@ -143,7 +143,16 @@ def test_successful_rollback_creates_audit_version(db_session, shop):
     product, original, published = _seed_product_with_versions(db_session, shop)
     client = MagicMock()
     client.get_file_statuses.return_value = [
-        {"id": "gid://shopify/MediaImage/10", "fileStatus": "READY"},
+        {
+            "id": "gid://shopify/MediaImage/10",
+            "fileStatus": "READY",
+            "image": {"url": "https://cdn.shopify.com/a.png", "width": 10, "height": 10},
+        },
+        {
+            "id": "gid://shopify/MediaImage/999",
+            "fileStatus": "READY",
+            "image": {"url": "https://cdn.shopify.com/new.png", "width": 10, "height": 10},
+        },
     ]
 
     live_published = {
@@ -233,14 +242,22 @@ def test_successful_rollback_creates_audit_version(db_session, shop):
     out = svc.run(op_id)
 
     assert out.status == RollbackStatus.ROLLED_BACK
-    assert out.result_version_id is not None
-    result = db_session.query(ProductMediaVersion).filter(ProductMediaVersion.id == out.result_version_id).one()
-    assert result.version_type == MediaVersionType.ROLLBACK
-    assert result.is_active is True
-    assert result.source_version_id == original.id
+    assert out.result_version_id == original.id
     db_session.refresh(original)
-    assert original.is_active is False  # historical target stays immutable / not reactivated
+    db_session.refresh(published)
+    assert original.is_active is True
     assert original.version_type == MediaVersionType.ORIGINAL
+    assert published.is_active is False
+    # No new ROLLBACK audit row should be created
+    rollback_rows = (
+        db_session.query(ProductMediaVersion)
+        .filter(
+            ProductMediaVersion.product_id == product.id,
+            ProductMediaVersion.version_type == MediaVersionType.ROLLBACK,
+        )
+        .count()
+    )
+    assert rollback_rows == 0
 
     # Detach only removed published file from this product
     remove_calls = client.remove_file_product_references.call_args_list
@@ -249,11 +266,99 @@ def test_successful_rollback_creates_audit_version(db_session, shop):
     assert remove_calls[0].kwargs["product_gid"] == product.shopify_product_gid
 
 
+def test_compare_by_files_allows_rematerialized_media_gids():
+    """Same CDN file after detach/reattach must not false-conflict on new MediaImage GIDs."""
+    from app.services.product_rollback import _compare_by_files
+
+    expected = {
+        "featured_media_gid": "gid://shopify/MediaImage/999",
+        "media": [
+            {
+                "media_gid": "gid://shopify/MediaImage/999",
+                "file_gid": "gid://shopify/MediaImage/999",
+                "position": 0,
+                "alt_text": "front",
+                "cdn_url": "https://cdn.shopify.com/s/files/1/new.png?v=1",
+                "is_primary": True,
+            }
+        ],
+        "variants": [
+            {"variant_gid": "gid://shopify/ProductVariant/1", "media_gid": "gid://shopify/MediaImage/999"}
+        ],
+    }
+    live = {
+        "featured_media_gid": "gid://shopify/MediaImage/1000",
+        "media": [
+            {
+                "media_gid": "gid://shopify/MediaImage/1000",
+                "file_gid": "gid://shopify/MediaImage/1000",
+                "position": 0,
+                "alt_text": "front",
+                "cdn_url": "https://cdn.shopify.com/s/files/1/new.png?v=99",
+                "is_primary": True,
+            }
+        ],
+        "variants": [
+            {"variant_gid": "gid://shopify/ProductVariant/1", "media_gid": "gid://shopify/MediaImage/1000"}
+        ],
+    }
+    assert _compare_by_files(expected, live)["hasConflict"] is False
+
+
+def test_compare_by_files_conflicts_when_cdn_differs():
+    from app.services.product_rollback import _compare_by_files
+
+    expected = {
+        "featured_media_gid": "gid://shopify/MediaImage/999",
+        "media": [
+            {
+                "media_gid": "gid://shopify/MediaImage/999",
+                "file_gid": "gid://shopify/MediaImage/999",
+                "position": 0,
+                "alt_text": "front",
+                "cdn_url": "https://cdn.shopify.com/s/files/1/published.png",
+                "is_primary": True,
+            }
+        ],
+        "variants": [],
+    }
+    live = {
+        "featured_media_gid": "gid://shopify/MediaImage/50",
+        "media": [
+            {
+                "media_gid": "gid://shopify/MediaImage/50",
+                "file_gid": "gid://shopify/MediaImage/50",
+                "position": 0,
+                "alt_text": "front",
+                "cdn_url": "https://cdn.shopify.com/s/files/1/changed.png",
+                "is_primary": True,
+            }
+        ],
+        "variants": [],
+    }
+    out = _compare_by_files(expected, live)
+    assert out["hasConflict"] is True
+    assert out["membershipChanged"] is True
+
+
 def test_rollback_conflict_when_live_differs(db_session, shop):
     product, original, _published = _seed_product_with_versions(db_session, shop)
     client = MagicMock()
     client.get_file_statuses.return_value = [
-        {"id": "gid://shopify/MediaImage/10", "fileStatus": "READY"},
+        {
+            "id": "gid://shopify/MediaImage/10",
+            "fileStatus": "READY",
+            "image": {"url": "https://cdn.shopify.com/a.png", "width": 10, "height": 10},
+        },
+        {
+            "id": "gid://shopify/MediaImage/999",
+            "fileStatus": "READY",
+            "image": {
+                "url": "https://cdn.shopify.com/gid://shopify/MediaImage/999.png",
+                "width": 10,
+                "height": 10,
+            },
+        },
     ]
     # Live has an unexpected media id vs active published version
     client.get_product_media_snapshot.return_value = {
@@ -278,6 +383,130 @@ def test_rollback_conflict_when_live_differs(db_session, shop):
     out = svc.run(UUID(queued["operationId"]))
     assert out.status == RollbackStatus.ROLLBACK_CONFLICT
     assert out.conflict_details
+
+
+def test_rollback_allows_rematerialized_live_media_gids(db_session, shop):
+    """Live MediaImage GIDs changed but CDN paths still match active published version."""
+    product, original, published = _seed_product_with_versions(db_session, shop)
+    # Align published snapshot CDN with what live will report (path-stable).
+    snap = dict(published.items_json or {})
+    media = [dict(m) for m in (snap.get("media") or [])]
+    for m in media:
+        m["cdn_url"] = "https://cdn.shopify.com/s/files/1/published.png?v=1"
+    snap["media"] = media
+    published.items_json = snap
+    db_session.commit()
+
+    client = MagicMock()
+    client.get_file_statuses.return_value = [
+        {
+            "id": "gid://shopify/MediaImage/10",
+            "fileStatus": "READY",
+            "image": {"url": "https://cdn.shopify.com/a.png", "width": 10, "height": 10},
+        },
+        {
+            "id": "gid://shopify/MediaImage/999",
+            "fileStatus": "READY",
+            "image": {
+                "url": "https://cdn.shopify.com/s/files/1/published.png?v=1",
+                "width": 10,
+                "height": 10,
+            },
+        },
+    ]
+
+    live_published = {
+        "id": product.shopify_product_gid,
+        "updatedAt": "2026-07-31T00:00:00Z",
+        "featuredMedia": {"id": "gid://shopify/MediaImage/1000"},
+        "media": {
+            "nodes": [
+                {
+                    "id": "gid://shopify/MediaImage/1000",
+                    "mediaContentType": "IMAGE",
+                    "alt": "front",
+                    "image": {
+                        "url": "https://cdn.shopify.com/s/files/1/published.png?v=2",
+                        "width": 10,
+                        "height": 10,
+                    },
+                }
+            ]
+        },
+        "variants": {
+            "nodes": [
+                {
+                    "id": "gid://shopify/ProductVariant/1",
+                    "media": {"nodes": [{"id": "gid://shopify/MediaImage/1000"}]},
+                }
+            ]
+        },
+    }
+    live_both = {
+        **live_published,
+        "media": {
+            "nodes": [
+                {
+                    "id": "gid://shopify/MediaImage/1000",
+                    "mediaContentType": "IMAGE",
+                    "alt": "front",
+                    "image": {
+                        "url": "https://cdn.shopify.com/s/files/1/published.png?v=2",
+                        "width": 10,
+                        "height": 10,
+                    },
+                },
+                {
+                    "id": "gid://shopify/MediaImage/10",
+                    "mediaContentType": "IMAGE",
+                    "alt": "front",
+                    "image": {"url": "https://cdn.shopify.com/a.png", "width": 10, "height": 10},
+                },
+            ]
+        },
+    }
+    live_original = {
+        "id": product.shopify_product_gid,
+        "updatedAt": "2026-07-31T00:00:00Z",
+        "featuredMedia": {"id": "gid://shopify/MediaImage/10"},
+        "media": {
+            "nodes": [
+                {
+                    "id": "gid://shopify/MediaImage/10",
+                    "mediaContentType": "IMAGE",
+                    "alt": "front",
+                    "image": {"url": "https://cdn.shopify.com/a.png", "width": 10, "height": 10},
+                }
+            ]
+        },
+        "variants": {
+            "nodes": [
+                {
+                    "id": "gid://shopify/ProductVariant/1",
+                    "media": {"nodes": [{"id": "gid://shopify/MediaImage/10"}]},
+                }
+            ]
+        },
+    }
+    client.get_product_media_snapshot.side_effect = [
+        live_published,
+        live_both,
+        live_both,
+        live_original,
+        live_original,
+    ]
+    client.add_file_product_references.return_value = []
+    client.remove_file_product_references.return_value = []
+    client.update_file_alt_text.return_value = {}
+    client.associate_media_to_variants.return_value = []
+    client.reorder_product_media.return_value = {"id": "gid://shopify/Job/1", "done": True}
+    client.get_job_status.return_value = {"id": "gid://shopify/Job/1", "done": True}
+
+    svc = ProductRollbackService(db_session, shop, client=client)
+    queued = svc.enqueue(product_id=product.id, target_version_id=original.id, confirm=True)
+    out = svc.run(UUID(queued["operationId"]))
+    assert out.status == RollbackStatus.ROLLED_BACK
+    assert out.result_version_id == original.id
 
 
 def test_rollback_api_shop_scoped(client, db_session, shop):
