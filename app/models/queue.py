@@ -75,7 +75,6 @@ class ShopSettings(Base):
         Uuid(as_uuid=True), ForeignKey("shops.id", ondelete="CASCADE"), nullable=False, index=True
     )
     auto_sync_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    max_products_per_batch: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
     batch_interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=15)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

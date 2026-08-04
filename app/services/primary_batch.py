@@ -124,7 +124,6 @@ class PrimaryBatchService:
             trigger_type=TriggerType.MANUAL,
             status=BatchStatus.QUEUED,
             settings_snapshot_json={
-                "max_products_per_batch": shop_settings.max_products_per_batch,
                 "batch_interval_minutes": shop_settings.batch_interval_minutes,
                 "manual_batch_product_limit": settings.manual_batch_product_limit,
             },
@@ -211,10 +210,16 @@ class PrimaryBatchService:
             try:
                 product = None
                 if item.product_id:
-                    product = self.db.get(Product, item.product_id)
+                    product = (
+                        self.db.query(Product)
+                        .options(selectinload(Product.media))
+                        .filter(Product.id == item.product_id)
+                        .one_or_none()
+                    )
                 if product is None:
                     product = (
                         self.db.query(Product)
+                        .options(selectinload(Product.media))
                         .filter(
                             Product.shop_id == self.shop.id,
                             Product.shopify_product_gid == item.shopify_product_gid,
@@ -229,6 +234,21 @@ class PrimaryBatchService:
                 if product:
                     baseline = self._get_or_create_baseline(product)
                     baseline_media = baseline.media_snapshot_json or []
+                    # Manual batches leave ProcessingBaseline media empty; seed from catalog
+                    # so title-only webhooks do not look like first-seen NEW images.
+                    if not baseline_media:
+                        catalog_media = media_snapshots_from_models(
+                            [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
+                        )
+                        if catalog_media:
+                            baseline.media_snapshot_json = catalog_media
+                            baseline.product_snapshot_json = (
+                                baseline.product_snapshot_json
+                                or product_snapshot_from_model(product)
+                            )
+                            baseline.evaluated_at = now
+                            baseline_media = catalog_media
+                            self.db.flush()
                 else:
                     baseline = None
 
@@ -252,7 +272,6 @@ class PrimaryBatchService:
                         trigger_type=TriggerType.AUTOMATIC,
                         status=BatchStatus.QUEUED,
                         settings_snapshot_json={
-                            "max_products_per_batch": shop_settings.max_products_per_batch,
                             "batch_interval_minutes": shop_settings.batch_interval_minutes,
                         },
                         started_at=now,
@@ -499,23 +518,10 @@ class PrimaryBatchService:
         )
 
     def should_create_automatic_batch(self, shop_settings: ShopSettings) -> bool:
+        """True when Auto Sync is on and the oldest pending Secondary Queue item
+        has waited at least ``batch_interval_minutes`` (time-only trigger)."""
         if not shop_settings.auto_sync_enabled:
             return False
-
-        pending_count = (
-            self.db.query(func.count(SecondaryQueueItem.id))
-            .filter(
-                SecondaryQueueItem.shop_id == self.shop.id,
-                SecondaryQueueItem.status == SecondaryQueueStatus.PENDING,
-            )
-            .scalar()
-            or 0
-        )
-        if pending_count <= 0:
-            return False
-
-        if pending_count >= shop_settings.max_products_per_batch:
-            return True
 
         oldest = (
             self.db.query(func.min(SecondaryQueueItem.first_queued_at))

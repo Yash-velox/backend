@@ -125,9 +125,8 @@ class ProcessingWorker:
                 primary = PrimaryBatchService(db, shop)
                 if not primary.should_create_automatic_batch(settings_row):
                     continue
-                limit = settings_row.max_products_per_batch
                 claimed = SecondaryQueueService(db, shop).claim_pending_for_conversion(
-                    limit=limit,
+                    limit=settings.auto_batch_claim_limit,
                     worker_id=self.worker_id,
                 )
                 if not claimed:

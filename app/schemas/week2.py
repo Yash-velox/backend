@@ -30,7 +30,6 @@ class ManualBatchCreateRequest(BaseModel):
 
 class SettingsOut(BaseModel):
     autoSyncEnabled: bool
-    maxProductsPerBatch: int
     batchIntervalMinutes: int
     createdAt: datetime
     updatedAt: datetime
@@ -38,7 +37,6 @@ class SettingsOut(BaseModel):
 
 class SettingsUpdateRequest(BaseModel):
     autoSyncEnabled: bool | None = None
-    maxProductsPerBatch: int | None = None
     batchIntervalMinutes: int | None = None
 
 

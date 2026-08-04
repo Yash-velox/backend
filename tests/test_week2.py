@@ -129,6 +129,60 @@ def test_delta_new_and_replaced_and_skip():
     assert skip.get("skip_reason")
 
 
+def test_delta_skips_product_image_vs_media_image_same_cdn():
+    """REST ProductImage GID vs GraphQL MediaImage GID for same CDN path is not NEW."""
+    baseline = [
+        {
+            "media_gid": "gid://shopify/MediaImage/33248938590291",
+            "cdn_url": "https://cdn.shopify.com/s/files/1/x/files/chain.png?v=1",
+            "filename": "chain.png",
+            "width": 1254,
+            "height": 1254,
+            "mime_type": "image/png",
+            "fingerprint": "catalog-fp",
+        }
+    ]
+    eligible = [
+        {
+            "media_gid": "gid://shopify/ProductImage/41966871347283",
+            "cdn_url": "https://cdn.shopify.com/s/files/1/x/files/chain.png?v=2",
+            "filename": "chain.png",
+            "width": 1254,
+            "height": 1254,
+            "mime_type": None,
+            "fingerprint": "webhook-fp-different-because-gid",
+        }
+    ]
+    result = compare_media_snapshots(eligible, baseline)
+    assert result["new"] == []
+    assert result["replaced"] == []
+    assert result["skip_reason"]
+
+
+def test_delta_new_cdn_path_still_detected():
+    baseline = [
+        {
+            "media_gid": "gid://shopify/MediaImage/1",
+            "cdn_url": "https://cdn.shopify.com/old.png",
+            "filename": "old.png",
+            "width": 10,
+            "height": 10,
+        }
+    ]
+    eligible = [
+        {
+            "media_gid": "gid://shopify/ProductImage/99",
+            "cdn_url": "https://cdn.shopify.com/brand-new.png",
+            "filename": "brand-new.png",
+            "width": 10,
+            "height": 10,
+        }
+    ]
+    result = compare_media_snapshots(eligible, baseline)
+    assert len(result["new"]) == 1
+    assert result["skip_reason"] is None
+
+
 def test_status_only_and_draft_helpers():
     product = Product(
         id=uuid4(),
@@ -222,16 +276,15 @@ def test_prompt_mapping_requires_db_configuration():
 
 
 def test_settings_validation(db_session, shop, monkeypatch):
-    monkeypatch.setattr("app.services.settings_service.settings.max_products_per_batch_cap", 20)
     monkeypatch.setattr("app.services.settings_service.settings.batch_interval_minutes_cap", 60)
     ensure_shop_settings(db_session, shop)
     db_session.commit()
     svc = SettingsService(db_session, shop)
-    updated = svc.update(auto_sync_enabled=True, max_products_per_batch=5, batch_interval_minutes=10)
+    updated = svc.update(auto_sync_enabled=True, batch_interval_minutes=10)
     assert updated.auto_sync_enabled is True
-    assert updated.max_products_per_batch == 5
+    assert updated.batch_interval_minutes == 10
     try:
-        svc.update(max_products_per_batch=999)
+        svc.update(batch_interval_minutes=999)
         assert False
     except SettingsValidationError:
         pass
@@ -375,17 +428,173 @@ def test_secondary_conversion_skips_no_delta(db_session, shop):
     assert item.status == SecondaryQueueStatus.SKIPPED_NO_ELIGIBLE_IMAGE_DELTA
 
 
-def test_auto_batch_trigger_by_count_and_interval(db_session, shop):
+def test_secondary_conversion_skips_title_only_empty_baseline(db_session, shop):
+    """Empty ProcessingBaseline seeds from catalog; ProductImage eligible matches by CDN."""
+    ensure_shop_settings(db_session, shop)
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/8034005418067",
+        title="Title A",
+        status="ACTIVE",
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(
+        ProductMedia(
+            shop_id=shop.id,
+            product_id=product.id,
+            shopify_media_gid="gid://shopify/MediaImage/33248938590291",
+            cdn_url="https://cdn.shopify.com/s/files/1/x/files/chain.png?v=1",
+            original_filename="chain.png",
+            width=1254,
+            height=1254,
+            is_visible=True,
+            is_active=True,
+            position=0,
+            content_fingerprint="catalog-fp",
+        )
+    )
+    # Empty baseline (manual batch path)
+    db_session.add(
+        ProcessingBaseline(
+            shop_id=shop.id,
+            product_id=product.id,
+            media_snapshot_json=[],
+            product_snapshot_json={"shopify_product_gid": product.shopify_product_gid},
+        )
+    )
+    eligible_media = [
+        {
+            "media_gid": "gid://shopify/ProductImage/41966871347283",
+            "cdn_url": "https://cdn.shopify.com/s/files/1/x/files/chain.png?v=9",
+            "filename": "chain.png",
+            "width": 1254,
+            "height": 1254,
+            "fingerprint": "webhook-fp",
+        }
+    ]
+    item = SecondaryQueueItem(
+        shop_id=shop.id,
+        shopify_product_gid=product.shopify_product_gid,
+        product_id=product.id,
+        status=SecondaryQueueStatus.CLAIMED,
+        eligible_product_snapshot_json={
+            "shopify_product_gid": product.shopify_product_gid,
+            "title": "Title B",
+        },
+        eligible_media_snapshot_json=eligible_media,
+        claimed_by="worker_test",
+        claimed_at=datetime.now(timezone.utc),
+    )
+    db_session.add(item)
+    db_session.commit()
+
+    result = PrimaryBatchService(db_session, shop).convert_secondary_items([item])
+    assert result is None
+    db_session.refresh(item)
+    assert item.status == SecondaryQueueStatus.SKIPPED_NO_ELIGIBLE_IMAGE_DELTA
+    baseline = (
+        db_session.query(ProcessingBaseline)
+        .filter(ProcessingBaseline.product_id == product.id)
+        .one()
+    )
+    # Seeded from catalog then advanced to evaluated eligible snapshot on skip.
+    assert baseline.media_snapshot_json
+    assert any(
+        (m.get("cdn_url") or "").startswith("https://cdn.shopify.com/s/files/1/x/files/chain.png")
+        for m in baseline.media_snapshot_json
+    )
+
+
+def test_secondary_conversion_creates_batch_for_new_cdn(db_session, shop):
+    ensure_shop_settings(db_session, shop)
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/77",
+        title="Bag",
+        status="ACTIVE",
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(
+        ProductMedia(
+            shop_id=shop.id,
+            product_id=product.id,
+            shopify_media_gid="gid://shopify/MediaImage/10",
+            cdn_url="https://cdn.shopify.com/old.png",
+            original_filename="old.png",
+            width=10,
+            height=10,
+            is_visible=True,
+            is_active=True,
+            position=0,
+        )
+    )
+    db_session.add(
+        ProcessingBaseline(
+            shop_id=shop.id,
+            product_id=product.id,
+            media_snapshot_json=[
+                {
+                    "media_gid": "gid://shopify/MediaImage/10",
+                    "cdn_url": "https://cdn.shopify.com/old.png",
+                    "filename": "old.png",
+                    "width": 10,
+                    "height": 10,
+                }
+            ],
+        )
+    )
+    item = SecondaryQueueItem(
+        shop_id=shop.id,
+        shopify_product_gid=product.shopify_product_gid,
+        product_id=product.id,
+        status=SecondaryQueueStatus.CLAIMED,
+        eligible_product_snapshot_json={"shopify_product_gid": product.shopify_product_gid, "title": "Bag"},
+        eligible_media_snapshot_json=[
+            {
+                "media_gid": "gid://shopify/MediaImage/10",
+                "cdn_url": "https://cdn.shopify.com/old.png",
+                "filename": "old.png",
+                "width": 10,
+                "height": 10,
+            },
+            {
+                "media_gid": "gid://shopify/MediaImage/11",
+                "cdn_url": "https://cdn.shopify.com/new.png",
+                "filename": "new.png",
+                "width": 20,
+                "height": 20,
+            },
+        ],
+        claimed_by="worker_test",
+        claimed_at=datetime.now(timezone.utc),
+    )
+    db_session.add(item)
+    db_session.commit()
+
+    batch = PrimaryBatchService(db_session, shop).convert_secondary_items([item])
+    assert batch is not None
+    assert batch.trigger_type == TriggerType.AUTOMATIC
+    db_session.refresh(item)
+    assert item.status == SecondaryQueueStatus.CONVERTED
+    images = db_session.query(BatchImage).filter(BatchImage.shop_id == shop.id).all()
+    assert len(images) == 1
+    assert images[0].delta_type == DeltaType.NEW
+    assert images[0].shopify_media_gid.endswith("/11")
+
+
+def test_auto_batch_trigger_by_interval_only(db_session, shop):
     settings_row = ensure_shop_settings(db_session, shop)
     settings_row.auto_sync_enabled = True
-    settings_row.max_products_per_batch = 2
     settings_row.batch_interval_minutes = 15
     db_session.commit()
 
     svc = PrimaryBatchService(db_session, shop)
     assert svc.should_create_automatic_batch(settings_row) is False
 
-    for i in range(2):
+    # Many pending products still within the interval → do not trigger
+    for i in range(5):
         db_session.add(
             SecondaryQueueItem(
                 shop_id=shop.id,
@@ -396,7 +605,7 @@ def test_auto_batch_trigger_by_count_and_interval(db_session, shop):
             )
         )
     db_session.commit()
-    assert svc.should_create_automatic_batch(settings_row) is True
+    assert svc.should_create_automatic_batch(settings_row) is False
 
     db_session.query(SecondaryQueueItem).delete()
     db_session.add(
@@ -421,12 +630,13 @@ def test_settings_api(client, shop, db_session):
 
     res = client.put(
         "/api/settings",
-        json={"autoSyncEnabled": True, "maxProductsPerBatch": 3, "batchIntervalMinutes": 12},
+        json={"autoSyncEnabled": True, "batchIntervalMinutes": 12},
     )
     assert res.status_code == 200
     data = res.json()["data"]
     assert data["autoSyncEnabled"] is True
-    assert data["maxProductsPerBatch"] == 3
+    assert data["batchIntervalMinutes"] == 12
+    assert "maxProductsPerBatch" not in data
 
 
 def test_secondary_queue_api(client, shop, db_session):

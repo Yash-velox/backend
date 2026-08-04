@@ -18,7 +18,6 @@ def _request_id(request: Request) -> str:
 def _settings_out(row) -> SettingsOut:
     return SettingsOut(
         autoSyncEnabled=row.auto_sync_enabled,
-        maxProductsPerBatch=row.max_products_per_batch,
         batchIntervalMinutes=row.batch_interval_minutes,
         createdAt=row.created_at,
         updatedAt=row.updated_at,
@@ -48,7 +47,6 @@ def update_settings(
     try:
         row = svc.update(
             auto_sync_enabled=payload.autoSyncEnabled,
-            max_products_per_batch=payload.maxProductsPerBatch,
             batch_interval_minutes=payload.batchIntervalMinutes,
         )
     except SettingsValidationError as exc:

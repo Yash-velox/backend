@@ -50,11 +50,11 @@ class Settings(BaseSettings):
     processing_worker_id: str = ""
     processing_output_directory: str = "storage/processed"
 
-    # Week 2 Auto Sync caps (server-side upper bounds; per-shop settings live in DB)
-    max_products_per_batch_cap: int = 50
+    # Week 2 Auto Sync (server-side bounds; per-shop interval lives in DB)
     batch_interval_minutes_cap: int = 1440
-    default_max_products_per_batch: int = 10
     default_batch_interval_minutes: int = 15
+    # Safety cap when claiming Secondary Queue items into one automatic Primary batch
+    auto_batch_claim_limit: int = 500
     manual_batch_product_limit: int = 50
 
     shopify_image_download_timeout_seconds: int = 60
