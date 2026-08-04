@@ -28,9 +28,15 @@ from app.models import (
 )
 from app.services.catalog_sync import CatalogSyncService
 from app.services.delta import compare_media_snapshots
+from app.services.prompt_resolver import PromptResolverError, assert_product_prompts_ready
 from app.services.shopify_graphql import ShopifyGraphQLClient, ShopifyGraphQLError
 from app.services.snapshot import media_snapshots_from_models, product_snapshot_from_model
-from app.services.state_machine import BATCH_PRODUCT_TRANSITIONS, BATCH_TRANSITIONS, assert_transition
+from app.services.state_machine import (
+    BATCH_PRODUCT_TRANSITIONS,
+    BATCH_TRANSITIONS,
+    SECONDARY_TRANSITIONS,
+    assert_transition,
+)
 
 logger = logging.getLogger("app.services.primary_batch")
 
@@ -114,10 +120,42 @@ class PrimaryBatchService:
             logger.error("Product refresh failed | shop=%s gid=%s error=%s", self.shop.id, product_gid, exc)
             return None
 
+    def _require_prompts_ready(
+        self,
+        product: Product | None,
+        *,
+        product_type_override: str | None = None,
+        product_label: str | None = None,
+    ) -> None:
+        try:
+            assert_product_prompts_ready(
+                self.db,
+                self.shop,
+                product,
+                product_type_override=product_type_override,
+                product_label=product_label,
+            )
+        except PromptResolverError as exc:
+            raise PrimaryBatchError(str(exc)) from exc
+
     def create_manual_batch(self, product_gids: list[str]) -> ProcessingBatch:
         gids = self._validate_product_gids(product_gids)
         shop_settings = ensure_shop_settings(self.db, self.shop)
         now = datetime.now(timezone.utc)
+
+        # Validate every product (media + prompts) before creating the batch row.
+        prepared: list[tuple[str, Product, list]] = []
+        for gid in gids:
+            product = self._load_or_refresh_product(gid)
+            if product is None:
+                raise PrimaryBatchError(f"Product not found: {gid}")
+
+            visible_media = [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
+            if not visible_media:
+                raise PrimaryBatchError(f"Product has no visible media: {gid}")
+
+            self._require_prompts_ready(product)
+            prepared.append((gid, product, visible_media))
 
         batch = ProcessingBatch(
             shop_id=self.shop.id,
@@ -132,15 +170,7 @@ class PrimaryBatchService:
         self.db.flush()
 
         image_count = 0
-        for gid in gids:
-            product = self._load_or_refresh_product(gid)
-            if product is None:
-                raise PrimaryBatchError(f"Product not found: {gid}")
-
-            visible_media = [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
-            if not visible_media:
-                raise PrimaryBatchError(f"Product has no visible media: {gid}")
-
+        for gid, product, visible_media in prepared:
             product_snapshot = product_snapshot_from_model(product)
             media_snapshot = media_snapshots_from_models(visible_media)
             # Publish conflict baseline must be the live media set at enqueue time.
@@ -266,6 +296,35 @@ class PrimaryBatchService:
                             product_snapshot=eligible_product,
                             media_snapshot=eligible_media,
                         )
+                    self.db.commit()
+                    continue
+
+                type_override = None
+                if product is None or not (product.product_type or "").strip():
+                    type_override = eligible_product.get("product_type") or eligible_product.get(
+                        "productType"
+                    )
+                label = (
+                    (product.title if product else None)
+                    or eligible_product.get("title")
+                    or item.shopify_product_gid
+                )
+                try:
+                    self._require_prompts_ready(
+                        product,
+                        product_type_override=str(type_override) if type_override else None,
+                        product_label=str(label) if label else None,
+                    )
+                except PrimaryBatchError as exc:
+                    assert_transition(
+                        "secondary_queue",
+                        SECONDARY_TRANSITIONS,
+                        item.status,
+                        SecondaryQueueStatus.FAILED_CONVERSION,
+                    )
+                    item.status = SecondaryQueueStatus.FAILED_CONVERSION
+                    item.failure_reason = str(exc)[:2000]
+                    item.skip_reason = None
                     self.db.commit()
                     continue
 

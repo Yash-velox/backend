@@ -601,6 +601,9 @@ class OpenAIBatchOrchestrator:
                 ready.append((product, image, target))
 
         if not ready:
+            # Prompt/config failures mark products FAILED above; refresh so the Primary
+            # batch does not remain stuck in QUEUED with no OpenAI work left.
+            PrimaryBatchService(self.db, shop).refresh_batch_counters(batch)
             return None
 
         # Prefer lowest step order; one step_type per OpenAI batch
@@ -1035,6 +1038,20 @@ class OpenAIBatchOrchestrator:
             if image.status not in {BatchImageStatus.FAILED}:
                 assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.FAILED)
                 image.status = BatchImageStatus.FAILED
+            image.completed_at = image.completed_at or datetime.now(timezone.utc)
+            if product.status in {BatchProductStatus.QUEUED, BatchProductStatus.PROCESSING}:
+                assert_transition(
+                    "batch_product",
+                    BATCH_PRODUCT_TRANSITIONS,
+                    product.status,
+                    BatchProductStatus.FAILED,
+                )
+                product.status = BatchProductStatus.FAILED
+                product.error_code = exc.code
+                product.error_message = str(exc)
+                product.completed_at = datetime.now(timezone.utc)
+                product.locked_by = None
+                product.locked_at = None
             return None
 
         next_order = image.current_prompt_step + 1

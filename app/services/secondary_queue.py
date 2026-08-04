@@ -14,6 +14,7 @@ from app.models import (
     SecondaryQueueStatus,
     Shop,
 )
+from app.services.prompt_resolver import PromptResolverError, assert_product_prompts_ready
 from app.services.state_machine import SECONDARY_TRANSITIONS, assert_transition
 
 logger = logging.getLogger("app.services.secondary_queue")
@@ -23,6 +24,54 @@ class SecondaryQueueService:
     def __init__(self, db: Session, shop: Shop) -> None:
         self.db = db
         self.shop = shop
+
+    def _prompt_failure_reason(
+        self,
+        product: Product | None,
+        product_snapshot: dict,
+        product_gid: str,
+    ) -> str | None:
+        type_override = None
+        if product is None or not (product.product_type or "").strip():
+            type_override = product_snapshot.get("product_type") or product_snapshot.get("productType")
+        label = (
+            (product.title if product else None)
+            or product_snapshot.get("title")
+            or product_gid
+        )
+        try:
+            assert_product_prompts_ready(
+                self.db,
+                self.shop,
+                product,
+                product_type_override=str(type_override) if type_override else None,
+                product_label=str(label) if label else None,
+            )
+            return None
+        except PromptResolverError as exc:
+            return str(exc)[:2000]
+
+    def _apply_prompt_gate(
+        self,
+        item: SecondaryQueueItem,
+        product: Product | None,
+        product_snapshot: dict,
+        product_gid: str,
+    ) -> None:
+        reason = self._prompt_failure_reason(product, product_snapshot, product_gid)
+        if reason is None:
+            item.failure_reason = None
+            return
+        if item.status != SecondaryQueueStatus.FAILED_CONVERSION:
+            assert_transition(
+                "secondary_queue",
+                SECONDARY_TRANSITIONS,
+                item.status,
+                SecondaryQueueStatus.FAILED_CONVERSION,
+            )
+            item.status = SecondaryQueueStatus.FAILED_CONVERSION
+        item.failure_reason = reason
+        item.skip_reason = None
 
     def upsert_from_webhook(
         self,
@@ -71,6 +120,29 @@ class SecondaryQueueService:
             .one_or_none()
         )
 
+        if existing is None:
+            # Re-open a prior prompt/config failure when Shopify sends another update.
+            existing = (
+                self.db.query(SecondaryQueueItem)
+                .filter(
+                    SecondaryQueueItem.shop_id == self.shop.id,
+                    SecondaryQueueItem.shopify_product_gid == product_gid,
+                    SecondaryQueueItem.status == SecondaryQueueStatus.FAILED_CONVERSION,
+                )
+                .order_by(SecondaryQueueItem.updated_at.desc())
+                .first()
+            )
+            if existing is not None:
+                assert_transition(
+                    "secondary_queue",
+                    SECONDARY_TRANSITIONS,
+                    existing.status,
+                    SecondaryQueueStatus.PENDING,
+                )
+                existing.status = SecondaryQueueStatus.PENDING
+                existing.claimed_at = None
+                existing.claimed_by = None
+
         if existing:
             existing.queue_revision += 1
             existing.webhook_count += 1
@@ -81,13 +153,15 @@ class SecondaryQueueService:
             existing.product_id = product.id if product else existing.product_id
             existing.skip_reason = None
             existing.failure_reason = None
+            self._apply_prompt_gate(existing, product, product_snapshot, product_gid)
             self.db.commit()
             self.db.refresh(existing)
             logger.info(
-                "Secondary queue updated | shop=%s product=%s revision=%s",
+                "Secondary queue updated | shop=%s product=%s revision=%s status=%s",
                 self.shop.id,
                 product_gid,
                 existing.queue_revision,
+                existing.status.value,
             )
             return existing
 
@@ -105,13 +179,16 @@ class SecondaryQueueService:
             webhook_count=1,
         )
         self.db.add(item)
+        self.db.flush()
+        self._apply_prompt_gate(item, product, product_snapshot, product_gid)
         self.db.commit()
         self.db.refresh(item)
         logger.info(
-            "Secondary queue created | shop=%s product=%s item=%s",
+            "Secondary queue created | shop=%s product=%s item=%s status=%s",
             self.shop.id,
             product_gid,
             item.id,
+            item.status.value,
         )
         return item
 

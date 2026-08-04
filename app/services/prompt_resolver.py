@@ -244,3 +244,38 @@ class PromptResolver:
             "image_position": str(image_position) if image_position is not None else None,
             "shop_name": shop_name,
         }
+
+
+def product_prompt_block_message(
+    exc: PromptResolverError,
+    *,
+    product_label: str,
+) -> str:
+    """Merchant-facing reason when a product cannot be queued/processed."""
+    label = (product_label or "").strip() or "product"
+    return f'Cannot process "{label}": {exc}'
+
+
+def assert_product_prompts_ready(
+    db: Session,
+    shop: Shop,
+    product: Product | None,
+    *,
+    product_type_override: str | None = None,
+    product_label: str | None = None,
+) -> list[ResolvedPromptStep]:
+    """Resolve prompts or raise PromptResolverError with a clear product label."""
+    label = product_label
+    if not label and product is not None:
+        label = product.title or product.shopify_product_gid
+    try:
+        return PromptResolver(db, shop).resolve_for_product(
+            product,
+            product_type_override=product_type_override,
+        )
+    except PromptResolverError as exc:
+        raise PromptResolverError(
+            product_prompt_block_message(exc, product_label=label or "product"),
+            code=exc.code,
+            retryable=exc.retryable,
+        ) from exc

@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     default_batch_interval_minutes: int = 15
     # Safety cap when claiming Secondary Queue items into one automatic Primary batch
     auto_batch_claim_limit: int = 500
-    manual_batch_product_limit: int = 50
+    manual_batch_product_limit: int = 2
 
     shopify_image_download_timeout_seconds: int = 60
     shopify_image_max_download_mb: int = 30
