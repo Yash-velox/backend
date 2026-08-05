@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
@@ -78,6 +79,60 @@ class PrimaryBatchService:
             self.db.add(baseline)
             self.db.flush()
         return baseline
+
+    def seed_empty_baseline_from_product_media(self, product: Product) -> ProcessingBaseline:
+        """Freeze pre-update catalog media into an empty ProcessingBaseline.
+
+        Webhook intake must call this *before* catalog upsert. Otherwise conversion
+        seeds the empty baseline from the already-updated catalog and newly added
+        images look like "no delta" and get SKIPPED_NO_ELIGIBLE_IMAGE_DELTA.
+
+        Uses a SAVEPOINT so a unique-constraint race cannot abort the outer webhook
+        transaction.
+        """
+        try:
+            with self.db.begin_nested():
+                baseline = self._get_or_create_baseline(product)
+                if baseline.media_snapshot_json is not None:
+                    return baseline
+                catalog_media = media_snapshots_from_models(
+                    [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
+                )
+                baseline.media_snapshot_json = catalog_media
+                baseline.product_snapshot_json = (
+                    baseline.product_snapshot_json or product_snapshot_from_model(product)
+                )
+                baseline.evaluated_at = datetime.now(timezone.utc)
+                self.db.flush()
+                logger.info(
+                    "Seeded empty ProcessingBaseline from pre-sync catalog | shop=%s product=%s media=%s",
+                    self.shop.id,
+                    product.shopify_product_gid,
+                    len(catalog_media),
+                )
+                return baseline
+        except IntegrityError:
+            # Concurrent path inserted the same uq_baseline_shop_product row.
+            baseline = (
+                self.db.query(ProcessingBaseline)
+                .filter(
+                    ProcessingBaseline.shop_id == self.shop.id,
+                    ProcessingBaseline.product_id == product.id,
+                )
+                .one()
+            )
+            if baseline.media_snapshot_json is not None:
+                return baseline
+            catalog_media = media_snapshots_from_models(
+                [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
+            )
+            baseline.media_snapshot_json = catalog_media
+            baseline.product_snapshot_json = (
+                baseline.product_snapshot_json or product_snapshot_from_model(product)
+            )
+            baseline.evaluated_at = datetime.now(timezone.utc)
+            self.db.flush()
+            return baseline
 
     def _advance_evaluated_baseline(
         self,
@@ -233,10 +288,12 @@ class PrimaryBatchService:
                 baseline_media: list[dict] | None = None
                 if product:
                     baseline = self._get_or_create_baseline(product)
-                    baseline_media = baseline.media_snapshot_json or []
-                    # Manual batches leave ProcessingBaseline media empty; seed from catalog
-                    # so title-only webhooks do not look like first-seen NEW images.
-                    if not baseline_media:
+                    # Only auto-seed when media_snapshot_json is None (never frozen).
+                    # An explicit [] means "no prior media" (seeded at webhook before upsert)
+                    # and must not be replaced by the post-webhook catalog, or new images
+                    # would be hidden. Title-only with None still seeds from catalog so
+                    # existing images are not treated as first-seen NEW.
+                    if baseline.media_snapshot_json is None:
                         catalog_media = media_snapshots_from_models(
                             [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
                         )
@@ -247,8 +304,8 @@ class PrimaryBatchService:
                                 or product_snapshot_from_model(product)
                             )
                             baseline.evaluated_at = now
-                            baseline_media = catalog_media
                             self.db.flush()
+                    baseline_media = baseline.media_snapshot_json or []
                 else:
                     baseline = None
 
