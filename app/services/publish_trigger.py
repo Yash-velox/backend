@@ -161,7 +161,7 @@ def validate_publishable_outputs(db: Session, batch_product: BatchProduct) -> tu
                 "shopify_cdn_url": None,
                 "upload_status": "PENDING",
                 "association_status": "PENDING",
-                "target_position": position,
+                "target_position": meta.get("position", position),
                 "target_alt_text": alt,
             }
         )

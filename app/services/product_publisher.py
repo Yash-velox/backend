@@ -202,16 +202,26 @@ class ProductPublisher:
                     variants=variant_inputs,
                 )
 
-            # Reorder new images to target positions among themselves first
-            # (product may temporarily contain old + new)
+            def _asset_target_position(asset: dict[str, Any]) -> int:
+                # Prefer original gallery slot (delta-safe). Fall back to enumerate index.
+                for key in ("source_position", "target_position"):
+                    raw = asset.get(key)
+                    if raw is None:
+                        continue
+                    try:
+                        return int(raw)
+                    except (TypeError, ValueError):
+                        continue
+                return 0
+
+            # Place each generated image at its source position (keep untouched images).
             self._set_stage(op, product, PublishStatus.PUBLISHING, "REORDERING")
-            ordered_new = sorted(assets, key=lambda a: a.get("target_position") or 0)
-            # Place new images at positions 0..n-1; old ones will be removed later
+            ordered_new = sorted(assets, key=_asset_target_position)
             moves = []
-            for idx, asset in enumerate(ordered_new):
+            for asset in ordered_new:
                 mid = asset.get("shopify_media_gid") or asset.get("shopify_file_gid")
                 if mid:
-                    moves.append({"id": mid, "newPosition": str(idx)})
+                    moves.append({"id": mid, "newPosition": str(_asset_target_position(asset))})
             if moves:
                 job = self.client.reorder_product_media(product_gid=op.shopify_product_gid, moves=moves)
                 poll_reorder_job(self.client, job.get("id"))
@@ -228,16 +238,38 @@ class ProductPublisher:
                         f"New media missing after attach: {mid}",
                     )
 
-            # Detach old associations from this product only
+            # Detach only the sources we replaced — never wipe the rest of the gallery.
+            # Delta/auto batches process NEW/REPLACED images only; other live images must stay.
             self._set_stage(op, product, PublishStatus.PUBLISHING, "DETACHING_OLD_SET")
-            old_file_gids = [
-                m.get("file_gid") or m.get("media_gid")
+            live_by_media = {
+                str(m.get("media_gid")): m
                 for m in (live.get("media") or [])
-                if (m.get("file_gid") or m.get("media_gid"))
-            ]
-            # Do not detach files that are also in the new set (unlikely)
+                if isinstance(m, dict) and m.get("media_gid")
+            }
+            live_by_file = {
+                str(m.get("file_gid") or m.get("media_gid")): m
+                for m in (live.get("media") or [])
+                if isinstance(m, dict) and (m.get("file_gid") or m.get("media_gid"))
+            }
             new_set = set(new_file_gids)
-            old_only = [g for g in old_file_gids if g not in new_set]
+            source_ids = {
+                str(a.get("source_media_gid") or a.get("source_file_gid"))
+                for a in assets
+                if a.get("source_media_gid") or a.get("source_file_gid")
+            }
+            old_only: list[str] = []
+            seen_detach: set[str] = set()
+            for source_id in source_ids:
+                row = live_by_media.get(source_id) or live_by_file.get(source_id)
+                if row is None:
+                    # Source may already be gone from live; still try detaching the id itself.
+                    candidate = source_id
+                else:
+                    candidate = str(row.get("file_gid") or row.get("media_gid") or source_id)
+                if not candidate or candidate in new_set or candidate in seen_detach:
+                    continue
+                seen_detach.add(candidate)
+                old_only.append(candidate)
             if old_only:
                 self.client.remove_file_product_references(
                     file_gids=old_only,
@@ -245,13 +277,13 @@ class ProductPublisher:
                 )
             detached_old = True
 
-            # Final reorder
+            # Final reorder of generated images into their target slots
             self._set_stage(op, product, PublishStatus.PUBLISHING, "REORDERING")
             final_moves = []
-            for idx, asset in enumerate(ordered_new):
+            for asset in ordered_new:
                 mid = asset.get("shopify_media_gid") or asset.get("shopify_file_gid")
                 if mid:
-                    final_moves.append({"id": mid, "newPosition": str(idx)})
+                    final_moves.append({"id": mid, "newPosition": str(_asset_target_position(asset))})
             if final_moves:
                 job = self.client.reorder_product_media(product_gid=op.shopify_product_gid, moves=final_moves)
                 poll_reorder_job(self.client, job.get("id"))
@@ -269,13 +301,16 @@ class ProductPublisher:
                         "SHOPIFY_VERIFICATION_FAILED",
                         "Final product media does not match published set",
                     )
-            old_ids = {m["media_gid"] for m in (live.get("media") or [])}
-            if old_ids & final_ids and not old_ids.issubset(expected_new):
-                leftover = old_ids & final_ids - expected_new
-                if leftover:
+            # Only the replaced sources must be gone — untouched gallery images stay.
+            leftover_sources = source_ids & final_ids - {x for x in expected_new if x}
+            if leftover_sources:
+                # Also treat file-gid overlap as still attached
+                final_files = {m.get("file_gid") or m.get("media_gid") for m in (final.get("media") or [])}
+                still = {s for s in leftover_sources if s in final_ids or s in final_files}
+                if still:
                     raise ProductPublisherError(
                         "SHOPIFY_VERIFICATION_FAILED",
-                        f"Old media still associated after detach: {sorted(leftover)[:3]}",
+                        f"Replaced source media still associated after detach: {sorted(still)[:3]}",
                     )
 
             now = datetime.now(timezone.utc)

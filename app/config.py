@@ -32,6 +32,19 @@ class Settings(BaseSettings):
     openai_image_model: str = "gpt-image-1"
     # Hard cap so a hung OpenAI call cannot block the worker forever.
     openai_image_timeout_seconds: float = 180.0
+    # Phase 1: OPEN_AI (current). Phase 2: external_llm → LLM microservice (not implemented yet).
+    ai_provider: str = "OPEN_AI"
+    llm_service_url: str = ""
+    # Primary Queue AI path: OPENAI_BATCH (production default) or SYNC (dev/emergency).
+    ai_execution_mode: str = "OPENAI_BATCH"
+    openai_batch_enabled: bool = True
+    # Only when true may Primary Queue fall back to SYNC if Batch is unavailable.
+    openai_allow_sync_fallback: bool = False
+    openai_text_model: str = "gpt-4.1"
+    openai_batch_completion_window: str = "24h"
+    openai_batch_poll_interval_seconds: float = 20.0
+    openai_temp_file_retention_hours: int = 48
+    openai_batch_max_requests: int = 50000
     poc_dev_skip_auth: bool = False
 
     # PostgreSQL (production). SQLite URL allowed for local/tests only.

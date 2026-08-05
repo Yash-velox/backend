@@ -142,6 +142,40 @@ class ProcessingWorker:
             db.close()
 
     async def _process_available_work(self) -> None:
+        use_batch = False
+        try:
+            from app.services.ai_provider import AiProviderError, require_openai_provider
+            from app.services.openai_batch_orchestrator import (
+                OpenAIBatchOrchestratorError,
+                primary_queue_uses_openai_batch,
+            )
+
+            try:
+                require_openai_provider()
+            except AiProviderError:
+                logger.exception("AI provider blocks Primary Queue work")
+                return
+
+            try:
+                use_batch = primary_queue_uses_openai_batch()
+            except OpenAIBatchOrchestratorError:
+                logger.exception("OpenAI Batch configuration error — Primary Queue work blocked")
+                return
+        except ImportError:
+            # Stash/merge left Batch orchestrator imports without matching enums on develop.
+            # Keep the UI/API demo usable via the sync Primary Queue path.
+            if not getattr(self, "_warned_batch_import", False):
+                logger.warning(
+                    "OpenAI Batch path unavailable — falling back to sync Primary Queue",
+                    exc_info=True,
+                )
+                self._warned_batch_import = True
+            use_batch = False
+
+        if use_batch:
+            await asyncio.to_thread(self._run_openai_batch_tick)
+            return
+
         shop_ids = await asyncio.to_thread(self._shops_with_work)
         for shop_id in shop_ids:
             if self._stop.is_set():
@@ -152,6 +186,19 @@ class ProcessingWorker:
                 if not product_id:
                     break
                 await asyncio.to_thread(self._process_product, product_id)
+
+    def _run_openai_batch_tick(self) -> None:
+        from app.services.openai_batch_orchestrator import OpenAIBatchOrchestrator
+
+        db = SessionLocal()
+        try:
+            stats = OpenAIBatchOrchestrator(db).tick(worker_id=self.worker_id)
+            if any(stats.values()):
+                logger.info("OpenAI Batch tick | %s worker_id=%s", stats, self.worker_id)
+        except Exception:
+            logger.exception("OpenAI Batch tick failed | worker_id=%s", self.worker_id)
+        finally:
+            db.close()
 
     def _shops_with_work(self) -> list[UUID]:
         db = SessionLocal()
