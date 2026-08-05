@@ -4,11 +4,12 @@ import logging
 import re
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.shop_resolver import get_shop_by_domain, resolve_shop_access_token
 from app.models import Product, WebhookEvent, WebhookProcessingResult
 from app.services.catalog_sync import CatalogSyncService
+from app.services.primary_batch import PrimaryBatchService
 from app.services.secondary_queue import SecondaryQueueService
 from app.services.shopify_graphql import ShopifyGraphQLClient, ShopifyGraphQLError
 from app.services.snapshot import (
@@ -215,10 +216,29 @@ class WebhookIntakeService:
                 webhook_id,
                 product_gid,
             )
-            event.processing_result = WebhookProcessingResult.FAILED
-            event.error_summary = str(exc)[:2000]
-            self.db.commit()
-            self.db.refresh(event)
+            # Catalog/image-version flushes can leave the session aborted; reset before
+            # persisting the FAILED webhook row so Shopify does not keep retrying a 500.
+            self.db.rollback()
+            event = WebhookEvent(
+                shop_id=shop.id,
+                shopify_webhook_id=webhook_id,
+                topic=topic,
+                shopify_product_gid=product_gid,
+                payload_hash=raw_hash,
+                processing_result=WebhookProcessingResult.FAILED,
+                error_summary=str(exc)[:2000],
+            )
+            self.db.add(event)
+            try:
+                self.db.commit()
+                self.db.refresh(event)
+            except Exception:
+                self.db.rollback()
+                logger.exception(
+                    "Failed to persist webhook failure row | shop=%s webhook=%s",
+                    shop.shop_domain,
+                    webhook_id,
+                )
             return event
 
         self.db.commit()
@@ -236,6 +256,7 @@ class WebhookIntakeService:
         catalog = CatalogSyncService(self.db, shop)
         old_product = (
             self.db.query(Product)
+            .options(selectinload(Product.media))
             .filter(Product.shop_id == shop.id, Product.shopify_product_gid == product_gid)
             .one_or_none()
         )
@@ -247,6 +268,24 @@ class WebhookIntakeService:
 
         # REST webhook images use ProductImage GIDs; catalog/baselines use MediaImage.
         # Always refresh media via GraphQL so Secondary Queue delta identity matches.
+        #
+        # Freeze an empty ProcessingBaseline from *pre-sync* catalog media before upsert.
+        # Conversion used to seed empty baselines from the post-upsert catalog, which
+        # already included newly added images — Secondary Queue then skipped with
+        # "No eligible new or replaced images detected".
+        #
+        # Failures here must not fail the webhook (Shopify would retry 5xx). Worst case
+        # we keep the old skip behavior until the next update.
+        if old_product is not None:
+            try:
+                PrimaryBatchService(self.db, shop).seed_empty_baseline_from_product_media(old_product)
+            except Exception:
+                logger.exception(
+                    "Baseline pre-seed failed; continuing webhook | shop=%s product=%s",
+                    shop.id,
+                    product_gid,
+                )
+
         product_snapshot = _product_snapshot_from_webhook(payload, product_gid)
         media_snapshot: list[dict[str, Any]] = []
         graphql_ok = False

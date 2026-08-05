@@ -40,6 +40,7 @@ from app.services.secondary_queue import SecondaryQueueService
 from app.services.settings_service import SettingsService, SettingsValidationError
 from app.services.snapshot import media_fingerprint
 from app.services.state_machine import BATCH_TRANSITIONS, InvalidStateTransition, assert_transition
+from app.services.webhook_intake import WebhookIntakeService
 
 
 def _configure_product_type(db_session, shop, product_type: str, *, prompt: str = "Enhance {{product_title}}") -> None:
@@ -492,7 +493,7 @@ def test_delta_new_cdn_path_still_detected():
 
 
 def test_secondary_conversion_skips_title_only_empty_baseline(db_session, shop):
-    """Empty ProcessingBaseline seeds from catalog; ProductImage eligible matches by CDN."""
+    """None ProcessingBaseline media seeds from catalog; ProductImage eligible matches by CDN."""
     ensure_shop_settings(db_session, shop)
     product = Product(
         shop_id=shop.id,
@@ -517,12 +518,12 @@ def test_secondary_conversion_skips_title_only_empty_baseline(db_session, shop):
             content_fingerprint="catalog-fp",
         )
     )
-    # Empty baseline (manual batch path)
+    # Never-frozen baseline (manual batch path leaves media_snapshot_json as None)
     db_session.add(
         ProcessingBaseline(
             shop_id=shop.id,
             product_id=product.id,
-            media_snapshot_json=[],
+            media_snapshot_json=None,
             product_snapshot_json={"shopify_product_gid": product.shopify_product_gid},
         )
     )
@@ -567,6 +568,103 @@ def test_secondary_conversion_skips_title_only_empty_baseline(db_session, shop):
         (m.get("cdn_url") or "").startswith("https://cdn.shopify.com/s/files/1/x/files/chain.png")
         for m in baseline.media_snapshot_json
     )
+
+
+def test_secondary_conversion_new_image_after_catalog_already_synced(db_session, shop):
+    """Regression: new image must convert when baseline was frozen pre-sync, catalog post-sync.
+
+    Simulates webhook order: seed empty baseline from old catalog → upsert adds new media
+    → Secondary Queue eligible includes new image → conversion must detect NEW (not skip).
+    """
+    ensure_shop_settings(db_session, shop)
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/8034005418999",
+        title="Chain",
+        status="ACTIVE",
+        product_type="Bags",
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(
+        ProductMedia(
+            shop_id=shop.id,
+            product_id=product.id,
+            shopify_media_gid="gid://shopify/MediaImage/10",
+            cdn_url="https://cdn.shopify.com/s/files/1/x/files/old.png?v=1",
+            original_filename="old.png",
+            width=100,
+            height=100,
+            is_visible=True,
+            is_active=True,
+            position=0,
+        )
+    )
+    db_session.flush()
+
+    svc = PrimaryBatchService(db_session, shop)
+    # Pre-sync freeze (what webhook must do before catalog upsert)
+    baseline = svc.seed_empty_baseline_from_product_media(product)
+    assert baseline.media_snapshot_json is not None
+    assert len(baseline.media_snapshot_json) == 1
+
+    # Post-sync catalog already includes the newly added image
+    db_session.add(
+        ProductMedia(
+            shop_id=shop.id,
+            product_id=product.id,
+            shopify_media_gid="gid://shopify/MediaImage/11",
+            cdn_url="https://cdn.shopify.com/s/files/1/x/files/new.png?v=1",
+            original_filename="new.png",
+            width=200,
+            height=200,
+            is_visible=True,
+            is_active=True,
+            position=1,
+        )
+    )
+    eligible_media = [
+        {
+            "media_gid": "gid://shopify/MediaImage/10",
+            "cdn_url": "https://cdn.shopify.com/s/files/1/x/files/old.png?v=1",
+            "filename": "old.png",
+            "width": 100,
+            "height": 100,
+        },
+        {
+            "media_gid": "gid://shopify/MediaImage/11",
+            "cdn_url": "https://cdn.shopify.com/s/files/1/x/files/new.png?v=1",
+            "filename": "new.png",
+            "width": 200,
+            "height": 200,
+        },
+    ]
+    item = SecondaryQueueItem(
+        shop_id=shop.id,
+        shopify_product_gid=product.shopify_product_gid,
+        product_id=product.id,
+        status=SecondaryQueueStatus.CLAIMED,
+        eligible_product_snapshot_json={
+            "shopify_product_gid": product.shopify_product_gid,
+            "title": "Chain",
+            "product_type": "Bags",
+        },
+        eligible_media_snapshot_json=eligible_media,
+        claimed_by="worker_test",
+        claimed_at=datetime.now(timezone.utc),
+    )
+    db_session.add(item)
+    db_session.commit()
+    _configure_product_type(db_session, shop, "Bags")
+
+    batch = svc.convert_secondary_items([item])
+    assert batch is not None
+    db_session.refresh(item)
+    assert item.status == SecondaryQueueStatus.CONVERTED
+    images = db_session.query(BatchImage).filter(BatchImage.shop_id == shop.id).all()
+    assert len(images) == 1
+    assert images[0].delta_type == DeltaType.NEW
+    assert images[0].shopify_media_gid.endswith("/11")
 
 
 def test_secondary_conversion_creates_batch_for_new_cdn(db_session, shop):
@@ -885,8 +983,6 @@ def test_internal_install_hmac(client, monkeypatch, db_session):
 
 
 def test_webhook_dedupe(db_session, shop):
-    from app.services.webhook_intake import WebhookIntakeService
-
     ensure_shop_settings(db_session, shop)
     db_session.commit()
     payload = {
@@ -919,6 +1015,144 @@ def test_webhook_dedupe(db_session, shop):
     assert first.id == second.id
     events = db_session.query(WebhookEvent).filter(WebhookEvent.shopify_webhook_id == "webhook-unique-1").all()
     assert len(events) == 1
+
+
+def test_webhook_seeds_baseline_before_catalog_upsert_so_new_image_converts(db_session, shop, monkeypatch):
+    """Adding an image with an empty ProcessingBaseline must convert, not skip."""
+    ensure_shop_settings(db_session, shop)
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/4242",
+        title="Pendant",
+        status="ACTIVE",
+        product_type="Bags",
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(
+        ProductMedia(
+            shop_id=shop.id,
+            product_id=product.id,
+            shopify_media_gid="gid://shopify/MediaImage/100",
+            cdn_url="https://cdn.shopify.com/old.png",
+            original_filename="old.png",
+            width=10,
+            height=10,
+            is_visible=True,
+            is_active=True,
+            position=0,
+        )
+    )
+    db_session.add(
+        ProcessingBaseline(
+            shop_id=shop.id,
+            product_id=product.id,
+            media_snapshot_json=None,
+        )
+    )
+    db_session.commit()
+    _configure_product_type(db_session, shop, "Bags")
+
+    graphql_node = {
+        "id": "gid://shopify/Product/4242",
+        "title": "Pendant",
+        "status": "ACTIVE",
+        "productType": "Bags",
+        "handle": "pendant",
+        "tags": [],
+        "featuredMedia": {"id": "gid://shopify/MediaImage/100"},
+        "media": {
+            "nodes": [
+                {
+                    "id": "gid://shopify/MediaImage/100",
+                    "mediaContentType": "IMAGE",
+                    "alt": None,
+                    "image": {
+                        "url": "https://cdn.shopify.com/old.png",
+                        "width": 10,
+                        "height": 10,
+                    },
+                },
+                {
+                    "id": "gid://shopify/MediaImage/101",
+                    "mediaContentType": "IMAGE",
+                    "alt": None,
+                    "image": {
+                        "url": "https://cdn.shopify.com/new.png",
+                        "width": 20,
+                        "height": 20,
+                    },
+                },
+            ]
+        },
+        "variants": {"nodes": []},
+    }
+
+    mock_client = MagicMock()
+    mock_client.fetch_product_by_gid.return_value = graphql_node
+    monkeypatch.setattr(
+        "app.services.webhook_intake.resolve_shop_access_token",
+        lambda _shop: "shpat_test",
+    )
+    monkeypatch.setattr(
+        "app.services.webhook_intake.ShopifyGraphQLClient",
+        lambda **_kwargs: mock_client,
+    )
+
+    payload = {
+        "admin_graphql_api_id": "gid://shopify/Product/4242",
+        "id": 4242,
+        "title": "Pendant",
+        "status": "active",
+        "product_type": "Bags",
+        "images": [
+            {"id": 100, "src": "https://cdn.shopify.com/old.png", "width": 10, "height": 10},
+            {"id": 101, "src": "https://cdn.shopify.com/new.png", "width": 20, "height": 20},
+        ],
+    }
+    event = WebhookIntakeService(db_session).record_and_process_products_update(
+        shop_domain=shop.shop_domain,
+        webhook_id="webhook-add-image-1",
+        topic="products/update",
+        payload=payload,
+        raw_hash="hash-add-image",
+    )
+    assert event.processing_result == WebhookProcessingResult.ACCEPTED
+
+    baseline = (
+        db_session.query(ProcessingBaseline)
+        .filter(ProcessingBaseline.product_id == product.id)
+        .one()
+    )
+    # Pre-sync freeze must keep only the old image — not the newly upserted one.
+    assert baseline.media_snapshot_json is not None
+    assert len(baseline.media_snapshot_json) == 1
+    assert baseline.media_snapshot_json[0]["media_gid"].endswith("/100")
+
+    pending = (
+        db_session.query(SecondaryQueueItem)
+        .filter(
+            SecondaryQueueItem.shop_id == shop.id,
+            SecondaryQueueItem.shopify_product_gid == product.shopify_product_gid,
+            SecondaryQueueItem.status == SecondaryQueueStatus.PENDING,
+        )
+        .one()
+    )
+    assert len(pending.eligible_media_snapshot_json or []) == 2
+
+    pending.status = SecondaryQueueStatus.CLAIMED
+    pending.claimed_by = "worker_test"
+    pending.claimed_at = datetime.now(timezone.utc)
+    db_session.commit()
+
+    batch = PrimaryBatchService(db_session, shop).convert_secondary_items([pending])
+    assert batch is not None
+    db_session.refresh(pending)
+    assert pending.status == SecondaryQueueStatus.CONVERTED
+    images = db_session.query(BatchImage).filter(BatchImage.shop_id == shop.id).all()
+    assert len(images) == 1
+    assert images[0].delta_type == DeltaType.NEW
+    assert images[0].shopify_media_gid.endswith("/101")
 
 
 def test_batch_image_output_endpoint(client, db_session, shop, tmp_path):
