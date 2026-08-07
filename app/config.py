@@ -29,7 +29,9 @@ class Settings(BaseSettings):
     poc_storage_dir: str = "storage/poc-jobs"
     poc_job_ttl_hours: int = 24
     openai_api_key: str = ""
-    openai_image_model: str = "gpt-image-1"
+    openai_image_model: str = "gpt-image-2"
+    # GPT Image quality tier: low | medium | high | auto
+    openai_image_quality: str = "medium"
     # Hard cap so a hung OpenAI call cannot block the worker forever.
     openai_image_timeout_seconds: float = 180.0
     # Phase 1: OPEN_AI (current). Phase 2: external_llm → LLM microservice (not implemented yet).
