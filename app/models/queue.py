@@ -27,6 +27,7 @@ from app.models.enums import (
     BatchProductStatus,
     BatchStatus,
     DeltaType,
+    PublishStatus,
     SecondaryQueueStatus,
     ShopStatus,
     SyncRunStatus,
@@ -75,6 +76,7 @@ class ShopSettings(Base):
         Uuid(as_uuid=True), ForeignKey("shops.id", ondelete="CASCADE"), nullable=False, index=True
     )
     auto_sync_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    auto_publish_processed_images: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     batch_interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=15)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -384,6 +386,13 @@ class ProcessingBatch(Base):
         default=BatchStatus.QUEUED,
         index=True,
     )
+    processing_phase: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    current_workflow_step: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_workflow_steps: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    openai_requests_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    openai_requests_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    openai_requests_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active_openai_batch_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     product_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     image_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     pending_product_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -428,11 +437,17 @@ class BatchProduct(Base):
     )
     product_snapshot_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     prompt_snapshot_json: Mapped[list | dict | None] = mapped_column(JSON, nullable=True)
+    prompt_override_json: Mapped[list | dict | None] = mapped_column(JSON, nullable=True)
     baseline_snapshot_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     status: Mapped[BatchProductStatus] = mapped_column(
         Enum(BatchProductStatus, name="batch_product_status", native_enum=False),
         nullable=False,
         default=BatchProductStatus.QUEUED,
+        index=True,
+    )
+    publish_status: Mapped[PublishStatus | None] = mapped_column(
+        Enum(PublishStatus, name="batch_product_publish_status", native_enum=False),
+        nullable=True,
         index=True,
     )
     image_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -488,6 +503,9 @@ class BatchImage(Base):
         Enum(DeltaType, name="delta_type", native_enum=False), nullable=False
     )
     current_prompt_step: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    prompt_override_json: Mapped[list | dict | None] = mapped_column(JSON, nullable=True)
+    pending_description_context: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_openai_file_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[BatchImageStatus] = mapped_column(
         Enum(BatchImageStatus, name="batch_image_status", native_enum=False),
         nullable=False,
@@ -499,6 +517,9 @@ class BatchImage(Base):
     output_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     output_mime_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     output_checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    generated_shopify_file_gid: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    generated_shopify_cdn_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generated_image_version_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

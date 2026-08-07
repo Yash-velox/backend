@@ -29,9 +29,15 @@ from app.models import (
 )
 from app.services.catalog_sync import CatalogSyncService
 from app.services.delta import compare_media_snapshots
+from app.services.prompt_resolver import PromptResolverError, assert_product_prompts_ready
 from app.services.shopify_graphql import ShopifyGraphQLClient, ShopifyGraphQLError
 from app.services.snapshot import media_snapshots_from_models, product_snapshot_from_model
-from app.services.state_machine import BATCH_PRODUCT_TRANSITIONS, BATCH_TRANSITIONS, assert_transition
+from app.services.state_machine import (
+    BATCH_PRODUCT_TRANSITIONS,
+    BATCH_TRANSITIONS,
+    SECONDARY_TRANSITIONS,
+    assert_transition,
+)
 
 logger = logging.getLogger("app.services.primary_batch")
 
@@ -169,10 +175,42 @@ class PrimaryBatchService:
             logger.error("Product refresh failed | shop=%s gid=%s error=%s", self.shop.id, product_gid, exc)
             return None
 
+    def _require_prompts_ready(
+        self,
+        product: Product | None,
+        *,
+        product_type_override: str | None = None,
+        product_label: str | None = None,
+    ) -> None:
+        try:
+            assert_product_prompts_ready(
+                self.db,
+                self.shop,
+                product,
+                product_type_override=product_type_override,
+                product_label=product_label,
+            )
+        except PromptResolverError as exc:
+            raise PrimaryBatchError(str(exc)) from exc
+
     def create_manual_batch(self, product_gids: list[str]) -> ProcessingBatch:
         gids = self._validate_product_gids(product_gids)
         shop_settings = ensure_shop_settings(self.db, self.shop)
         now = datetime.now(timezone.utc)
+
+        # Validate every product (media + prompts) before creating the batch row.
+        prepared: list[tuple[str, Product, list]] = []
+        for gid in gids:
+            product = self._load_or_refresh_product(gid)
+            if product is None:
+                raise PrimaryBatchError(f"Product not found: {gid}")
+
+            visible_media = [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
+            if not visible_media:
+                raise PrimaryBatchError(f"Product has no visible media: {gid}")
+
+            self._require_prompts_ready(product)
+            prepared.append((gid, product, visible_media))
 
         batch = ProcessingBatch(
             shop_id=self.shop.id,
@@ -187,18 +225,13 @@ class PrimaryBatchService:
         self.db.flush()
 
         image_count = 0
-        for gid in gids:
-            product = self._load_or_refresh_product(gid)
-            if product is None:
-                raise PrimaryBatchError(f"Product not found: {gid}")
-
-            visible_media = [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
-            if not visible_media:
-                raise PrimaryBatchError(f"Product has no visible media: {gid}")
-
+        for gid, product, visible_media in prepared:
             product_snapshot = product_snapshot_from_model(product)
             media_snapshot = media_snapshots_from_models(visible_media)
-            baseline = self._get_or_create_baseline(product)
+            # Publish conflict baseline must be the live media set at enqueue time.
+            # ProcessingBaseline may be empty on first run (delta tracking only) — do not
+            # copy its null media into baseline_snapshot_json or publish always conflicts.
+            self._get_or_create_baseline(product)
 
             batch_product = BatchProduct(
                 batch_id=batch.id,
@@ -208,8 +241,8 @@ class PrimaryBatchService:
                 product_snapshot_json=product_snapshot,
                 prompt_snapshot_json=None,
                 baseline_snapshot_json={
-                    "product": baseline.product_snapshot_json,
-                    "media": baseline.media_snapshot_json,
+                    "product": product_snapshot,
+                    "media": media_snapshot,
                 },
                 status=BatchProductStatus.QUEUED,
                 image_count=len(visible_media),
@@ -323,6 +356,35 @@ class PrimaryBatchService:
                     self.db.commit()
                     continue
 
+                type_override = None
+                if product is None or not (product.product_type or "").strip():
+                    type_override = eligible_product.get("product_type") or eligible_product.get(
+                        "productType"
+                    )
+                label = (
+                    (product.title if product else None)
+                    or eligible_product.get("title")
+                    or item.shopify_product_gid
+                )
+                try:
+                    self._require_prompts_ready(
+                        product,
+                        product_type_override=str(type_override) if type_override else None,
+                        product_label=str(label) if label else None,
+                    )
+                except PrimaryBatchError as exc:
+                    assert_transition(
+                        "secondary_queue",
+                        SECONDARY_TRANSITIONS,
+                        item.status,
+                        SecondaryQueueStatus.FAILED_CONVERSION,
+                    )
+                    item.status = SecondaryQueueStatus.FAILED_CONVERSION
+                    item.failure_reason = str(exc)[:2000]
+                    item.skip_reason = None
+                    self.db.commit()
+                    continue
+
                 if batch is None:
                     batch = ProcessingBatch(
                         shop_id=self.shop.id,
@@ -345,9 +407,11 @@ class PrimaryBatchService:
                     product_id=product.id if product else None,
                     product_snapshot_json=eligible_product,
                     prompt_snapshot_json=None,
+                    # Conflict check compares against media at process start (eligible),
+                    # not prior ProcessingBaseline (used only for delta detection above).
                     baseline_snapshot_json={
-                        "product": baseline.product_snapshot_json if baseline else None,
-                        "media": baseline_media,
+                        "product": eligible_product,
+                        "media": eligible_media,
                     },
                     status=BatchProductStatus.QUEUED,
                     image_count=len(delta_images),
@@ -442,7 +506,23 @@ class PrimaryBatchService:
             + batch.processing_product_count
             + batch.retrying_product_count
         )
-        if active == 0 and batch.product_count > 0:
+        if active > 0:
+            batch.completed_at = None
+            if batch.status in {
+                BatchStatus.COMPLETED,
+                BatchStatus.PARTIALLY_COMPLETED,
+                BatchStatus.FAILED,
+            }:
+                assert_transition("batch", BATCH_TRANSITIONS, batch.status, BatchStatus.PROCESSING)
+                batch.status = BatchStatus.PROCESSING
+                if batch.started_at is None:
+                    batch.started_at = datetime.now(timezone.utc)
+            elif batch.status == BatchStatus.QUEUED and batch.processing_product_count > 0:
+                assert_transition("batch", BATCH_TRANSITIONS, batch.status, BatchStatus.PROCESSING)
+                batch.status = BatchStatus.PROCESSING
+                if batch.started_at is None:
+                    batch.started_at = datetime.now(timezone.utc)
+        elif active == 0 and batch.product_count > 0:
             completed = batch.completed_product_count
             failed = batch.failed_product_count
             if completed == batch.product_count:
@@ -455,15 +535,27 @@ class PrimaryBatchService:
                 new_status = BatchStatus.PARTIALLY_COMPLETED
             else:
                 new_status = BatchStatus.FAILED
+            became_terminal = batch.status not in {
+                BatchStatus.COMPLETED,
+                BatchStatus.PARTIALLY_COMPLETED,
+                BatchStatus.FAILED,
+                BatchStatus.CANCELLED,
+            }
             if batch.status != new_status:
                 assert_transition("batch", BATCH_TRANSITIONS, batch.status, new_status)
                 batch.status = new_status
             batch.completed_at = datetime.now(timezone.utc)
-        elif batch.status == BatchStatus.QUEUED and batch.processing_product_count > 0:
-            assert_transition("batch", BATCH_TRANSITIONS, batch.status, BatchStatus.PROCESSING)
-            batch.status = BatchStatus.PROCESSING
-            if batch.started_at is None:
-                batch.started_at = datetime.now(timezone.utc)
+            self.db.flush()
+            if became_terminal:
+                try:
+                    from app.services.publish_trigger import PublishTriggerService
+
+                    PublishTriggerService(self.db, self.shop).on_batch_terminal(batch, commit=False)
+                except Exception:
+                    logger.exception(
+                        "Publish trigger after batch terminal failed | batch=%s",
+                        batch.id,
+                    )
 
         self.db.flush()
         return batch

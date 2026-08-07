@@ -43,9 +43,10 @@ BATCH_TRANSITIONS: dict[BatchStatus, set[BatchStatus]] = {
         BatchStatus.FAILED,
         BatchStatus.CANCELLED,
     },
-    BatchStatus.COMPLETED: set(),
-    BatchStatus.PARTIALLY_COMPLETED: set(),
-    BatchStatus.FAILED: set(),
+    # Manual reprocess can reopen a finished batch.
+    BatchStatus.COMPLETED: {BatchStatus.PROCESSING, BatchStatus.QUEUED},
+    BatchStatus.PARTIALLY_COMPLETED: {BatchStatus.PROCESSING, BatchStatus.QUEUED},
+    BatchStatus.FAILED: {BatchStatus.PROCESSING, BatchStatus.QUEUED},
     BatchStatus.CANCELLED: set(),
 }
 
@@ -65,9 +66,9 @@ BATCH_PRODUCT_TRANSITIONS: dict[BatchProductStatus, set[BatchProductStatus]] = {
         BatchProductStatus.FAILED,
         BatchProductStatus.COMPLETED,
     },
-    BatchProductStatus.COMPLETED: set(),
+    BatchProductStatus.COMPLETED: {BatchProductStatus.QUEUED, BatchProductStatus.RETRYING},
     BatchProductStatus.FAILED: {BatchProductStatus.RETRYING, BatchProductStatus.QUEUED},
-    BatchProductStatus.SKIPPED: set(),
+    BatchProductStatus.SKIPPED: {BatchProductStatus.QUEUED},
 }
 
 BATCH_IMAGE_TRANSITIONS: dict[BatchImageStatus, set[BatchImageStatus]] = {
@@ -75,6 +76,7 @@ BATCH_IMAGE_TRANSITIONS: dict[BatchImageStatus, set[BatchImageStatus]] = {
         BatchImageStatus.DOWNLOADING,
         BatchImageStatus.FAILED,
         BatchImageStatus.RETRYING,
+        BatchImageStatus.UPLOADING,
     },
     BatchImageStatus.DOWNLOADING: {
         BatchImageStatus.PROCESSING,
@@ -83,12 +85,17 @@ BATCH_IMAGE_TRANSITIONS: dict[BatchImageStatus, set[BatchImageStatus]] = {
     },
     BatchImageStatus.PROCESSING: {
         BatchImageStatus.WAITING_FOR_PROVIDER,
-        BatchImageStatus.COMPLETED,
+        BatchImageStatus.UPLOADING,
         BatchImageStatus.FAILED,
         BatchImageStatus.RETRYING,
     },
     BatchImageStatus.WAITING_FOR_PROVIDER: {
         BatchImageStatus.PROCESSING,
+        BatchImageStatus.UPLOADING,
+        BatchImageStatus.FAILED,
+        BatchImageStatus.RETRYING,
+    },
+    BatchImageStatus.UPLOADING: {
         BatchImageStatus.COMPLETED,
         BatchImageStatus.FAILED,
         BatchImageStatus.RETRYING,
@@ -96,9 +103,10 @@ BATCH_IMAGE_TRANSITIONS: dict[BatchImageStatus, set[BatchImageStatus]] = {
     BatchImageStatus.RETRYING: {
         BatchImageStatus.QUEUED,
         BatchImageStatus.DOWNLOADING,
+        BatchImageStatus.UPLOADING,
         BatchImageStatus.FAILED,
     },
-    BatchImageStatus.COMPLETED: set(),
+    BatchImageStatus.COMPLETED: {BatchImageStatus.QUEUED, BatchImageStatus.RETRYING},
     BatchImageStatus.FAILED: {BatchImageStatus.RETRYING, BatchImageStatus.QUEUED},
 }
 

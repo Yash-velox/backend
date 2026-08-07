@@ -1,8 +1,8 @@
 """Drop max_products_per_batch — automatic batches are time-triggered only.
 
-Revision ID: 005_drop_max_products_per_batch
-Revises: 004_shopify_product_publishing
-Create Date: 2026-08-04
+Revision ID: 009_drop_max_products_per_batch
+Revises: 008_openai_batch_api
+Create Date: 2026-08-03
 """
 
 from typing import Sequence, Union
@@ -10,8 +10,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "005_drop_max_products_per_batch"
-down_revision: Union[str, None] = "004_shopify_product_publishing"
+revision: str = "009_drop_max_products_per_batch"
+down_revision: Union[str, None] = "008_openai_batch_api"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

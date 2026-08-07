@@ -7,7 +7,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session, selectinload
 
-from app.models import PromptConfiguration, PromptProductType, PromptStep, Shop
+from app.models import PromptConfiguration, PromptProductType, PromptStep, PromptStepType, Shop
 from app.services.prompt_product_types import PromptProductTypeError, PromptProductTypeService
 from app.services.prompt_variables import PromptVariableError, validate_prompt_variables
 
@@ -56,15 +56,20 @@ class PromptConfigurationService:
         name: str,
         prompt_text: str,
         is_enabled: bool = True,
+        step_type: str | PromptStepType = PromptStepType.IMAGE,
     ) -> PromptStep:
         _, config = self.get_detail(product_type_id)
         cleaned_name, cleaned_text = self._validate_step_fields(name, prompt_text)
         next_order = (max((s.step_order for s in config.steps), default=0)) + 1
+        resolved_type = (
+            step_type if isinstance(step_type, PromptStepType) else PromptStepType(str(step_type).upper())
+        )
         step = PromptStep(
             prompt_configuration_id=config.id,
             name=cleaned_name,
             prompt_text=cleaned_text,
             step_order=next_order,
+            step_type=resolved_type,
             is_enabled=bool(is_enabled),
         )
         self.db.add(step)
@@ -80,6 +85,7 @@ class PromptConfigurationService:
         name: str | None = None,
         prompt_text: str | None = None,
         is_enabled: bool | None = None,
+        step_type: str | PromptStepType | None = None,
     ) -> PromptStep:
         step = self._get_step_for_shop(step_id)
         new_name = name if name is not None else step.name
@@ -89,6 +95,10 @@ class PromptConfigurationService:
         step.prompt_text = cleaned_text
         if is_enabled is not None:
             step.is_enabled = bool(is_enabled)
+        if step_type is not None:
+            step.step_type = (
+                step_type if isinstance(step_type, PromptStepType) else PromptStepType(str(step_type).upper())
+            )
         step.updated_at = datetime.now(timezone.utc)
         step.configuration.updated_at = datetime.now(timezone.utc)
         self.db.commit()

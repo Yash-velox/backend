@@ -9,11 +9,17 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.models import BatchImage, Product, Shop
+from app.models.enums import PromptStepType
 from app.services.prompt_product_types import (
     PromptProductTypeService,
     normalize_product_type_name,
 )
-from app.services.prompt_variables import extract_variables, render_prompt
+from app.services.prompt_variables import (
+    PromptVariableError,
+    extract_variables,
+    render_prompt,
+    validate_prompt_variables,
+)
 
 
 class PromptResolverError(Exception):
@@ -30,6 +36,8 @@ class ResolvedPromptStep:
     prompt_text: str
     rendered_prompt: str
     variables: list[str]
+    step_type: PromptStepType = PromptStepType.IMAGE
+    step_id: UUID | None = None
 
 
 class PromptResolver:
@@ -125,6 +133,79 @@ class PromptResolver:
                     prompt_text=step.prompt_text,
                     rendered_prompt=rendered,
                     variables=extract_variables(step.prompt_text),
+                    step_type=getattr(step, "step_type", None) or PromptStepType.IMAGE,
+                    step_id=step.id,
+                )
+            )
+        return resolved
+
+    def resolve_from_override(
+        self,
+        override_steps: list[dict[str, Any]],
+        *,
+        product: Product | None,
+        product_type_display: str,
+        image: BatchImage | None = None,
+        image_position: int | None = None,
+    ) -> list[ResolvedPromptStep]:
+        """Render a one-time prompt override (does not change saved configuration)."""
+        if not override_steps:
+            raise PromptResolverError(
+                "Prompt override is empty.",
+                code="PROMPT_OVERRIDE_EMPTY",
+                retryable=False,
+            )
+
+        values = self._build_variable_values(
+            product,
+            product_type_display=product_type_display,
+            image=image,
+            image_position=image_position,
+        )
+        resolved: list[ResolvedPromptStep] = []
+        for index, raw in enumerate(override_steps, start=1):
+            if not isinstance(raw, dict):
+                raise PromptResolverError(
+                    "Each prompt override step must be an object.",
+                    code="PROMPT_OVERRIDE_INVALID",
+                    retryable=False,
+                )
+            name = str(raw.get("name") or f"Step {index}").strip() or f"Step {index}"
+            template = str(
+                raw.get("promptTemplate")
+                or raw.get("prompt_template")
+                or raw.get("prompt")
+                or ""
+            )
+            if not template.strip():
+                raise PromptResolverError(
+                    f'Prompt override step "{name}" has empty text.',
+                    code="PROMPT_OVERRIDE_EMPTY",
+                    retryable=False,
+                )
+            try:
+                validate_prompt_variables(template)
+            except PromptVariableError as exc:
+                raise PromptResolverError(
+                    str(exc),
+                    code=exc.code,
+                    retryable=False,
+                ) from exc
+            raw_type = str(raw.get("stepType") or raw.get("step_type") or "IMAGE").upper()
+            try:
+                step_type = PromptStepType(raw_type)
+            except ValueError:
+                step_type = PromptStepType.IMAGE
+            rendered = render_prompt(template, values)
+            resolved.append(
+                ResolvedPromptStep(
+                    step_order=index,
+                    name=name,
+                    prompt_text=template,
+                    rendered_prompt=rendered,
+                    variables=extract_variables(template),
+                    step_type=step_type,
+                    step_id=None,
                 )
             )
         return resolved
@@ -137,6 +218,8 @@ class PromptResolver:
                 "prompt": s.rendered_prompt,
                 "promptTemplate": s.prompt_text,
                 "variables": s.variables,
+                "stepType": s.step_type.value if hasattr(s.step_type, "value") else str(s.step_type),
+                "stepId": str(s.step_id) if s.step_id else None,
                 "preserveTransparency": True,
             }
             for s in steps
@@ -161,3 +244,38 @@ class PromptResolver:
             "image_position": str(image_position) if image_position is not None else None,
             "shop_name": shop_name,
         }
+
+
+def product_prompt_block_message(
+    exc: PromptResolverError,
+    *,
+    product_label: str,
+) -> str:
+    """Merchant-facing reason when a product cannot be queued/processed."""
+    label = (product_label or "").strip() or "product"
+    return f'Cannot process "{label}": {exc}'
+
+
+def assert_product_prompts_ready(
+    db: Session,
+    shop: Shop,
+    product: Product | None,
+    *,
+    product_type_override: str | None = None,
+    product_label: str | None = None,
+) -> list[ResolvedPromptStep]:
+    """Resolve prompts or raise PromptResolverError with a clear product label."""
+    label = product_label
+    if not label and product is not None:
+        label = product.title or product.shopify_product_gid
+    try:
+        return PromptResolver(db, shop).resolve_for_product(
+            product,
+            product_type_override=product_type_override,
+        )
+    except PromptResolverError as exc:
+        raise PromptResolverError(
+            product_prompt_block_message(exc, product_label=label or "product"),
+            code=exc.code,
+            retryable=exc.retryable,
+        ) from exc

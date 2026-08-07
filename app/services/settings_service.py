@@ -25,11 +25,14 @@ class SettingsService:
         self,
         *,
         auto_sync_enabled: bool | None = None,
+        auto_publish_processed_images: bool | None = None,
         batch_interval_minutes: int | None = None,
     ) -> ShopSettings:
         row = self.get()
         if auto_sync_enabled is not None:
             row.auto_sync_enabled = auto_sync_enabled
+        if auto_publish_processed_images is not None:
+            row.auto_publish_processed_images = auto_publish_processed_images
         if batch_interval_minutes is not None:
             if batch_interval_minutes < 1:
                 raise SettingsValidationError("batch_interval_minutes must be at least 1")

@@ -20,6 +20,11 @@ from app.poc.auth import require_shopify_jwt
 
 @pytest.fixture()
 def db_engine():
+    # Keep existing ImageProcessor/sync tests on the SYNC path.
+    settings.ai_execution_mode = "SYNC"
+    settings.openai_batch_enabled = False
+    settings.openai_allow_sync_fallback = True
+
     engine = create_engine(
         "sqlite+pysqlite://",
         connect_args={"check_same_thread": False},

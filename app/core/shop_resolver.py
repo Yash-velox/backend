@@ -10,6 +10,14 @@ from app.core.crypto import decrypt_token, encrypt_token
 from app.models import Shop, ShopSettings, ShopStatus
 
 
+def _dev_access_token_fallback_allowed() -> bool:
+    """Client-credentials token is for Vite-only local/UAT tunnels (no OAuth shell).
+
+    Production must use install handoff only.
+    """
+    return settings.app_env in {"dev", "uat"} and bool(settings.shopify_dev_access_token)
+
+
 def extract_shop_domain(jwt_payload: dict) -> str:
     dest = (jwt_payload.get("dest") or jwt_payload.get("iss") or "").strip()
     if dest.startswith("https://"):
@@ -31,6 +39,7 @@ def ensure_shop_settings(db: Session, shop: Shop) -> ShopSettings:
     row = ShopSettings(
         shop_id=shop.id,
         auto_sync_enabled=False,
+        auto_publish_processed_images=False,
         batch_interval_minutes=settings.default_batch_interval_minutes,
     )
     db.add(row)
@@ -53,7 +62,7 @@ def get_or_create_shop(db: Session, shop_domain: str) -> Shop:
         status=ShopStatus.ACTIVE,
         updated_at=datetime.now(timezone.utc),
     )
-    if settings.app_env == "dev" and settings.shopify_dev_access_token:
+    if _dev_access_token_fallback_allowed():
         shop.encrypted_access_token = encrypt_token(settings.shopify_dev_access_token)
     db.add(shop)
     db.flush()
@@ -113,11 +122,11 @@ def resolve_shop_access_token(shop: Shop) -> str:
         token = decrypt_token(shop.encrypted_access_token)
         if token:
             return token
-    if settings.app_env == "dev" and settings.shopify_dev_access_token:
+    if _dev_access_token_fallback_allowed():
         return settings.shopify_dev_access_token
     raise RuntimeError(
         "Shopify access token is not available for this shop. "
-        "Install handoff is not complete, or set SHOPIFY_DEV_ACCESS_TOKEN in development."
+        "Install handoff is not complete, or set SHOPIFY_DEV_ACCESS_TOKEN for local/UAT."
     )
 
 

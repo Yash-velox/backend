@@ -151,6 +151,9 @@ class RetryService:
         now = datetime.now(timezone.utc)
 
         for batch_product in stale:
+            # Do not interrupt products waiting on OpenAI Platform Batch results.
+            if any(img.status == BatchImageStatus.WAITING_FOR_PROVIDER for img in batch_product.images):
+                continue
             for image in batch_product.images:
                 if image.status not in (BatchImageStatus.DOWNLOADING, BatchImageStatus.PROCESSING):
                     continue
@@ -283,14 +286,32 @@ class RetryService:
             for image in images:
                 if image.status != BatchImageStatus.FAILED:
                     continue
+                # Preserve local output for Shopify upload-only retries when present.
+                preserve_output = bool(image.output_storage_key) and (
+                    (image.error_code or "").startswith("SHOPIFY_")
+                    or (image.error_code or "")
+                    in {
+                        "GENERATED_IMAGE_TOO_LARGE",
+                        "GENERATED_IMAGE_PIXEL_LIMIT",
+                        "SHOPIFY_TOKEN_MISSING",
+                        "PUBLISH_OUTPUT_MISSING",
+                        "PUBLISH_OUTPUT_INVALID",
+                        "PUBLISH_OUTPUT_NOT_PNG",
+                    }
+                )
                 assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.QUEUED)
                 image.status = BatchImageStatus.QUEUED
-                image.current_prompt_step = 0
+                if not preserve_output:
+                    image.current_prompt_step = 0
+                    image.output_storage_key = None
+                    image.output_url = None
+                    image.generated_shopify_file_gid = None
+                    image.generated_shopify_cdn_url = None
+                    image.generated_image_version_id = None
+                    image.output_checksum = None
                 image.error_code = None
                 image.error_message = None
                 image.completed_at = None
-                image.output_storage_key = None
-                image.output_url = None
 
             batch_ids.add(batch_product.batch_id)
             logger.info(

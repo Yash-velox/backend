@@ -9,18 +9,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.batches_v2 import router as batches_router
+from app.api.image_versions import router as image_versions_router
 from app.api.internal import router as internal_router
 from app.api.products import router as products_router
 from app.api.prompts import router as prompts_router
+from app.api.publishing import router as publishing_router
 from app.api.secondary_queue import router as secondary_queue_router
 from app.api.settings import router as settings_router
 from app.api.sync import router as sync_router
+from app.api.versions import router as versions_router
 from app.config import settings
 from app.core.deps import CurrentShop
 from app.logging_setup import setup_logging
 from app.poc.auth import require_shopify_jwt
 from app.poc.router import router as poc_router
 from app.workers.processing_worker import processing_worker
+from app.workers.publish_worker import publish_worker
 
 setup_logging()
 logger = logging.getLogger("app.main")
@@ -30,11 +34,13 @@ logger = logging.getLogger("app.main")
 async def lifespan(_app: FastAPI):
     if settings.auto_processing_enabled:
         await processing_worker.start()
+        await publish_worker.start()
     else:
-        logger.info("Automatic processing disabled — worker not started")
+        logger.info("Automatic processing disabled — workers not started")
     try:
         yield
     finally:
+        await publish_worker.stop()
         await processing_worker.stop()
 
 
@@ -104,7 +110,7 @@ def health():
 @app.get("/tenant/checkConfig", dependencies=[Depends(require_shopify_jwt)])
 def tenant_check_config(shop: CurrentShop):
     installed = bool(shop.encrypted_access_token) or (
-        settings.app_env == "dev" and bool(settings.shopify_dev_access_token)
+        settings.app_env in {"dev", "uat"} and bool(settings.shopify_dev_access_token)
     )
     return {
         "status": "ok",
@@ -120,5 +126,8 @@ app.include_router(sync_router)
 app.include_router(settings_router)
 app.include_router(secondary_queue_router)
 app.include_router(batches_router)
+app.include_router(publishing_router)
+app.include_router(versions_router)
+app.include_router(image_versions_router)
 app.include_router(prompts_router)
 app.include_router(products_router)

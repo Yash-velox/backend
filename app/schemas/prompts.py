@@ -20,12 +20,14 @@ class PromptStepCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=150)
     promptText: str = Field(min_length=1, max_length=20000)
     isEnabled: bool = True
+    stepType: str = "IMAGE"
 
 
 class PromptStepUpdateRequest(BaseModel):
     name: str | None = Field(default=None, max_length=150)
     promptText: str | None = Field(default=None, max_length=20000)
     isEnabled: bool | None = None
+    stepType: str | None = None
 
 
 class PromptStepStatusRequest(BaseModel):
@@ -41,6 +43,7 @@ class PromptStepOut(BaseModel):
     name: str
     promptText: str
     stepOrder: int
+    stepType: str = "IMAGE"
     isEnabled: bool
     variables: list[str]
     createdAt: datetime

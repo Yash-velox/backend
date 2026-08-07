@@ -39,6 +39,17 @@ class ProcessingWorker:
             logger.warning("Worker already running | worker_id=%s", self.worker_id)
             return
         self._stop.clear()
+        try:
+            from app.services.output_storage import cleanup_expired_temp_outputs
+
+            cleanup_stats = await asyncio.to_thread(cleanup_expired_temp_outputs)
+            logger.info(
+                "Startup temp output cleanup | scanned=%s deleted=%s",
+                cleanup_stats.get("scanned"),
+                cleanup_stats.get("deleted"),
+            )
+        except Exception:
+            logger.exception("Startup temp output cleanup failed | worker_id=%s", self.worker_id)
         self._task = asyncio.create_task(self._run_loop(), name=f"processing-worker-{self.worker_id}")
         self._recover_task = asyncio.create_task(
             self._recover_loop(),
@@ -142,35 +153,23 @@ class ProcessingWorker:
             db.close()
 
     async def _process_available_work(self) -> None:
-        use_batch = False
+        from app.services.ai_provider import AiProviderError, require_openai_provider
+        from app.services.openai_batch_orchestrator import (
+            OpenAIBatchOrchestratorError,
+            primary_queue_uses_openai_batch,
+        )
+
         try:
-            from app.services.ai_provider import AiProviderError, require_openai_provider
-            from app.services.openai_batch_orchestrator import (
-                OpenAIBatchOrchestratorError,
-                primary_queue_uses_openai_batch,
-            )
+            require_openai_provider()
+        except AiProviderError:
+            logger.exception("AI provider blocks Primary Queue work")
+            return
 
-            try:
-                require_openai_provider()
-            except AiProviderError:
-                logger.exception("AI provider blocks Primary Queue work")
-                return
-
-            try:
-                use_batch = primary_queue_uses_openai_batch()
-            except OpenAIBatchOrchestratorError:
-                logger.exception("OpenAI Batch configuration error — Primary Queue work blocked")
-                return
-        except ImportError:
-            # Stash/merge left Batch orchestrator imports without matching enums on develop.
-            # Keep the UI/API demo usable via the sync Primary Queue path.
-            if not getattr(self, "_warned_batch_import", False):
-                logger.warning(
-                    "OpenAI Batch path unavailable — falling back to sync Primary Queue",
-                    exc_info=True,
-                )
-                self._warned_batch_import = True
-            use_batch = False
+        try:
+            use_batch = primary_queue_uses_openai_batch()
+        except OpenAIBatchOrchestratorError:
+            logger.exception("OpenAI Batch configuration error — Primary Queue work blocked")
+            return
 
         if use_batch:
             await asyncio.to_thread(self._run_openai_batch_tick)
@@ -180,7 +179,6 @@ class ProcessingWorker:
         for shop_id in shop_ids:
             if self._stop.is_set():
                 return
-            # Process multiple products per shop per poll, up to concurrency.
             for _ in range(settings.processing_batch_concurrency):
                 product_id = await asyncio.to_thread(self._claim_product, shop_id)
                 if not product_id:

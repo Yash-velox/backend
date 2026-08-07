@@ -70,13 +70,34 @@ class Settings(BaseSettings):
     default_batch_interval_minutes: int = 15
     # Safety cap when claiming Secondary Queue items into one automatic Primary batch
     auto_batch_claim_limit: int = 500
-    manual_batch_product_limit: int = 50
+    manual_batch_product_limit: int = 2
 
     shopify_image_download_timeout_seconds: int = 60
     shopify_image_max_download_mb: int = 30
     shopify_api_version: str = "2026-07"
     # Dev-only fallback when shop encrypted token is empty. Never used when APP_ENV != dev.
     shopify_dev_access_token: str = ""
+
+    # Shopify publishing
+    publish_product_concurrency: int = 2
+    shopify_file_upload_concurrency: int = 3
+    shopify_file_status_poll_seconds: float = 2.0
+    shopify_file_ready_timeout_seconds: float = 300.0
+    shopify_reorder_timeout_seconds: float = 180.0
+    publish_poll_interval_seconds: float = 3.0
+    publish_stale_lock_seconds: int = 600
+    publish_worker_id: str = ""
+
+    # Shopify generated-image validation / temp retention (CDN versions)
+    shopify_image_preferred_max_mb: int = 10
+    shopify_image_optimize_warn_mb: int = 10
+    shopify_image_optimize_attempt_mb: int = 15
+    shopify_image_reject_mb: int = 20
+    processing_temp_retry_retention_hours: int = 48
+    # Soft warning thresholds for estimated CDN storage (metadata totals only)
+    image_storage_warn_total_versions: int = 5000
+    image_storage_warn_avg_generated_mb: float = 8.0
+    image_storage_warn_versions_per_product: int = 50
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -85,6 +106,10 @@ class Settings(BaseSettings):
     @property
     def effective_worker_id(self) -> str:
         return self.processing_worker_id.strip() or f"worker_{uuid.uuid4().hex[:12]}"
+
+    @property
+    def effective_publish_worker_id(self) -> str:
+        return self.publish_worker_id.strip() or f"publish_{uuid.uuid4().hex[:12]}"
 
     @property
     def effective_handoff_secret(self) -> str:

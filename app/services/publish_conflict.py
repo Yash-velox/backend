@@ -2,7 +2,51 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+logger = logging.getLogger("app.services.publish_conflict")
+
+
+def heal_empty_publish_baseline(
+    baseline: dict[str, Any],
+    live: dict[str, Any],
+    assets: list[dict[str, Any]],
+) -> tuple[dict[str, Any], bool]:
+    """Repair legacy empty baselines that falsely conflict with unchanged live media.
+
+    Older batches copied an empty ProcessingBaseline into baseline_snapshot_json.
+    When the processed source media GIDs exactly match live Shopify membership,
+    treat live as the baseline so publish can proceed without a false conflict.
+    """
+    if baseline.get("media"):
+        return baseline, False
+
+    source_ids = {
+        str(a.get("source_media_gid"))
+        for a in assets
+        if isinstance(a, dict) and a.get("source_media_gid")
+    }
+    live_ids = {
+        str(m.get("media_gid"))
+        for m in (live.get("media") or [])
+        if isinstance(m, dict) and m.get("media_gid")
+    }
+    if not source_ids or source_ids != live_ids:
+        return baseline, False
+
+    healed = {
+        "product_gid": live.get("product_gid") or baseline.get("product_gid"),
+        "updated_at": live.get("updated_at"),
+        "featured_media_gid": live.get("featured_media_gid"),
+        "media": list(live.get("media") or []),
+        "variants": list(live.get("variants") or []),
+    }
+    logger.info(
+        "Healed empty publish baseline from live snapshot | sources=%s",
+        len(source_ids),
+    )
+    return healed, True
 
 
 def compare_publish_snapshots(

@@ -18,6 +18,7 @@ def _request_id(request: Request) -> str:
 def _settings_out(row) -> SettingsOut:
     return SettingsOut(
         autoSyncEnabled=row.auto_sync_enabled,
+        autoPublishProcessedImages=bool(getattr(row, "auto_publish_processed_images", False)),
         batchIntervalMinutes=row.batch_interval_minutes,
         createdAt=row.created_at,
         updatedAt=row.updated_at,
@@ -47,6 +48,7 @@ def update_settings(
     try:
         row = svc.update(
             auto_sync_enabled=payload.autoSyncEnabled,
+            auto_publish_processed_images=payload.autoPublishProcessedImages,
             batch_interval_minutes=payload.batchIntervalMinutes,
         )
     except SettingsValidationError as exc:

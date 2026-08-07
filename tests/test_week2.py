@@ -30,7 +30,9 @@ from app.models import (
     WebhookProcessingResult,
 )
 from app.services.delta import compare_media_snapshots
-from app.services.primary_batch import PrimaryBatchService
+from app.services.primary_batch import PrimaryBatchError, PrimaryBatchService
+from app.services.prompt_configuration import PromptConfigurationService
+from app.services.prompt_product_types import PromptProductTypeService
 from app.services.prompt_resolver import PromptResolverError
 from app.services.prompt_mapping import PromptMappingService
 from app.services.retry_service import RetryService
@@ -38,6 +40,23 @@ from app.services.secondary_queue import SecondaryQueueService
 from app.services.settings_service import SettingsService, SettingsValidationError
 from app.services.snapshot import media_fingerprint
 from app.services.state_machine import BATCH_TRANSITIONS, InvalidStateTransition, assert_transition
+from app.services.webhook_intake import WebhookIntakeService
+
+
+def _configure_product_type(db_session, shop, product_type: str, *, prompt: str = "Enhance {{product_title}}") -> None:
+    types = PromptProductTypeService(db_session, shop)
+    types.sync_shopify_product_types()
+    db_session.flush()
+    ppt = types.find_by_normalized_name(product_type.casefold())
+    if ppt is None:
+        ppt = types.add_manual(product_type)
+    PromptConfigurationService(db_session, shop).add_step(
+        ppt.id,
+        name="Step 1",
+        prompt_text=prompt,
+        is_enabled=True,
+    )
+    db_session.commit()
 from app.services.webhook_intake import detect_status_only, is_draft_transition, product_gid_from_webhook_payload
 
 
@@ -129,60 +148,6 @@ def test_delta_new_and_replaced_and_skip():
     assert skip.get("skip_reason")
 
 
-def test_delta_skips_product_image_vs_media_image_same_cdn():
-    """REST ProductImage GID vs GraphQL MediaImage GID for same CDN path is not NEW."""
-    baseline = [
-        {
-            "media_gid": "gid://shopify/MediaImage/33248938590291",
-            "cdn_url": "https://cdn.shopify.com/s/files/1/x/files/chain.png?v=1",
-            "filename": "chain.png",
-            "width": 1254,
-            "height": 1254,
-            "mime_type": "image/png",
-            "fingerprint": "catalog-fp",
-        }
-    ]
-    eligible = [
-        {
-            "media_gid": "gid://shopify/ProductImage/41966871347283",
-            "cdn_url": "https://cdn.shopify.com/s/files/1/x/files/chain.png?v=2",
-            "filename": "chain.png",
-            "width": 1254,
-            "height": 1254,
-            "mime_type": None,
-            "fingerprint": "webhook-fp-different-because-gid",
-        }
-    ]
-    result = compare_media_snapshots(eligible, baseline)
-    assert result["new"] == []
-    assert result["replaced"] == []
-    assert result["skip_reason"]
-
-
-def test_delta_new_cdn_path_still_detected():
-    baseline = [
-        {
-            "media_gid": "gid://shopify/MediaImage/1",
-            "cdn_url": "https://cdn.shopify.com/old.png",
-            "filename": "old.png",
-            "width": 10,
-            "height": 10,
-        }
-    ]
-    eligible = [
-        {
-            "media_gid": "gid://shopify/ProductImage/99",
-            "cdn_url": "https://cdn.shopify.com/brand-new.png",
-            "filename": "brand-new.png",
-            "width": 10,
-            "height": 10,
-        }
-    ]
-    result = compare_media_snapshots(eligible, baseline)
-    assert len(result["new"]) == 1
-    assert result["skip_reason"] is None
-
-
 def test_status_only_and_draft_helpers():
     product = Product(
         id=uuid4(),
@@ -215,8 +180,11 @@ def test_status_only_and_draft_helpers():
 def test_state_machine_rejects_invalid():
     assert_transition("batch", BATCH_TRANSITIONS, BatchStatus.QUEUED, BatchStatus.PROCESSING)
     assert_transition("batch", BATCH_TRANSITIONS, BatchStatus.QUEUED, BatchStatus.COMPLETED)
+    # Manual reprocess may reopen a finished batch.
+    assert_transition("batch", BATCH_TRANSITIONS, BatchStatus.COMPLETED, BatchStatus.QUEUED)
+    assert_transition("batch", BATCH_TRANSITIONS, BatchStatus.COMPLETED, BatchStatus.PROCESSING)
     try:
-        assert_transition("batch", BATCH_TRANSITIONS, BatchStatus.COMPLETED, BatchStatus.QUEUED)
+        assert_transition("batch", BATCH_TRANSITIONS, BatchStatus.CANCELLED, BatchStatus.PROCESSING)
         assert False, "expected InvalidStateTransition"
     except InvalidStateTransition:
         pass
@@ -311,6 +279,9 @@ def test_secondary_queue_upsert_dedupe_and_draft(db_session, shop):
     )
     assert first is not None
     assert first.queue_revision == 1
+    assert first.status == SecondaryQueueStatus.FAILED_CONVERSION
+    assert first.failure_reason
+    assert "Cannot process" in first.failure_reason
     second = svc.upsert_from_webhook(
         product_gid="gid://shopify/Product/9",
         product_snapshot={**snap, "title": "T2"},
@@ -321,6 +292,8 @@ def test_secondary_queue_upsert_dedupe_and_draft(db_session, shop):
     assert second.id == first.id
     assert second.queue_revision == 2
     assert second.webhook_count == 2
+    assert second.status == SecondaryQueueStatus.FAILED_CONVERSION
+    assert "T2" in (second.failure_reason or "")
 
     draft = svc.upsert_from_webhook(
         product_gid="gid://shopify/Product/9",
@@ -367,6 +340,7 @@ def test_manual_batch_creates_initial_images(db_session, shop):
         )
     )
     db_session.commit()
+    _configure_product_type(db_session, shop, "Shoes")
 
     batch = PrimaryBatchService(db_session, shop).create_manual_batch(["gid://shopify/Product/42"])
     assert batch.trigger_type == TriggerType.MANUAL
@@ -375,6 +349,42 @@ def test_manual_batch_creates_initial_images(db_session, shop):
     images = db_session.query(BatchImage).all()
     assert images[0].delta_type == DeltaType.INITIAL
     assert images[0].status == BatchImageStatus.QUEUED
+    bp = db_session.query(BatchProduct).one()
+    baseline_media = (bp.baseline_snapshot_json or {}).get("media") or []
+    assert len(baseline_media) == 1
+    assert baseline_media[0]["media_gid"] == "gid://shopify/MediaImage/7"
+
+
+def test_manual_batch_rejects_unconfigured_product_type(db_session, shop):
+    ensure_shop_settings(db_session, shop)
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/420",
+        title="Loose Charm",
+        status="ACTIVE",
+        product_type="UnconfiguredType",
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(
+        ProductMedia(
+            shop_id=shop.id,
+            product_id=product.id,
+            shopify_media_gid="gid://shopify/MediaImage/420",
+            cdn_url="https://cdn.shopify.com/charm.png",
+            is_visible=True,
+            is_active=True,
+        )
+    )
+    db_session.commit()
+
+    try:
+        PrimaryBatchService(db_session, shop).create_manual_batch(["gid://shopify/Product/420"])
+        assert False, "expected PrimaryBatchError"
+    except PrimaryBatchError as exc:
+        assert "Loose Charm" in str(exc)
+        assert "prompt configuration" in str(exc).lower() or "PROMPT" in str(exc) or "Configure" in str(exc)
+    assert db_session.query(ProcessingBatch).count() == 0
 
 
 def test_secondary_conversion_skips_no_delta(db_session, shop):
@@ -426,6 +436,60 @@ def test_secondary_conversion_skips_no_delta(db_session, shop):
     assert result is None
     db_session.refresh(item)
     assert item.status == SecondaryQueueStatus.SKIPPED_NO_ELIGIBLE_IMAGE_DELTA
+
+
+def test_delta_skips_product_image_vs_media_image_same_cdn():
+    """REST ProductImage GID vs GraphQL MediaImage GID for same CDN path is not NEW."""
+    baseline = [
+        {
+            "media_gid": "gid://shopify/MediaImage/33248938590291",
+            "cdn_url": "https://cdn.shopify.com/s/files/1/x/files/chain.png?v=1",
+            "filename": "chain.png",
+            "width": 1254,
+            "height": 1254,
+            "mime_type": "image/png",
+            "fingerprint": "catalog-fp",
+        }
+    ]
+    eligible = [
+        {
+            "media_gid": "gid://shopify/ProductImage/41966871347283",
+            "cdn_url": "https://cdn.shopify.com/s/files/1/x/files/chain.png?v=2",
+            "filename": "chain.png",
+            "width": 1254,
+            "height": 1254,
+            "mime_type": None,
+            "fingerprint": "webhook-fp-different-because-gid",
+        }
+    ]
+    result = compare_media_snapshots(eligible, baseline)
+    assert result["new"] == []
+    assert result["replaced"] == []
+    assert result["skip_reason"]
+
+
+def test_delta_new_cdn_path_still_detected():
+    baseline = [
+        {
+            "media_gid": "gid://shopify/MediaImage/1",
+            "cdn_url": "https://cdn.shopify.com/old.png",
+            "filename": "old.png",
+            "width": 10,
+            "height": 10,
+        }
+    ]
+    eligible = [
+        {
+            "media_gid": "gid://shopify/ProductImage/99",
+            "cdn_url": "https://cdn.shopify.com/brand-new.png",
+            "filename": "brand-new.png",
+            "width": 10,
+            "height": 10,
+        }
+    ]
+    result = compare_media_snapshots(eligible, baseline)
+    assert len(result["new"]) == 1
+    assert result["skip_reason"] is None
 
 
 def test_secondary_conversion_skips_title_only_empty_baseline(db_session, shop):
@@ -507,13 +571,18 @@ def test_secondary_conversion_skips_title_only_empty_baseline(db_session, shop):
 
 
 def test_secondary_conversion_new_image_after_catalog_already_synced(db_session, shop):
-    """Regression: new image must convert when baseline was frozen pre-sync, catalog post-sync."""
+    """Regression: new image must convert when baseline was frozen pre-sync, catalog post-sync.
+
+    Simulates webhook order: seed empty baseline from old catalog → upsert adds new media
+    → Secondary Queue eligible includes new image → conversion must detect NEW (not skip).
+    """
     ensure_shop_settings(db_session, shop)
     product = Product(
         shop_id=shop.id,
         shopify_product_gid="gid://shopify/Product/8034005418999",
         title="Chain",
         status="ACTIVE",
+        product_type="Bags",
     )
     db_session.add(product)
     db_session.flush()
@@ -534,10 +603,12 @@ def test_secondary_conversion_new_image_after_catalog_already_synced(db_session,
     db_session.flush()
 
     svc = PrimaryBatchService(db_session, shop)
+    # Pre-sync freeze (what webhook must do before catalog upsert)
     baseline = svc.seed_empty_baseline_from_product_media(product)
     assert baseline.media_snapshot_json is not None
     assert len(baseline.media_snapshot_json) == 1
 
+    # Post-sync catalog already includes the newly added image
     db_session.add(
         ProductMedia(
             shop_id=shop.id,
@@ -576,6 +647,7 @@ def test_secondary_conversion_new_image_after_catalog_already_synced(db_session,
         eligible_product_snapshot_json={
             "shopify_product_gid": product.shopify_product_gid,
             "title": "Chain",
+            "product_type": "Bags",
         },
         eligible_media_snapshot_json=eligible_media,
         claimed_by="worker_test",
@@ -583,6 +655,7 @@ def test_secondary_conversion_new_image_after_catalog_already_synced(db_session,
     )
     db_session.add(item)
     db_session.commit()
+    _configure_product_type(db_session, shop, "Bags")
 
     batch = svc.convert_secondary_items([item])
     assert batch is not None
@@ -601,6 +674,7 @@ def test_secondary_conversion_creates_batch_for_new_cdn(db_session, shop):
         shopify_product_gid="gid://shopify/Product/77",
         title="Bag",
         status="ACTIVE",
+        product_type="Bags",
     )
     db_session.add(product)
     db_session.flush()
@@ -638,7 +712,11 @@ def test_secondary_conversion_creates_batch_for_new_cdn(db_session, shop):
         shopify_product_gid=product.shopify_product_gid,
         product_id=product.id,
         status=SecondaryQueueStatus.CLAIMED,
-        eligible_product_snapshot_json={"shopify_product_gid": product.shopify_product_gid, "title": "Bag"},
+        eligible_product_snapshot_json={
+            "shopify_product_gid": product.shopify_product_gid,
+            "title": "Bag",
+            "product_type": "Bags",
+        },
         eligible_media_snapshot_json=[
             {
                 "media_gid": "gid://shopify/MediaImage/10",
@@ -660,6 +738,7 @@ def test_secondary_conversion_creates_batch_for_new_cdn(db_session, shop):
     )
     db_session.add(item)
     db_session.commit()
+    _configure_product_type(db_session, shop, "Bags")
 
     batch = PrimaryBatchService(db_session, shop).convert_secondary_items([item])
     assert batch is not None
@@ -670,6 +749,51 @@ def test_secondary_conversion_creates_batch_for_new_cdn(db_session, shop):
     assert len(images) == 1
     assert images[0].delta_type == DeltaType.NEW
     assert images[0].shopify_media_gid.endswith("/11")
+
+
+def test_secondary_conversion_fails_unconfigured_product_type(db_session, shop):
+    ensure_shop_settings(db_session, shop)
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/780",
+        title="Orphan Ring",
+        status="ACTIVE",
+        product_type="MysteryType",
+    )
+    db_session.add(product)
+    db_session.flush()
+    item = SecondaryQueueItem(
+        shop_id=shop.id,
+        shopify_product_gid=product.shopify_product_gid,
+        product_id=product.id,
+        status=SecondaryQueueStatus.CLAIMED,
+        eligible_product_snapshot_json={
+            "shopify_product_gid": product.shopify_product_gid,
+            "title": "Orphan Ring",
+            "product_type": "MysteryType",
+        },
+        eligible_media_snapshot_json=[
+            {
+                "media_gid": "gid://shopify/MediaImage/780",
+                "cdn_url": "https://cdn.shopify.com/new-ring.png",
+                "filename": "new-ring.png",
+                "width": 20,
+                "height": 20,
+            },
+        ],
+        claimed_by="worker_test",
+        claimed_at=datetime.now(timezone.utc),
+    )
+    db_session.add(item)
+    db_session.commit()
+
+    batch = PrimaryBatchService(db_session, shop).convert_secondary_items([item])
+    assert batch is None
+    db_session.refresh(item)
+    assert item.status == SecondaryQueueStatus.FAILED_CONVERSION
+    assert item.failure_reason
+    assert "Orphan Ring" in item.failure_reason
+    assert "prompt" in item.failure_reason.lower() or "Configure" in item.failure_reason
 
 
 def test_auto_batch_trigger_by_interval_only(db_session, shop):
@@ -754,6 +878,7 @@ def test_manual_batch_api(client, shop, db_session):
         shopify_product_gid="gid://shopify/Product/88",
         title="Bag",
         status="ACTIVE",
+        product_type="Bags",
     )
     db_session.add(product)
     db_session.flush()
@@ -768,6 +893,7 @@ def test_manual_batch_api(client, shop, db_session):
         )
     )
     db_session.commit()
+    _configure_product_type(db_session, shop, "Bags")
 
     res = client.post("/api/batches/manual", json={"productGids": ["gid://shopify/Product/88"]})
     assert res.status_code == 200, res.text
@@ -775,6 +901,31 @@ def test_manual_batch_api(client, shop, db_session):
     assert body["success"] is True
     assert body["data"]["productCount"] == 1
     assert body["data"]["imageCount"] == 1
+
+    blocked = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/89",
+        title="No Prompt Product",
+        status="ACTIVE",
+        product_type="MissingConfig",
+    )
+    db_session.add(blocked)
+    db_session.flush()
+    db_session.add(
+        ProductMedia(
+            shop_id=shop.id,
+            product_id=blocked.id,
+            shopify_media_gid="gid://shopify/MediaImage/89",
+            cdn_url="https://cdn.shopify.com/x.png",
+            is_visible=True,
+            is_active=True,
+        )
+    )
+    db_session.commit()
+    bad = client.post("/api/batches/manual", json={"productGids": ["gid://shopify/Product/89"]})
+    assert bad.status_code == 400, bad.text
+    assert "No Prompt Product" in bad.text
+    assert "prompt" in bad.text.lower() or "Configure" in bad.text
 
 
 def test_catalog_products_list_and_select_all(client, shop, db_session):
@@ -832,8 +983,6 @@ def test_internal_install_hmac(client, monkeypatch, db_session):
 
 
 def test_webhook_dedupe(db_session, shop):
-    from app.services.webhook_intake import WebhookIntakeService
-
     ensure_shop_settings(db_session, shop)
     db_session.commit()
     payload = {
@@ -870,14 +1019,13 @@ def test_webhook_dedupe(db_session, shop):
 
 def test_webhook_seeds_baseline_before_catalog_upsert_so_new_image_converts(db_session, shop, monkeypatch):
     """Adding an image with an empty ProcessingBaseline must convert, not skip."""
-    from app.services.webhook_intake import WebhookIntakeService
-
     ensure_shop_settings(db_session, shop)
     product = Product(
         shop_id=shop.id,
         shopify_product_gid="gid://shopify/Product/4242",
         title="Pendant",
         status="ACTIVE",
+        product_type="Bags",
     )
     db_session.add(product)
     db_session.flush()
@@ -903,6 +1051,7 @@ def test_webhook_seeds_baseline_before_catalog_upsert_so_new_image_converts(db_s
         )
     )
     db_session.commit()
+    _configure_product_type(db_session, shop, "Bags")
 
     graphql_node = {
         "id": "gid://shopify/Product/4242",
@@ -975,6 +1124,7 @@ def test_webhook_seeds_baseline_before_catalog_upsert_so_new_image_converts(db_s
         .filter(ProcessingBaseline.product_id == product.id)
         .one()
     )
+    # Pre-sync freeze must keep only the old image — not the newly upserted one.
     assert baseline.media_snapshot_json is not None
     assert len(baseline.media_snapshot_json) == 1
     assert baseline.media_snapshot_json[0]["media_gid"].endswith("/100")
