@@ -95,6 +95,13 @@ def execution_mode() -> AiExecutionMode:
 
 
 def primary_queue_uses_openai_batch() -> bool:
+    from app.services.ai_provider import AiProviderError, require_openai_provider
+
+    try:
+        require_openai_provider()
+    except AiProviderError as exc:
+        raise OpenAIBatchOrchestratorError(str(exc), code=exc.code) from exc
+
     mode = execution_mode()
     if mode == AiExecutionMode.SYNC:
         return False
