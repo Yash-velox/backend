@@ -354,10 +354,56 @@ def test_storage_summary_and_api_shop_scope(client, db_session, shop):
     assert body["success"] is True
     assert body["data"]["estimateOnly"] is True
     assert body["data"]["totalVersions"] >= 1
+    assert body["data"]["originalVersionCount"] >= 1
+    assert body["data"]["generatedVersionCount"] == 0
+    note = body["data"]["note"].lower()
+    assert "file_size_bytes" in note
+    assert "not shopify" in note
+    # Originals alone must not trigger the generated-count storage warning.
+    assert all(w["code"] != "HIGH_TOTAL_VERSIONS" for w in body["data"]["warnings"])
 
     res2 = client.get(f"/api/products/{product.id}/image-versions")
     assert res2.status_code == 200
     assert res2.json()["data"]["total"] >= 1
+
+
+def test_storage_summary_warns_on_generated_count_not_originals(db_session, shop, monkeypatch):
+    """HIGH_TOTAL_VERSIONS is based on GENERATED Files versions, not catalog originals."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "image_storage_warn_total_versions", 2)
+    monkeypatch.setattr(settings, "image_storage_warn_avg_generated_mb", 999.0)
+    monkeypatch.setattr(settings, "image_storage_warn_versions_per_product", 999)
+
+    product, media = _seed_catalog(db_session, shop)
+    svc = ImageVersionsService(db_session, shop)
+    svc.ensure_original_from_media(media)
+    # Extra original-like rows would previously inflate the warning; still one product media.
+    for i in range(3):
+        svc.create_generated_after_upload(
+            product_id=product.id,
+            source_media_gid=media.shopify_media_gid,
+            shopify_file_gid=f"gid://shopify/File/gen-{i}",
+            shopify_cdn_url=f"https://cdn.shopify.com/gen-{i}.png",
+            width=100,
+            height=100,
+            file_size_bytes=1024 * 100,
+            checksum=f"sum-{i}",
+            upload_idempotency_key=f"idem-{i}",
+        )
+    db_session.commit()
+
+    summary = svc.storage_summary()
+    assert summary["estimateOnly"] is True
+    assert summary["totalRecordedFileSizeBytes"] == 1024 * 100 * 3
+    assert summary["generatedVersionCount"] == 3
+    assert summary["originalVersionCount"] == 1
+    codes = [w["code"] for w in summary["warnings"]]
+    assert "HIGH_TOTAL_VERSIONS" in codes
+    high = next(w for w in summary["warnings"] if w["code"] == "HIGH_TOTAL_VERSIONS")
+    assert high["value"] == 3
+    assert "not Shopify" in high["message"]
+    assert "No automatic deletion" in high["message"]
 
 
 def test_cross_shop_image_version_blocked(client, db_session, shop, SessionLocal):

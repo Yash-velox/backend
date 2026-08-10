@@ -133,8 +133,22 @@ class ImageVersionsService:
     def ensure_original_from_media(self, media: ProductMedia, *, actor_type: str = "catalog_sync") -> ImageVersion:
         """Idempotently register Version 0 for a catalog ProductMedia row."""
         existing = self.get_original(product_id=media.product_id, source_media_gid=media.shopify_media_gid)
+        # Unique is (shop_id, shopify_file_gid). Re-sync can miss get_original when
+        # source_media_gid changed but the File/MediaImage GID is already stored.
+        if existing is None and media.shopify_file_gid:
+            existing = (
+                self.db.query(ImageVersion)
+                .filter(
+                    ImageVersion.shop_id == self.shop.id,
+                    ImageVersion.shopify_file_gid == media.shopify_file_gid,
+                )
+                .order_by(ImageVersion.version_number.asc())
+                .first()
+            )
         if existing:
             # Refresh mutable catalog metadata without creating duplicates.
+            existing.product_id = media.product_id
+            existing.source_media_gid = media.shopify_media_gid or existing.source_media_gid
             existing.shopify_file_gid = media.shopify_file_gid or existing.shopify_file_gid
             existing.shopify_media_gid = media.shopify_media_gid
             existing.shopify_cdn_url = media.cdn_url or existing.shopify_cdn_url
@@ -500,12 +514,38 @@ class ImageVersionsService:
         return rows, total
 
     def storage_summary(self) -> dict[str, Any]:
+        """Estimate app-managed image-version footprint from DB metadata only.
+
+        Byte totals are SUM(file_size_bytes) only (NULLs count as 0). This is not
+        Shopify plan/account storage. ORIGINAL rows are catalog media baselines for
+        rollback history; GENERATED rows are Files uploads created by this app.
+        Nothing is deleted automatically.
+        """
         total_versions = (
             self.db.query(func.count(ImageVersion.id))
             .filter(ImageVersion.shop_id == self.shop.id)
             .scalar()
             or 0
         )
+        original_count = (
+            self.db.query(func.count(ImageVersion.id))
+            .filter(
+                ImageVersion.shop_id == self.shop.id,
+                ImageVersion.is_original.is_(True),
+            )
+            .scalar()
+            or 0
+        )
+        missing_size_count = (
+            self.db.query(func.count(ImageVersion.id))
+            .filter(
+                ImageVersion.shop_id == self.shop.id,
+                ImageVersion.file_size_bytes.is_(None),
+            )
+            .scalar()
+            or 0
+        )
+        # Storage estimates use only stored file_size_bytes metadata (never Shopify Admin usage APIs).
         total_bytes = (
             self.db.query(func.coalesce(func.sum(ImageVersion.file_size_bytes), 0))
             .filter(ImageVersion.shop_id == self.shop.id)
@@ -554,12 +594,19 @@ class ImageVersionsService:
         products_with_versions = len(per_product)
 
         warnings: list[dict[str, Any]] = []
-        if total_versions >= settings.image_storage_warn_total_versions:
+        # Count GENERATED Files versions only — ORIGINAL catalog baselines are not app-created storage.
+        if generated_count >= settings.image_storage_warn_total_versions:
             warnings.append(
                 {
                     "code": "HIGH_TOTAL_VERSIONS",
-                    "message": "Estimated total image versions is high. No automatic deletion is performed.",
-                    "value": total_versions,
+                    "message": (
+                        f"This shop has {int(generated_count):,} generated image versions "
+                        f"(threshold {settings.image_storage_warn_total_versions:,}). "
+                        "That count is from our version history, not Shopify plan usage. "
+                        "No automatic deletion is performed; rollback history is kept."
+                    ),
+                    "value": int(generated_count),
+                    "threshold": settings.image_storage_warn_total_versions,
                 }
             )
         avg_mb = avg_generated / (1024 * 1024)
@@ -567,23 +614,42 @@ class ImageVersionsService:
             warnings.append(
                 {
                     "code": "HIGH_AVG_GENERATED_SIZE",
-                    "message": "Average generated image size is high (estimate from stored metadata).",
+                    "message": (
+                        f"Average recorded size of generated versions is about {avg_mb:.1f} MB "
+                        f"(threshold {settings.image_storage_warn_avg_generated_mb:g} MB). "
+                        "Based only on stored file_size_bytes metadata — not Shopify account usage."
+                    ),
                     "valueMb": round(avg_mb, 2),
+                    "thresholdMb": settings.image_storage_warn_avg_generated_mb,
                 }
             )
         if max_versions_product >= settings.image_storage_warn_versions_per_product:
             warnings.append(
                 {
                     "code": "HIGH_VERSIONS_PER_PRODUCT",
-                    "message": "One product has an unusually high number of image versions.",
+                    "message": (
+                        f"At least one product has {max_versions_product} image version rows "
+                        f"(threshold {settings.image_storage_warn_versions_per_product}). "
+                        "Extra rows usually mean reprocess/rollback history, not a Shopify storage meter. "
+                        "No versions are deleted automatically."
+                    ),
                     "value": max_versions_product,
+                    "threshold": settings.image_storage_warn_versions_per_product,
                 }
             )
 
         return {
             "estimateOnly": True,
-            "note": "Totals are estimates from stored file_size_bytes metadata; not Shopify account usage.",
+            "note": (
+                "Estimates use only this app’s stored file_size_bytes metadata on image version rows. "
+                "They are not Shopify plan or account storage usage, and may undercount when size "
+                "metadata is missing (common for original catalog images). "
+                "Original versions are protected baselines for rollback; generated versions are kept "
+                "for version history. No automatic deletion is performed."
+            ),
             "totalVersions": int(total_versions),
+            "originalVersionCount": int(original_count),
+            "versionsMissingFileSizeCount": int(missing_size_count),
             "totalRecordedFileSizeBytes": int(total_bytes),
             "originalFileStorageBytes": int(original_bytes),
             "generatedVersionStorageBytes": int(generated_bytes),

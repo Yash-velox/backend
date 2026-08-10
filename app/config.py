@@ -98,7 +98,8 @@ class Settings(BaseSettings):
     shopify_image_optimize_attempt_mb: int = 15
     shopify_image_reject_mb: int = 20
     processing_temp_retry_retention_hours: int = 48
-    # Soft warning thresholds for estimated CDN storage (metadata totals only)
+    # Soft warning thresholds for estimated app-managed image versions (metadata only;
+    # not Shopify plan storage). total_versions applies to GENERATED Files uploads.
     image_storage_warn_total_versions: int = 5000
     image_storage_warn_avg_generated_mb: float = 8.0
     image_storage_warn_versions_per_product: int = 50
