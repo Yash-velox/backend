@@ -22,6 +22,9 @@ from app.models import (
     ProcessingBatch,
     Product,
     ProductMedia,
+    ProductPublishOperation,
+    PublishStatus,
+    PublishTriggerSource,
     SecondaryQueueItem,
     SecondaryQueueStatus,
     Shop,
@@ -328,6 +331,187 @@ def test_secondary_queue_upsert_dedupe_and_draft(db_session, shop):
         is_status_only=True,
     )
     assert status_only is None
+
+
+def test_secondary_queue_skips_when_media_matches_baseline(db_session, shop):
+    """Publish/self webhooks must not create a new Secondary Queue row when media is unchanged."""
+    ensure_shop_settings(db_session, shop)
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/8801",
+        title="Bag",
+        status="ACTIVE",
+        product_type="Bags",
+    )
+    db_session.add(product)
+    db_session.flush()
+    media = [
+        {
+            "media_gid": "gid://shopify/MediaImage/1",
+            "cdn_url": "https://cdn.shopify.com/a.png",
+            "filename": "a.png",
+            "width": 10,
+            "height": 10,
+            "fingerprint": "fp-a",
+        },
+        {
+            "media_gid": "gid://shopify/MediaImage/2",
+            "cdn_url": "https://cdn.shopify.com/b.png",
+            "filename": "b.png",
+            "width": 20,
+            "height": 20,
+            "fingerprint": "fp-b",
+        },
+    ]
+    db_session.add(
+        ProcessingBaseline(
+            shop_id=shop.id,
+            product_id=product.id,
+            media_snapshot_json=media,
+            product_snapshot_json={"product_gid": product.shopify_product_gid, "title": "Bag"},
+            evaluated_at=datetime.now(timezone.utc),
+            successfully_processed_at=datetime.now(timezone.utc),
+        )
+    )
+    db_session.commit()
+
+    svc = SecondaryQueueService(db_session, shop)
+    result = svc.upsert_from_webhook(
+        product_gid=product.shopify_product_gid,
+        product_snapshot={"product_gid": product.shopify_product_gid, "title": "Bag", "status": "ACTIVE"},
+        media_snapshot=media,
+        webhook_id="wh-publish-echo",
+    )
+    assert result is None
+    assert (
+        db_session.query(SecondaryQueueItem)
+        .filter(SecondaryQueueItem.shopify_product_gid == product.shopify_product_gid)
+        .count()
+        == 0
+    )
+
+
+def test_secondary_queue_skips_during_active_publish(db_session, shop):
+    ensure_shop_settings(db_session, shop)
+    batch = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.AUTOMATIC,
+        status=BatchStatus.COMPLETED,
+        product_count=1,
+        image_count=1,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    bp = BatchProduct(
+        batch_id=batch.id,
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/8802",
+        status=BatchProductStatus.COMPLETED,
+        image_count=1,
+        publish_status=PublishStatus.PUBLISHING,
+    )
+    db_session.add(bp)
+    db_session.flush()
+    db_session.add(
+        ProductPublishOperation(
+            shop_id=shop.id,
+            processing_batch_id=batch.id,
+            batch_product_id=bp.id,
+            shopify_product_gid="gid://shopify/Product/8802",
+            status=PublishStatus.PUBLISHING,
+            trigger_source=PublishTriggerSource.AUTO,
+            idempotency_key=f"pub-active-{uuid4()}",
+            current_stage="ATTACHING",
+        )
+    )
+    db_session.commit()
+
+    svc = SecondaryQueueService(db_session, shop)
+    result = svc.upsert_from_webhook(
+        product_gid="gid://shopify/Product/8802",
+        product_snapshot={"product_gid": "gid://shopify/Product/8802", "title": "X", "status": "ACTIVE"},
+        media_snapshot=[
+            {
+                "media_gid": "gid://shopify/MediaImage/9",
+                "cdn_url": "https://cdn.shopify.com/new.png",
+                "filename": "new.png",
+            }
+        ],
+        webhook_id="wh-during-publish",
+    )
+    assert result is None
+
+
+def test_advance_baseline_on_success_keeps_full_eligible_media(db_session, shop):
+    """Regression: baseline must keep sibling images, not only the processed delta image."""
+    from app.services.image_processor import ImageProcessor
+
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/8803",
+        title="Multi",
+        status="ACTIVE",
+        product_type="Bags",
+    )
+    db_session.add(product)
+    db_session.flush()
+    batch = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.AUTOMATIC,
+        status=BatchStatus.PROCESSING,
+        product_count=1,
+        image_count=1,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    full_media = [
+        {
+            "media_gid": "gid://shopify/MediaImage/1",
+            "cdn_url": "https://cdn.shopify.com/old.png",
+            "filename": "old.png",
+        },
+        {
+            "media_gid": "gid://shopify/MediaImage/2",
+            "cdn_url": "https://cdn.shopify.com/new.png",
+            "filename": "new.png",
+        },
+    ]
+    bp = BatchProduct(
+        batch_id=batch.id,
+        shop_id=shop.id,
+        product_id=product.id,
+        shopify_product_gid=product.shopify_product_gid,
+        status=BatchProductStatus.COMPLETED,
+        image_count=1,
+        product_snapshot_json={"product_gid": product.shopify_product_gid, "title": "Multi"},
+        baseline_snapshot_json={"product": {"product_gid": product.shopify_product_gid}, "media": full_media},
+    )
+    db_session.add(bp)
+    db_session.flush()
+    db_session.add(
+        BatchImage(
+            batch_product_id=bp.id,
+            shop_id=shop.id,
+            shopify_media_gid="gid://shopify/MediaImage/2",
+            cdn_url="https://cdn.shopify.com/new.png",
+            original_filename="new.png",
+            status=BatchImageStatus.COMPLETED,
+            delta_type=DeltaType.NEW,
+        )
+    )
+    db_session.commit()
+
+    ImageProcessor(db_session)._advance_baseline_on_success(bp)
+    db_session.commit()
+
+    baseline = (
+        db_session.query(ProcessingBaseline)
+        .filter(ProcessingBaseline.product_id == product.id)
+        .one()
+    )
+    assert len(baseline.media_snapshot_json or []) == 2
+    gids = {m["media_gid"] for m in baseline.media_snapshot_json}
+    assert gids == {"gid://shopify/MediaImage/1", "gid://shopify/MediaImage/2"}
 
 
 def test_manual_batch_creates_initial_images(db_session, shop):
@@ -1105,12 +1289,8 @@ def test_webhook_seeds_baseline_before_catalog_upsert_so_new_image_converts(db_s
     mock_client = MagicMock()
     mock_client.fetch_product_by_gid.return_value = graphql_node
     monkeypatch.setattr(
-        "app.services.webhook_intake.resolve_shop_access_token",
-        lambda _shop: "shpat_test",
-    )
-    monkeypatch.setattr(
-        "app.services.webhook_intake.ShopifyGraphQLClient",
-        lambda **_kwargs: mock_client,
+        "app.services.webhook_intake.create_shopify_graphql_client",
+        lambda _db, _shop: mock_client,
     )
 
     payload = {

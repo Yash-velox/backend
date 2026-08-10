@@ -807,22 +807,34 @@ class ImageProcessor:
         )
         now = datetime.now(timezone.utc)
         product_snapshot = batch_product.product_snapshot_json or {}
-        media_snapshot = []
-        for image in batch_product.images:
-            if image.status != BatchImageStatus.COMPLETED:
-                continue
-            media_snapshot.append(
-                {
-                    "media_gid": image.shopify_media_gid,
-                    "file_gid": image.shopify_file_gid,
-                    "cdn_url": image.cdn_url,
-                    "filename": image.original_filename,
-                    "width": image.width,
-                    "height": image.height,
-                    "mime_type": image.mime_type,
-                    "fingerprint": image.source_fingerprint,
-                }
-            )
+        # Prefer the full eligible media frozen at conversion (all product images),
+        # not only images this batch processed. Replacing baseline with the processed
+        # subset made later webhooks treat sibling gallery images as NEW.
+        media_snapshot: list[dict] = []
+        baseline_blob = batch_product.baseline_snapshot_json
+        if isinstance(baseline_blob, dict):
+            raw_media = baseline_blob.get("media")
+            if isinstance(raw_media, list) and raw_media:
+                media_snapshot = [dict(m) for m in raw_media if isinstance(m, dict)]
+            product_from_baseline = baseline_blob.get("product")
+            if isinstance(product_from_baseline, dict) and product_from_baseline:
+                product_snapshot = product_from_baseline
+        if not media_snapshot:
+            for image in batch_product.images:
+                if image.status != BatchImageStatus.COMPLETED:
+                    continue
+                media_snapshot.append(
+                    {
+                        "media_gid": image.shopify_media_gid,
+                        "file_gid": image.shopify_file_gid,
+                        "cdn_url": image.cdn_url,
+                        "filename": image.original_filename,
+                        "width": image.width,
+                        "height": image.height,
+                        "mime_type": image.mime_type,
+                        "fingerprint": image.source_fingerprint,
+                    }
+                )
 
         if baseline is None:
             baseline = ProcessingBaseline(

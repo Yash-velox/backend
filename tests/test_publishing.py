@@ -14,7 +14,9 @@ from app.models import (
     BatchProductStatus,
     BatchStatus,
     DeltaType,
+    ProcessingBaseline,
     ProcessingBatch,
+    Product,
     ProductPublishOperation,
     PublishStatus,
     PublishTriggerSource,
@@ -641,3 +643,61 @@ def test_normalize_publish_snapshot_from_graphql():
     assert snap["product_gid"] == "gid://shopify/Product/1"
     assert len(snap["media"]) == 1
     assert snap["variants"][0]["media_gid"] == "gid://shopify/MediaImage/1"
+
+
+def test_advance_processing_baseline_after_publish(db_session, shop):
+    """After publish, ProcessingBaseline must match final Shopify media (new GIDs/CDN)."""
+    catalog = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/1",
+        title="Pub",
+        status="ACTIVE",
+    )
+    db_session.add(catalog)
+    db_session.flush()
+    db_session.add(
+        ProcessingBaseline(
+            shop_id=shop.id,
+            product_id=catalog.id,
+            media_snapshot_json=[_media("gid://shopify/MediaImage/10", 0)],
+        )
+    )
+    batch = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.MANUAL,
+        status=BatchStatus.COMPLETED,
+        product_count=1,
+        image_count=1,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    bp = BatchProduct(
+        batch_id=batch.id,
+        shop_id=shop.id,
+        product_id=catalog.id,
+        shopify_product_gid=catalog.shopify_product_gid,
+        status=BatchProductStatus.COMPLETED,
+        image_count=1,
+        product_snapshot_json={"product_gid": catalog.shopify_product_gid, "title": "Pub"},
+        baseline_snapshot_json={"media": [_media("gid://shopify/MediaImage/10", 0)]},
+    )
+    db_session.add(bp)
+    db_session.commit()
+
+    final = _snapshot(
+        [
+            _media("gid://shopify/MediaImage/999", 0, alt="ai", featured=True),
+            _media("gid://shopify/MediaImage/11", 1, alt="other"),
+        ]
+    )
+    ProductPublisher(db_session, shop, client=MagicMock())._advance_processing_baseline_after_publish(bp, final)
+    db_session.commit()
+
+    baseline = (
+        db_session.query(ProcessingBaseline)
+        .filter(ProcessingBaseline.product_id == catalog.id)
+        .one()
+    )
+    gids = {m["media_gid"] for m in (baseline.media_snapshot_json or [])}
+    assert gids == {"gid://shopify/MediaImage/999", "gid://shopify/MediaImage/11"}
+    assert "gid://shopify/MediaImage/10" not in gids

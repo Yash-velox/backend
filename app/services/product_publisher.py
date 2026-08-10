@@ -10,7 +10,14 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.core.shop_resolver import create_shopify_graphql_client
-from app.models import BatchProduct, ProductPublishOperation, PublishStatus, Shop
+from app.models import (
+    BatchProduct,
+    ProcessingBaseline,
+    Product,
+    ProductPublishOperation,
+    PublishStatus,
+    Shop,
+)
 from app.services.output_storage import get_output_storage
 from app.services.publish_compensation import PublishCompensationError, PublishCompensationService
 from app.services.publish_conflict import compare_publish_snapshots, heal_empty_publish_baseline
@@ -26,6 +33,7 @@ from app.services.shopify_file_upload import (
     validate_png_file,
 )
 from app.services.shopify_graphql import ShopifyGraphQLClient, ShopifyGraphQLError
+from app.services.snapshot import media_snapshots_from_shopify
 
 logger = logging.getLogger("app.services.product_publisher")
 
@@ -354,6 +362,11 @@ class ProductPublisher:
             op.last_error_message = None
             product.publish_status = PublishStatus.PUBLISHED
 
+            # Freeze ProcessingBaseline to the post-publish media set before commit so
+            # Shopify products/update webhooks caused by this publish do not convert
+            # into a new automatic Primary batch (publish → webhook feedback loop).
+            self._advance_processing_baseline_after_publish(product, final)
+
             try:
                 from app.services.image_versions import ImageVersionsService
                 from app.services.media_versions import MediaVersionsService
@@ -449,6 +462,67 @@ class ProductPublisher:
         except (PublishCompensationError, ShopifyGraphQLError) as restore_exc:
             code = getattr(restore_exc, "code", "PUBLISH_RESTORE_FAILED")
             return self._fail_restore(op, product, code, str(restore_exc))
+
+    def _advance_processing_baseline_after_publish(
+        self,
+        batch_product: BatchProduct,
+        final_snapshot: dict[str, Any],
+    ) -> None:
+        """Point ProcessingBaseline at the live post-publish media GIDs/CDN URLs."""
+        catalog_product: Product | None = None
+        if batch_product.product_id:
+            catalog_product = self.db.get(Product, batch_product.product_id)
+        if catalog_product is None:
+            catalog_product = (
+                self.db.query(Product)
+                .filter(
+                    Product.shop_id == self.shop.id,
+                    Product.shopify_product_gid == batch_product.shopify_product_gid,
+                )
+                .one_or_none()
+            )
+        if catalog_product is None:
+            logger.warning(
+                "Skip ProcessingBaseline advance after publish; catalog product missing | product=%s",
+                batch_product.shopify_product_gid,
+            )
+            return
+
+        media_rows = [
+            {**row, "is_visible": True}
+            for row in (final_snapshot.get("media") or [])
+            if isinstance(row, dict)
+        ]
+        media_snapshot = media_snapshots_from_shopify(media_rows, visible_only=False)
+        now = datetime.now(timezone.utc)
+
+        baseline = (
+            self.db.query(ProcessingBaseline)
+            .filter(
+                ProcessingBaseline.shop_id == self.shop.id,
+                ProcessingBaseline.product_id == catalog_product.id,
+            )
+            .one_or_none()
+        )
+        if baseline is None:
+            baseline = ProcessingBaseline(shop_id=self.shop.id, product_id=catalog_product.id)
+            self.db.add(baseline)
+
+        product_snapshot = batch_product.product_snapshot_json or {}
+        if isinstance(batch_product.baseline_snapshot_json, dict):
+            nested = batch_product.baseline_snapshot_json.get("product")
+            if isinstance(nested, dict) and nested:
+                product_snapshot = nested
+        baseline.product_snapshot_json = product_snapshot
+        baseline.media_snapshot_json = media_snapshot
+        baseline.successfully_processed_at = now
+        baseline.evaluated_at = now
+        self.db.flush()
+        logger.info(
+            "ProcessingBaseline advanced after publish | product=%s media=%s",
+            batch_product.shopify_product_gid,
+            len(media_snapshot),
+        )
 
     def _set_stage(
         self,
