@@ -6,7 +6,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.core.shop_resolver import resolve_shop_access_token
+from app.core.shop_resolver import create_shopify_graphql_client
 from app.models import (
     Product,
     ProductMedia,
@@ -17,7 +17,7 @@ from app.models import (
     SyncRunStatus,
     SyncRunType,
 )
-from app.services.shopify_graphql import ShopifyGraphQLClient, ShopifyGraphQLError
+from app.services.shopify_graphql import ShopifyGraphQLError
 from app.services.snapshot import media_fingerprint, normalize_shopify_product_node
 
 logger = logging.getLogger("app.services.catalog_sync")
@@ -28,9 +28,8 @@ class CatalogSyncService:
         self.db = db
         self.shop = shop
 
-    def _client(self) -> ShopifyGraphQLClient:
-        token = resolve_shop_access_token(self.shop, db=self.db)
-        return ShopifyGraphQLClient(shop_domain=self.shop.shop_domain, access_token=token)
+    def _client(self):
+        return create_shopify_graphql_client(self.db, self.shop)
 
     def get_latest_run(self) -> SyncRun | None:
         return (

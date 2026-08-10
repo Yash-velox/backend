@@ -11,7 +11,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.core.shop_resolver import resolve_shop_access_token
+from app.core.shop_resolver import create_shopify_graphql_client
 from app.models import ProcessingQueueItem, QueueItemStatus, Shop, SourceType
 from app.services.shopify_graphql import ShopifyGraphQLClient, ShopifyGraphQLError
 
@@ -133,8 +133,7 @@ class ShopifyImageSourceService:
         unique_gids = list(dict.fromkeys(gids))
         client = graphql_client
         if client is None:
-            token = resolve_shop_access_token(self.shop, db=self.db)
-            client = ShopifyGraphQLClient(shop_domain=self.shop.shop_domain, access_token=token)
+            client = create_shopify_graphql_client(self.db, self.shop)
 
         products_found = 0
         images_found = 0

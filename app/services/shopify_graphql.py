@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -12,9 +13,16 @@ logger = logging.getLogger("app.services.shopify_graphql")
 
 
 class ShopifyGraphQLError(RuntimeError):
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        status_code: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.status_code = status_code
 
 
 PRODUCT_MEDIA_QUERY = """
@@ -363,11 +371,20 @@ query JobStatus($id: ID!) {
 class ShopifyGraphQLClient:
     """Admin GraphQL client for catalog reads and product media publishing."""
 
-    def __init__(self, *, shop_domain: str, access_token: str, api_version: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        shop_domain: str,
+        access_token: str,
+        api_version: str | None = None,
+        refresh_access_token: Callable[[], str] | None = None,
+    ) -> None:
         domain = shop_domain.replace("https://", "").replace("http://", "").rstrip("/")
         version = api_version or settings.shopify_api_version
         self.shop_domain = domain
         self._url = f"https://{domain}/admin/api/{version}/graphql.json"
+        self._refresh_access_token = refresh_access_token
+        self._unauthorized_retried = False
         self._headers = {
             "X-Shopify-Access-Token": access_token,
             "Content-Type": "application/json",
@@ -388,6 +405,31 @@ class ShopifyGraphQLClient:
         try:
             return self._execute_once(payload)
         except ShopifyGraphQLError as exc:
+            # Scenario 1: auth failed → refresh shops token once, then retry the same call.
+            if (
+                exc.status_code == 401
+                and self._refresh_access_token is not None
+                and not self._unauthorized_retried
+            ):
+                self._unauthorized_retried = True
+                logger.warning(
+                    "Shopify GraphQL 401 — refreshing shops token and retrying | shop=%s",
+                    self.shop_domain,
+                )
+                try:
+                    new_token = self._refresh_access_token()
+                except Exception as refresh_exc:
+                    logger.error(
+                        "Shopify token refresh after 401 failed | shop=%s error=%s",
+                        self.shop_domain,
+                        refresh_exc,
+                    )
+                    raise exc from refresh_exc
+                if not new_token:
+                    raise
+                self._headers["X-Shopify-Access-Token"] = new_token
+                return self._execute_once(payload)
+
             if allow_retry and exc.retryable:
                 logger.warning(
                     "Shopify GraphQL retry | shop=%s error=%s",
@@ -410,11 +452,13 @@ class ShopifyGraphQLClient:
             raise ShopifyGraphQLError(
                 f"Shopify GraphQL temporary error HTTP {response.status_code}",
                 retryable=True,
+                status_code=response.status_code,
             )
         if response.status_code >= 400:
             raise ShopifyGraphQLError(
                 f"Shopify GraphQL error HTTP {response.status_code}",
                 retryable=False,
+                status_code=response.status_code,
             )
 
         body = response.json()

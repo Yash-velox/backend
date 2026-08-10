@@ -10,7 +10,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.core.shop_resolver import resolve_shop_access_token
+from app.core.shop_resolver import create_shopify_graphql_client
 from app.models import (
     ProductMediaVersion,
     ProductRollbackOperation,
@@ -254,10 +254,9 @@ class ProductRollbackService:
             self.client = client
         else:
             try:
-                token = resolve_shop_access_token(shop, db=self.db)
+                self.client = create_shopify_graphql_client(db, shop)
             except RuntimeError as exc:
                 raise RollbackError("SHOPIFY_SCOPE_MISSING", str(exc)) from exc
-            self.client = ShopifyGraphQLClient(shop_domain=shop.shop_domain, access_token=token)
         self.compensation = PublishCompensationService(self.client)
 
     def enqueue(

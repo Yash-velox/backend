@@ -9,7 +9,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.core.shop_resolver import resolve_shop_access_token
+from app.core.shop_resolver import create_shopify_graphql_client
 from app.models import BatchProduct, ProductPublishOperation, PublishStatus, Shop
 from app.services.output_storage import get_output_storage
 from app.services.publish_compensation import PublishCompensationError, PublishCompensationService
@@ -45,10 +45,9 @@ class ProductPublisher:
             self.client = client
         else:
             try:
-                token = resolve_shop_access_token(shop, db=self.db)
+                self.client = create_shopify_graphql_client(db, shop)
             except RuntimeError as exc:
                 raise ProductPublisherError("SHOPIFY_SCOPE_MISSING", str(exc)) from exc
-            self.client = ShopifyGraphQLClient(shop_domain=shop.shop_domain, access_token=token)
         self.uploader = ShopifyFileUploadService(self.client)
         self.compensation = PublishCompensationService(self.client)
 

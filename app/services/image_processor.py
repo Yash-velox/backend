@@ -12,7 +12,7 @@ import httpx
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
-from app.core.shop_resolver import resolve_shop_access_token
+from app.core.shop_resolver import create_shopify_graphql_client
 from app.models import (
     AttemptStatus,
     BatchImage,
@@ -36,7 +36,6 @@ from app.services.shopify_file_upload import (
     ShopifyFileUploadService,
     validate_generated_png_for_shopify,
 )
-from app.services.shopify_graphql import ShopifyGraphQLClient
 from app.services.state_machine import BATCH_IMAGE_TRANSITIONS, BATCH_PRODUCT_TRANSITIONS, assert_transition
 
 logger = logging.getLogger("app.services.image_processor")
@@ -404,11 +403,10 @@ class ImageProcessor:
             existing_gid = prior_version.shopify_file_gid
 
         try:
-            token = resolve_shop_access_token(shop, db=self.db)
+            client = create_shopify_graphql_client(self.db, shop)
         except RuntimeError as exc:
             raise ProcessingError(str(exc), code="SHOPIFY_TOKEN_MISSING", retryable=True) from exc
 
-        client = ShopifyGraphQLClient(shop_domain=shop.shop_domain, access_token=token)
         uploader = ShopifyFileUploadService(client)
         try:
             result = uploader.upload_png(

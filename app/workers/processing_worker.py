@@ -32,6 +32,7 @@ class ProcessingWorker:
         self.worker_id = settings.effective_worker_id
         self._task: asyncio.Task | None = None
         self._recover_task: asyncio.Task | None = None
+        self._token_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
     async def start(self) -> None:
@@ -55,18 +56,23 @@ class ProcessingWorker:
             self._recover_loop(),
             name=f"processing-recover-{self.worker_id}",
         )
+        self._token_task = asyncio.create_task(
+            self._token_refresh_loop(),
+            name=f"processing-token-refresh-{self.worker_id}",
+        )
         logger.info(
-            "Processing worker started | worker_id=%s auto=%s poll=%ss concurrency=%s stale=%ss",
+            "Processing worker started | worker_id=%s auto=%s poll=%ss concurrency=%s stale=%ss token_check=%ss",
             self.worker_id,
             settings.auto_processing_enabled,
             settings.processing_poll_interval_seconds,
             settings.processing_batch_concurrency,
             settings.processing_stale_lock_seconds,
+            settings.shopify_token_refresh_check_seconds,
         )
 
     async def stop(self) -> None:
         self._stop.set()
-        for task in (self._task, self._recover_task):
+        for task in (self._task, self._recover_task, self._token_task):
             if not task:
                 continue
             try:
@@ -79,6 +85,7 @@ class ProcessingWorker:
                     pass
         self._task = None
         self._recover_task = None
+        self._token_task = None
         logger.info("Processing worker stopped | worker_id=%s", self.worker_id)
 
     async def _recover_loop(self) -> None:
@@ -95,6 +102,43 @@ class ProcessingWorker:
                 )
             except asyncio.TimeoutError:
                 continue
+
+    async def _token_refresh_loop(self) -> None:
+        """Scenario 2: every ~23h, refresh due Shopify Admin tokens into shops."""
+        # Run once at startup so a stale UAT token is fixed without waiting an hour.
+        try:
+            await asyncio.to_thread(self._refresh_due_tokens)
+        except Exception:
+            logger.exception("Startup Shopify token refresh failed | worker_id=%s", self.worker_id)
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(),
+                    timeout=max(60, int(settings.shopify_token_refresh_check_seconds)),
+                )
+            except asyncio.TimeoutError:
+                pass
+            if self._stop.is_set():
+                break
+            try:
+                await asyncio.to_thread(self._refresh_due_tokens)
+            except Exception:
+                logger.exception("Shopify token refresh loop error | worker_id=%s", self.worker_id)
+
+    def _refresh_due_tokens(self) -> None:
+        from app.services.shopify_token_refresh import refresh_due_shop_tokens
+
+        db = SessionLocal()
+        try:
+            refreshed = refresh_due_shop_tokens(db)
+            if refreshed:
+                logger.info(
+                    "Proactive Shopify token refresh finished | refreshed=%s worker_id=%s",
+                    refreshed,
+                    self.worker_id,
+                )
+        finally:
+            db.close()
 
     async def _run_loop(self) -> None:
         await asyncio.to_thread(self._recover_stale)

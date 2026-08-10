@@ -125,8 +125,7 @@ def mark_shop_uninstalled(db: Session, shop_domain: str) -> Shop | None:
 def resolve_shop_access_token(shop: Shop, db: Session | None = None) -> str:
     """Return Admin API token from the shops table only (never SHOPIFY_DEV_ACCESS_TOKEN).
 
-    When ``db`` is provided and ``token_expires_at`` is near/past expiry, refreshes the
-    token (refresh_token grant or client_credentials) and persists the new value first.
+    When ``db`` is provided and the token is due (~23h / near expiry), refreshes into shops first.
     """
     working = shop
     if db is not None:
@@ -140,7 +139,7 @@ def resolve_shop_access_token(shop: Shop, db: Session | None = None) -> str:
             try:
                 working = refresh_shop_access_token(db, working)
             except ShopifyTokenRefreshError as exc:
-                # Keep attempting with the stored token; callers still surface Shopify 401 if dead.
+                # Keep attempting with the stored token; GraphQL 401 path force-refreshes.
                 import logging
 
                 logging.getLogger("app.core.shop_resolver").warning(
@@ -157,6 +156,27 @@ def resolve_shop_access_token(shop: Shop, db: Session | None = None) -> str:
     raise RuntimeError(
         "Shopify access token is not available in the shops table for this shop. "
         "Reinstall the app (install handoff) or refresh the token into shops."
+    )
+
+
+def create_shopify_graphql_client(db: Session, shop: Shop):
+    """Build a GraphQL client that reads shops tokens and refreshes on HTTP 401."""
+    from app.services.shopify_graphql import ShopifyGraphQLClient
+    from app.services.shopify_token_refresh import refresh_shop_access_token
+
+    token = resolve_shop_access_token(shop, db=db)
+
+    def _refresh_after_unauthorized() -> str:
+        refreshed = refresh_shop_access_token(db, shop, force=True)
+        new_token = decrypt_token(refreshed.encrypted_access_token or "")
+        if not new_token:
+            raise RuntimeError("Shopify token refresh returned an empty access token")
+        return new_token
+
+    return ShopifyGraphQLClient(
+        shop_domain=shop.shop_domain,
+        access_token=token,
+        refresh_access_token=_refresh_after_unauthorized,
     )
 
 

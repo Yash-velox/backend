@@ -77,6 +77,10 @@ class Settings(BaseSettings):
     shopify_api_version: str = "2026-07"
     # Optional bootstrap seed for first shop create in dev/uat only. API calls never read this.
     shopify_dev_access_token: str = ""
+    # Proactive Admin token refresh cadence (client-credentials / expiring offline ~24h).
+    shopify_token_proactive_refresh_hours: float = 23.0
+    # How often the worker checks whether shops need a proactive token refresh.
+    shopify_token_refresh_check_seconds: int = 3600
 
     # Shopify publishing
     publish_product_concurrency: int = 2

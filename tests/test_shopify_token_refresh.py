@@ -3,21 +3,29 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from app.core.crypto import encrypt_token
 from app.core.shop_resolver import resolve_shop_access_token, upsert_shop_install
 from app.models import Shop
+from app.services.shopify_graphql import ShopifyGraphQLClient, ShopifyGraphQLError
 from app.services.shopify_token_refresh import access_token_needs_refresh, refresh_shop_access_token
 
 
-def test_access_token_needs_refresh_respects_skew():
+def test_access_token_needs_refresh_every_23h_window():
     shop = Shop(shop_domain="a.myshopify.com")
-    shop.token_expires_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+    # Within final hour of a 24h token → due (≈23h cadence).
+    shop.token_expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)
     assert access_token_needs_refresh(shop) is True
+    # Still early in the 24h window.
     shop.token_expires_at = datetime.now(timezone.utc) + timedelta(hours=12)
     assert access_token_needs_refresh(shop) is False
+    # No expiry: use updated_at age.
     shop.token_expires_at = None
+    shop.updated_at = datetime.now(timezone.utc) - timedelta(hours=23, minutes=5)
+    shop.encrypted_access_token = encrypt_token("x")
+    assert access_token_needs_refresh(shop) is True
+    shop.updated_at = datetime.now(timezone.utc) - timedelta(hours=1)
     assert access_token_needs_refresh(shop) is False
 
 
@@ -107,3 +115,37 @@ def test_upsert_keeps_existing_expiry_when_omitted(db_session, shop):
     if stored.tzinfo is None:
         stored = stored.replace(tzinfo=timezone.utc)
     assert abs((stored - expires).total_seconds()) < 2
+
+
+def test_graphql_401_refreshes_token_and_retries():
+    refresh = MagicMock(return_value="shpat_new")
+    client = ShopifyGraphQLClient(
+        shop_domain="a.myshopify.com",
+        access_token="shpat_old",
+        refresh_access_token=refresh,
+    )
+
+    unauthorized = MagicMock(status_code=401, text="unauthorized")
+    ok = MagicMock(status_code=200)
+    ok.json.return_value = {"data": {"shop": {"name": "A"}}}
+
+    with patch("app.services.shopify_graphql.httpx.post", side_effect=[unauthorized, ok]) as posted:
+        data = client.execute("{ shop { name } }")
+
+    assert data == {"shop": {"name": "A"}}
+    refresh.assert_called_once()
+    assert posted.call_count == 2
+    assert client._headers["X-Shopify-Access-Token"] == "shpat_new"
+
+
+def test_graphql_401_without_refresh_callback_raises():
+    client = ShopifyGraphQLClient(shop_domain="a.myshopify.com", access_token="shpat_old")
+    with patch(
+        "app.services.shopify_graphql.httpx.post",
+        return_value=MagicMock(status_code=401, text="unauthorized"),
+    ):
+        try:
+            client.execute("{ shop { name } }")
+            raise AssertionError("expected ShopifyGraphQLError")
+        except ShopifyGraphQLError as exc:
+            assert exc.status_code == 401

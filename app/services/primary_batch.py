@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
-from app.core.shop_resolver import ensure_shop_settings, resolve_shop_access_token
+from app.core.shop_resolver import ensure_shop_settings, create_shopify_graphql_client
 from app.models import (
     BatchImage,
     BatchImageStatus,
@@ -30,7 +30,7 @@ from app.models import (
 from app.services.catalog_sync import CatalogSyncService
 from app.services.delta import compare_media_snapshots
 from app.services.prompt_resolver import PromptResolverError, assert_product_prompts_ready
-from app.services.shopify_graphql import ShopifyGraphQLClient, ShopifyGraphQLError
+from app.services.shopify_graphql import ShopifyGraphQLError
 from app.services.snapshot import media_snapshots_from_models, product_snapshot_from_model
 from app.services.state_machine import (
     BATCH_PRODUCT_TRANSITIONS,
@@ -165,8 +165,7 @@ class PrimaryBatchService:
         if product is not None:
             return product
         try:
-            token = resolve_shop_access_token(self.shop, db=self.db)
-            client = ShopifyGraphQLClient(shop_domain=self.shop.shop_domain, access_token=token)
+            client = create_shopify_graphql_client(self.db, self.shop)
             node = client.fetch_product_by_gid(product_gid)
             if not node:
                 return None

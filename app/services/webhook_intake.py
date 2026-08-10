@@ -6,12 +6,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session, selectinload
 
-from app.core.shop_resolver import get_shop_by_domain, resolve_shop_access_token
+from app.core.shop_resolver import create_shopify_graphql_client, get_shop_by_domain
 from app.models import Product, WebhookEvent, WebhookProcessingResult
 from app.services.catalog_sync import CatalogSyncService
 from app.services.primary_batch import PrimaryBatchService
 from app.services.secondary_queue import SecondaryQueueService
-from app.services.shopify_graphql import ShopifyGraphQLClient, ShopifyGraphQLError
+from app.services.shopify_graphql import ShopifyGraphQLError
 from app.services.snapshot import (
     media_snapshots_from_shopify,
     normalize_shopify_product_node,
@@ -291,8 +291,7 @@ class WebhookIntakeService:
         graphql_ok = False
 
         try:
-            token = resolve_shop_access_token(shop, db=self.db)
-            client = ShopifyGraphQLClient(shop_domain=shop.shop_domain, access_token=token)
+            client = create_shopify_graphql_client(self.db, shop)
             node = client.fetch_product_by_gid(product_gid)
             if node:
                 normalized = normalize_shopify_product_node(node)

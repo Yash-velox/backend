@@ -12,12 +12,9 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.core.crypto import decrypt_token
-from app.models import Shop
+from app.models import Shop, ShopStatus
 
 logger = logging.getLogger("app.services.shopify_token_refresh")
-
-# Refresh a few minutes early so workers do not race the hard expiry.
-_REFRESH_SKEW = timedelta(minutes=5)
 
 
 class ShopifyTokenRefreshError(RuntimeError):
@@ -26,15 +23,33 @@ class ShopifyTokenRefreshError(RuntimeError):
         self.retryable = retryable
 
 
+def _ensure_aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
 def access_token_needs_refresh(shop: Shop, *, now: datetime | None = None) -> bool:
-    """True when shops.token_expires_at is near or past expiry."""
-    if shop.token_expires_at is None:
-        return False
+    """True when the shops token should be rotated proactively (~every 23h).
+
+    Two triggers:
+    - ``token_expires_at`` within 1 hour of expiry (≈ hour 23 of a 24h token)
+    - no expiry, but ``updated_at`` is older than ``shopify_token_proactive_refresh_hours``
+    """
     current = now or datetime.now(timezone.utc)
-    expires = shop.token_expires_at
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    return expires <= current + _REFRESH_SKEW
+    proactive = timedelta(hours=float(settings.shopify_token_proactive_refresh_hours))
+
+    if shop.token_expires_at is not None:
+        expires = _ensure_aware(shop.token_expires_at)
+        # Refresh one hour before hard expiry for a typical 24h token → ~23h cadence.
+        return expires <= current + timedelta(hours=1)
+
+    if shop.updated_at is not None:
+        updated = _ensure_aware(shop.updated_at)
+        return updated <= current - proactive
+
+    # Unknown age with a stored token — refresh when credentials exist (handled by caller).
+    return bool(shop.encrypted_access_token)
 
 
 def _normalize_shop_domain(shop_domain: str) -> str:
@@ -78,7 +93,7 @@ def _request_access_token(shop_domain: str, form: dict[str, str]) -> dict[str, A
 
 
 def refresh_shop_access_token(db: Session, shop: Shop, *, force: bool = False) -> Shop:
-    """Refresh shop Admin API token when expired (or force) and write shops row."""
+    """Refresh shop Admin API token when due (or force) and write shops row."""
     # Local import avoids circular import with shop_resolver.
     from app.core.shop_resolver import upsert_shop_install
 
@@ -133,3 +148,31 @@ def refresh_shop_access_token(db: Session, shop: Shop, *, force: bool = False) -
         refresh_token=new_refresh,
         token_expires_at=expires_at,
     )
+
+
+def refresh_due_shop_tokens(db: Session) -> int:
+    """Proactively refresh every active shop whose token is due (~23h). Returns count refreshed."""
+    shops = (
+        db.query(Shop)
+        .filter(
+            Shop.status == ShopStatus.ACTIVE,
+            Shop.encrypted_access_token.isnot(None),
+        )
+        .all()
+    )
+    refreshed = 0
+    for shop in shops:
+        if not access_token_needs_refresh(shop):
+            continue
+        try:
+            refresh_shop_access_token(db, shop, force=True)
+            refreshed += 1
+        except ShopifyTokenRefreshError as exc:
+            logger.warning(
+                "Proactive Shopify token refresh failed | shop=%s error=%s",
+                shop.shop_domain,
+                exc,
+            )
+        except Exception:
+            logger.exception("Proactive Shopify token refresh crashed | shop=%s", shop.shop_domain)
+    return refreshed
