@@ -78,6 +78,20 @@ def test_internal_hmac_valid_and_expired(monkeypatch):
     assert not verify_internal_signature(body, timestamp="1", signature=sig, max_age_seconds=10)
 
 
+def test_internal_hmac_accepts_millisecond_timestamps(monkeypatch):
+    """Node historically signed with Date.now() (ms); age check must not reject those."""
+    import hashlib
+    import hmac
+    import time
+
+    monkeypatch.setattr("app.config.settings.internal_handoff_secret", "test-secret")
+    monkeypatch.setattr("app.core.crypto.settings.internal_handoff_secret", "test-secret")
+    body = b'{"shop":"x.myshopify.com"}'
+    ts_ms = str(int(time.time() * 1000))
+    sig = hmac.new(b"test-secret", f"{ts_ms}.".encode() + body, hashlib.sha256).hexdigest()
+    assert verify_internal_signature(body, timestamp=ts_ms, signature=sig, max_age_seconds=300)
+
+
 def test_media_fingerprint_ignores_alt_for_content():
     a = {
         "shopify_media_gid": "gid://shopify/MediaImage/1",

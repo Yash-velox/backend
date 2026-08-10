@@ -52,8 +52,11 @@ def verify_internal_signature(
         ts = int(timestamp)
     except ValueError:
         return False
+    # Node historically sent Date.now() (ms). Accept either unit for age checks,
+    # but HMAC still uses the raw timestamp string the caller signed with.
+    ts_seconds = ts // 1000 if ts > 10_000_000_000 else ts
     now = int(time.time())
-    if abs(now - ts) > max_age_seconds:
+    if abs(now - ts_seconds) > max_age_seconds:
         return False
     secret = (settings.internal_handoff_secret or settings.app_secret or "").encode("utf-8")
     expected = hmac.new(secret, f"{timestamp}.".encode("utf-8") + body, hashlib.sha256).hexdigest()
