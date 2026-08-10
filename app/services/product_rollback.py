@@ -91,89 +91,220 @@ def _is_distinct_file_gid(file_gid: str | None, media_gid: str | None) -> bool:
     return True
 
 
-def _media_identity(m: dict[str, Any]) -> str | None:
-    """Best-effort stable identity across detach/reattach rematerialization."""
+def _media_identities(m: dict[str, Any]) -> set[str]:
+    """All stable identity keys for one media row (File GID, CDN path, MediaImage GID).
+
+    Using a *set* (not a single preferred key) avoids false conflicts when one snapshot
+    has a CDN URL and the other only has a MediaImage GID for the same asset.
+    """
     if not isinstance(m, dict):
-        return None
+        return set()
+    ids: set[str] = set()
     media_gid = m.get("media_gid")
     file_gid = m.get("file_gid")
     if _is_distinct_file_gid(file_gid, media_gid):
-        return f"file:{file_gid}"
+        ids.add(f"file:{file_gid}")
     cdn = _cdn_identity(m.get("cdn_url"))
     if cdn:
-        return f"cdn:{cdn}"
+        ids.add(f"cdn:{cdn}")
     if media_gid:
-        return f"media:{media_gid}"
-    if file_gid:
-        return f"file:{file_gid}"
-    return None
+        ids.add(f"media:{media_gid}")
+    elif file_gid:
+        ids.add(f"file:{file_gid}")
+    return ids
+
+
+def _media_identity(m: dict[str, Any]) -> str | None:
+    """Primary display/match key: prefer distinct File GID, then CDN path, then media GID."""
+    ids = _media_identities(m)
+    if not ids:
+        return None
+    for prefix in ("file:", "cdn:", "media:"):
+        for key in sorted(ids):
+            if key.startswith(prefix):
+                return key
+    return sorted(ids)[0]
 
 
 def _identity_index(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Map every identity key → media row (multi-key; same row may appear under several keys)."""
     out: dict[str, dict[str, Any]] = {}
     for m in snapshot.get("media") or []:
-        key = _media_identity(m)
-        if key and key not in out:
-            out[key] = m
+        if not isinstance(m, dict):
+            continue
+        for key in _media_identities(m):
+            if key not in out:
+                out[key] = m
     return out
 
 
-def _gid_to_identity(snapshot: dict[str, Any]) -> dict[str, str]:
-    mapping: dict[str, str] = {}
+def _match_media_rows(
+    expected: dict[str, Any],
+    live: dict[str, Any],
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any], str]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Pair expected↔live rows when any identity overlaps. Returns (pairs, unmatched_exp, unmatched_live)."""
+    exp_rows = [m for m in (expected.get("media") or []) if isinstance(m, dict)]
+    live_rows = [m for m in (live.get("media") or []) if isinstance(m, dict)]
+    live_used: set[int] = set()
+    pairs: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    unmatched_exp: list[dict[str, Any]] = []
+
+    for exp in exp_rows:
+        exp_ids = _media_identities(exp)
+        matched_idx: int | None = None
+        shared_key: str | None = None
+        for idx, live_row in enumerate(live_rows):
+            if idx in live_used:
+                continue
+            overlap = exp_ids & _media_identities(live_row)
+            if overlap:
+                matched_idx = idx
+                # Prefer CDN/file keys in the shared label for conflict reporting.
+                shared_key = next(
+                    (k for prefix in ("file:", "cdn:", "media:") for k in sorted(overlap) if k.startswith(prefix)),
+                    sorted(overlap)[0],
+                )
+                break
+        if matched_idx is None or shared_key is None:
+            unmatched_exp.append(exp)
+        else:
+            live_used.add(matched_idx)
+            pairs.append((exp, live_rows[matched_idx], shared_key))
+
+    unmatched_live = [live_rows[i] for i in range(len(live_rows)) if i not in live_used]
+    return pairs, unmatched_exp, unmatched_live
+
+
+def _gid_to_identities(snapshot: dict[str, Any]) -> dict[str, set[str]]:
+    mapping: dict[str, set[str]] = {}
     for m in snapshot.get("media") or []:
-        key = _media_identity(m)
-        if not key:
+        if not isinstance(m, dict):
+            continue
+        ids = _media_identities(m)
+        if not ids:
             continue
         for gid in (m.get("media_gid"), m.get("file_gid")):
             if gid:
-                mapping[str(gid)] = key
+                mapping[str(gid)] = ids
     return mapping
 
 
-def _ordered_identities(snapshot: dict[str, Any]) -> list[str]:
-    rows = sorted(snapshot.get("media") or [], key=lambda x: x.get("position") or 0)
-    return [key for m in rows if (key := _media_identity(m))]
+def _identities_overlap(a: set[str] | None, b: set[str] | None) -> bool:
+    if not a or not b:
+        return False
+    return bool(a & b)
+
+
+def _row_label(m: dict[str, Any]) -> str:
+    key = _media_identity(m)
+    if key:
+        return key
+    return m.get("filename") or m.get("media_gid") or m.get("file_gid") or "unknown"
+
+
+def _ordered_match_keys(
+    snapshot: dict[str, Any],
+    pair_key_by_row_id: dict[int, str],
+) -> list[str]:
+    rows = sorted(
+        (m for m in (snapshot.get("media") or []) if isinstance(m, dict)),
+        key=lambda x: x.get("position") or 0,
+    )
+    out: list[str] = []
+    for m in rows:
+        key = pair_key_by_row_id.get(id(m)) or _media_identity(m)
+        if key:
+            out.append(key)
+    return out
+
+
+def humanize_conflict_details(conflict: dict[str, Any] | None) -> str:
+    """Merchant-facing summary of structured conflictDetails."""
+    if not conflict:
+        return "Live Shopify product media no longer matches the active version"
+    parts: list[str] = []
+    removed = conflict.get("removedMediaIds") or []
+    added = conflict.get("addedMediaIds") or []
+    if removed:
+        labels = [_short_identity(x) for x in removed[:5]]
+        extra = f" (+{len(removed) - 5} more)" if len(removed) > 5 else ""
+        parts.append(
+            "Active version expects image(s) not found on live Shopify: " + ", ".join(labels) + extra
+        )
+    if added:
+        labels = [_short_identity(x) for x in added[:5]]
+        extra = f" (+{len(added) - 5} more)" if len(added) > 5 else ""
+        parts.append("Live Shopify has extra image(s) not in the active version: " + ", ".join(labels) + extra)
+    if conflict.get("orderChanged"):
+        parts.append("Image order differs from the active version")
+    alt_changes = conflict.get("altChanges") or []
+    if alt_changes:
+        parts.append(f"Alt text differs on {len(alt_changes)} image(s)")
+    if conflict.get("featuredMediaChanged"):
+        parts.append("Featured image differs from the active version")
+    variant_changes = conflict.get("variantChanges") or []
+    if variant_changes:
+        parts.append(f"Variant image links differ on {len(variant_changes)} variant(s)")
+    if not parts:
+        return "Live Shopify product media no longer matches the active version"
+    return "; ".join(parts)
+
+
+def _short_identity(identity: str) -> str:
+    raw = str(identity)
+    if raw.startswith("cdn:"):
+        path = raw[4:]
+        return path.rsplit("/", 1)[-1] or path
+    if raw.startswith("file:") or raw.startswith("media:"):
+        return raw.split("/", 1)[-1] if "/" in raw else raw
+    return raw
 
 
 def _compare_by_files(expected: dict[str, Any], live: dict[str, Any]) -> dict[str, Any]:
     """Conflict check resilient to MediaImage GID rematerialization after attach/detach.
 
-    Snapshot `file_gid` often equals `media_gid` (GraphQL has no separate File id), so
-    GID-only fallbacks false-conflict when Shopify rematerializes MediaImage nodes for
-    the same CDN file. Prefer distinct File GIDs, then CDN path, then media GID.
+    Rows match when *any* identity overlaps (distinct File GID, CDN path, or MediaImage GID).
+    This avoids false conflicts when one side has a CDN URL and the other only a GID.
+    Falls back to GID-only compare_publish_snapshots when that reports no conflict.
     """
     media_conflict = compare_publish_snapshots(expected, live)
     if not media_conflict.get("hasConflict"):
         return media_conflict
 
-    exp_map = _identity_index(expected)
-    live_map = _identity_index(live)
-    exp_ids = set(exp_map)
-    live_ids = set(live_map)
-    added = sorted(live_ids - exp_ids)
-    removed = sorted(exp_ids - live_ids)
+    pairs, unmatched_exp, unmatched_live = _match_media_rows(expected, live)
+    removed = sorted(_row_label(m) for m in unmatched_exp)
+    added = sorted(_row_label(m) for m in unmatched_live)
     membership_changed = bool(added or removed)
 
-    exp_order = _ordered_identities(expected)
-    live_order = _ordered_identities(live)
-    shared_exp = [i for i in exp_order if i in live_ids]
-    shared_live = [i for i in live_order if i in exp_ids]
+    pair_key_by_exp_id = {id(exp): key for exp, _live, key in pairs}
+    pair_key_by_live_id = {id(live_row): key for _exp, live_row, key in pairs}
+    exp_order = _ordered_match_keys(expected, pair_key_by_exp_id)
+    live_order = _ordered_match_keys(live, pair_key_by_live_id)
+    shared_keys = {key for _e, _l, key in pairs}
+    shared_exp = [k for k in exp_order if k in shared_keys]
+    shared_live = [k for k in live_order if k in shared_keys]
     order_changed = shared_exp != shared_live
 
     alt_changes: list[dict[str, Any]] = []
-    for key in sorted(exp_ids & live_ids):
-        b_alt = exp_map[key].get("alt_text") or ""
-        l_alt = live_map[key].get("alt_text") or ""
+    for exp, live_row, key in pairs:
+        b_alt = exp.get("alt_text") or ""
+        l_alt = live_row.get("alt_text") or ""
         if b_alt != l_alt:
             alt_changes.append({"identity": key, "baseline": b_alt, "live": l_alt})
 
-    exp_gids = _gid_to_identity(expected)
-    live_gids = _gid_to_identity(live)
+    exp_gids = _gid_to_identities(expected)
+    live_gids = _gid_to_identities(live)
     featured_baseline = expected.get("featured_media_gid")
     featured_live = live.get("featured_media_gid")
-    featured_b_id = exp_gids.get(str(featured_baseline)) if featured_baseline else None
-    featured_l_id = live_gids.get(str(featured_live)) if featured_live else None
-    featured_changed = bool(featured_b_id and featured_l_id and featured_b_id != featured_l_id)
+    featured_b_ids = exp_gids.get(str(featured_baseline)) if featured_baseline else None
+    featured_l_ids = live_gids.get(str(featured_live)) if featured_live else None
+    if featured_baseline and featured_live:
+        if featured_b_ids and featured_l_ids:
+            featured_changed = not _identities_overlap(featured_b_ids, featured_l_ids)
+        else:
+            featured_changed = str(featured_baseline) != str(featured_live)
+    else:
+        featured_changed = bool(featured_baseline and featured_live)
 
     exp_variants = {
         v["variant_gid"]: v.get("media_gid")
@@ -189,14 +320,15 @@ def _compare_by_files(expected: dict[str, Any], live: dict[str, Any]) -> dict[st
     for vgid in sorted(set(exp_variants) | set(live_variants)):
         b_media = exp_variants.get(vgid)
         l_media = live_variants.get(vgid)
-        b_id = exp_gids.get(str(b_media)) if b_media else None
-        l_id = live_gids.get(str(l_media)) if l_media else None
-        if b_id != l_id:
+        b_ids = exp_gids.get(str(b_media)) if b_media else None
+        l_ids = live_gids.get(str(l_media)) if l_media else None
+        same = (not b_media and not l_media) or _identities_overlap(b_ids, l_ids)
+        if not same:
             variant_changes.append(
                 {
                     "variant_gid": vgid,
-                    "baseline_identity": b_id,
-                    "live_identity": l_id,
+                    "baseline_identity": _media_identity({"media_gid": b_media}) if b_media else None,
+                    "live_identity": _media_identity({"media_gid": l_media}) if l_media else None,
                     "baseline_media_gid": b_media,
                     "live_media_gid": l_media,
                 }
@@ -217,6 +349,18 @@ def _compare_by_files(expected: dict[str, Any], live: dict[str, Any]) -> dict[st
         "featuredLive": featured_live,
         "variantChanges": variant_changes,
         "reprocessRequired": membership_changed,
+        "summary": humanize_conflict_details(
+            {
+                "removedMediaIds": removed,
+                "addedMediaIds": added,
+                "orderChanged": order_changed,
+                "altChanges": alt_changes,
+                "featuredMediaChanged": featured_changed,
+                "variantChanges": variant_changes,
+            }
+        )
+        if has_conflict
+        else None,
     }
 
 
@@ -265,6 +409,7 @@ class ProductRollbackService:
         product_id: UUID,
         target_version_id: UUID,
         confirm: bool,
+        force_despite_conflict: bool = False,
     ) -> dict[str, Any]:
         if not confirm:
             raise RollbackError("ROLLBACK_CONFIRM_REQUIRED", "Explicit confirmation is required")
@@ -321,6 +466,7 @@ class ProductRollbackService:
                 existing.status = RollbackStatus.QUEUED
                 existing.current_stage = "QUEUED"
                 existing.attempt_number = (existing.attempt_number or 1) + 1
+                existing.force_despite_conflict = bool(force_despite_conflict)
                 existing.queued_at = datetime.now(timezone.utc)
                 existing.started_at = None
                 existing.completed_at = None
@@ -328,12 +474,22 @@ class ProductRollbackService:
                 existing.last_error_message = None
                 existing.locked_by = None
                 existing.locked_at = None
+                if force_despite_conflict:
+                    # Keep prior conflict details for audit; mark force intent.
+                    details = dict(existing.conflict_details or {})
+                    details["forceRequested"] = True
+                    existing.conflict_details = details
                 self.db.commit()
                 return {
                     "operationId": str(existing.id),
                     "status": existing.status.value,
-                    "message": "Rollback retry queued",
+                    "message": (
+                        "Rollback force retry queued"
+                        if force_despite_conflict
+                        else "Rollback retry queued"
+                    ),
                     "retried": True,
+                    "forceDespiteConflict": bool(force_despite_conflict),
                 }
 
         op = ProductRollbackOperation(
@@ -346,6 +502,7 @@ class ProductRollbackService:
             current_stage="QUEUED",
             idempotency_key=key,
             attempt_number=1,
+            force_despite_conflict=bool(force_despite_conflict),
             queued_at=datetime.now(timezone.utc),
         )
         self.db.add(op)
@@ -354,9 +511,10 @@ class ProductRollbackService:
             "operationId": str(op.id),
             "status": op.status.value,
             "message": "Rollback has been queued",
+            "forceDespiteConflict": bool(force_despite_conflict),
         }
 
-    def retry(self, operation_id: UUID) -> dict[str, Any]:
+    def retry(self, operation_id: UUID, *, force_despite_conflict: bool = False) -> dict[str, Any]:
         op = (
             self.db.query(ProductRollbackOperation)
             .filter(
@@ -380,6 +538,7 @@ class ProductRollbackService:
         op.status = RollbackStatus.QUEUED
         op.current_stage = "QUEUED"
         op.attempt_number = (op.attempt_number or 1) + 1
+        op.force_despite_conflict = bool(force_despite_conflict)
         op.queued_at = datetime.now(timezone.utc)
         op.started_at = None
         op.completed_at = None
@@ -387,8 +546,19 @@ class ProductRollbackService:
         op.locked_at = None
         op.last_error_code = None
         op.last_error_message = None
+        if force_despite_conflict:
+            details = dict(op.conflict_details or {})
+            details["forceRequested"] = True
+            op.conflict_details = details
         self.db.commit()
-        return {"operationId": str(op.id), "status": op.status.value, "message": "Rollback retry queued"}
+        return {
+            "operationId": str(op.id),
+            "status": op.status.value,
+            "message": (
+                "Rollback force retry queued" if force_despite_conflict else "Rollback retry queued"
+            ),
+            "forceDespiteConflict": bool(force_despite_conflict),
+        }
 
     def rollback_preview(self, product_id: UUID, target_version_id: UUID) -> dict[str, Any]:
         product = self.versions.get_product(product_id)
@@ -548,12 +718,24 @@ class ProductRollbackService:
 
             conflict = _compare_by_files(active.items_json or {}, live)
             if conflict.get("hasConflict"):
-                op.conflict_details = conflict
-                raise RollbackError(
-                    "ROLLBACK_CONFLICT",
-                    "Live Shopify product media no longer matches the active version",
-                    conflict=conflict,
-                )
+                details = dict(conflict)
+                if op.force_despite_conflict:
+                    details["forceApplied"] = True
+                    op.conflict_details = details
+                    self.db.flush()
+                    logger.warning(
+                        "Rollback continuing despite conflict (force) | op=%s product=%s summary=%s",
+                        op.id,
+                        op.shopify_product_gid,
+                        details.get("summary"),
+                    )
+                else:
+                    op.conflict_details = details
+                    raise RollbackError(
+                        "ROLLBACK_CONFLICT",
+                        humanize_conflict_details(details),
+                        conflict=details,
+                    )
 
             current_file_gids = [
                 m.get("file_gid") or m.get("media_gid") for m in (live.get("media") or [])
@@ -786,7 +968,10 @@ class ProductRollbackService:
         op.status = RollbackStatus.ROLLBACK_CONFLICT
         op.current_stage = "ROLLBACK_CONFLICT"
         op.last_error_code = exc.code
-        op.last_error_message = str(exc)[:2000]
+        message = str(exc)
+        if exc.conflict:
+            message = humanize_conflict_details(exc.conflict)
+        op.last_error_message = message[:2000]
         op.conflict_details = exc.conflict
         op.completed_at = datetime.now(timezone.utc)
         self.db.commit()

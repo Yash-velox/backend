@@ -522,3 +522,163 @@ def test_rollback_api_shop_scoped(client, db_session, shop):
     assert res.status_code == 400
     detail = res.json()["error"]["message"]
     assert "confirm" in str(detail).lower() or "CONFIRM" in str(detail) or "code" in str(detail)
+
+
+def test_compare_by_files_matches_cdn_to_media_gid():
+    """Active has CDN+GID; live has only the same MediaImage GID — must not false-conflict."""
+    from app.services.product_rollback import _compare_by_files
+
+    expected = {
+        "featured_media_gid": "gid://shopify/MediaImage/33272640831571",
+        "media": [
+            {
+                "media_gid": "gid://shopify/MediaImage/33272640831571",
+                "file_gid": "gid://shopify/MediaImage/33272640831571",
+                "position": 0,
+                "alt_text": "",
+                "cdn_url": (
+                    "https://cdn.shopify.com/s/files/1/0729/7512/2515/files/"
+                    "product_b45fa38d24844e8a_media_33272640831571_version_1.png"
+                ),
+                "is_primary": True,
+            }
+        ],
+        "variants": [],
+    }
+    live = {
+        "featured_media_gid": "gid://shopify/MediaImage/33272640831571",
+        "media": [
+            {
+                "media_gid": "gid://shopify/MediaImage/33272640831571",
+                "file_gid": "gid://shopify/MediaImage/33272640831571",
+                "position": 0,
+                "alt_text": "",
+                # Live snapshot missing CDN — old matcher preferred cdn on expected and media on live.
+                "cdn_url": None,
+                "is_primary": True,
+            }
+        ],
+        "variants": [],
+    }
+    out = _compare_by_files(expected, live)
+    assert out["hasConflict"] is False
+
+
+def test_humanize_conflict_details_mentions_removed_file():
+    from app.services.product_rollback import humanize_conflict_details
+
+    msg = humanize_conflict_details(
+        {
+            "hasConflict": True,
+            "removedMediaIds": [
+                "cdn:/s/files/1/x/files/product_b45fa38d24844e8a_media_33272640831571_version_1.png"
+            ],
+            "addedMediaIds": [],
+            "orderChanged": False,
+            "altChanges": [],
+            "featuredMediaChanged": False,
+            "variantChanges": [],
+        }
+    )
+    assert "not found on live Shopify" in msg
+    assert "version_1.png" in msg
+
+
+def test_rollback_force_despite_conflict(db_session, shop):
+    product, original, published = _seed_product_with_versions(db_session, shop)
+    client = MagicMock()
+    client.get_file_statuses.return_value = [
+        {
+            "id": "gid://shopify/MediaImage/10",
+            "fileStatus": "READY",
+            "image": {"url": "https://cdn.shopify.com/a.png", "width": 10, "height": 10},
+        },
+        {
+            "id": "gid://shopify/MediaImage/999",
+            "fileStatus": "READY",
+            "image": {
+                "url": "https://cdn.shopify.com/gid://shopify/MediaImage/999.png",
+                "width": 10,
+                "height": 10,
+            },
+        },
+    ]
+    live_diverged = {
+        "id": product.shopify_product_gid,
+        "updatedAt": "2026-07-31T00:00:00Z",
+        "featuredMedia": {"id": "gid://shopify/MediaImage/50"},
+        "media": {
+            "nodes": [
+                {
+                    "id": "gid://shopify/MediaImage/50",
+                    "mediaContentType": "IMAGE",
+                    "alt": "changed",
+                    "image": {"url": "https://cdn.shopify.com/x.png", "width": 10, "height": 10},
+                }
+            ]
+        },
+        "variants": {"nodes": []},
+    }
+    live_with_target = {
+        "id": product.shopify_product_gid,
+        "updatedAt": "2026-07-31T00:00:00Z",
+        "featuredMedia": {"id": "gid://shopify/MediaImage/10"},
+        "media": {
+            "nodes": [
+                {
+                    "id": "gid://shopify/MediaImage/10",
+                    "mediaContentType": "IMAGE",
+                    "alt": "front",
+                    "image": {"url": "https://cdn.shopify.com/a.png", "width": 10, "height": 10},
+                }
+            ]
+        },
+        "variants": {
+            "nodes": [
+                {
+                    "id": "gid://shopify/ProductVariant/1",
+                    "media": {"nodes": [{"id": "gid://shopify/MediaImage/10"}]},
+                }
+            ]
+        },
+    }
+    # First run: conflict snapshot only. Force run: mid/verify/detach/final snapshots.
+    client.get_product_media_snapshot.side_effect = [
+        live_diverged,
+        live_with_target,
+        live_with_target,
+        live_with_target,
+        live_with_target,
+        live_with_target,
+        live_with_target,
+    ]
+    client.add_file_product_references.return_value = []
+    client.remove_file_product_references.return_value = []
+    client.update_file_alt_text.return_value = {}
+    client.associate_media_to_variants.return_value = []
+    client.reorder_product_media.return_value = {"id": "gid://shopify/Job/1", "done": True}
+    client.get_job_status.return_value = {"id": "gid://shopify/Job/1", "done": True}
+
+    svc = ProductRollbackService(db_session, shop, client=client)
+    queued = svc.enqueue(
+        product_id=product.id,
+        target_version_id=original.id,
+        confirm=True,
+        force_despite_conflict=False,
+    )
+    blocked = svc.run(UUID(queued["operationId"]))
+    assert blocked.status == RollbackStatus.ROLLBACK_CONFLICT
+    assert "not found on live Shopify" in (blocked.last_error_message or "") or (
+        blocked.conflict_details or {}
+    ).get("hasConflict")
+
+    retried = svc.retry(UUID(queued["operationId"]), force_despite_conflict=True)
+    assert retried["forceDespiteConflict"] is True
+    out = svc.run(UUID(retried["operationId"]))
+    assert out.status == RollbackStatus.ROLLED_BACK
+    assert out.force_despite_conflict is True
+    assert (out.conflict_details or {}).get("forceApplied") is True
+    assert out.result_version_id == original.id
+    # published remains the "from" version historically; target original is reactivated
+    assert published.id != out.result_version_id
+

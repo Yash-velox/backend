@@ -111,6 +111,7 @@ class ProductRollbackOperation(Base):
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     pre_rollback_snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     conflict_details: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    force_despite_conflict: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)

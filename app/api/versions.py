@@ -23,6 +23,17 @@ def _request_id(request: Request) -> str:
 
 class RollbackConfirmBody(BaseModel):
     confirm: bool = Field(default=False)
+    forceDespiteConflict: bool = Field(
+        default=False,
+        description="When true, proceed even if live Shopify media differs from the active version.",
+    )
+
+
+class RollbackRetryBody(BaseModel):
+    forceDespiteConflict: bool = Field(
+        default=False,
+        description="When true, retry and skip the conflict hard-stop (still records conflict details).",
+    )
 
 
 def _cdn_lookup_from_linked(linked_images: list | None) -> dict[str, str]:
@@ -118,6 +129,7 @@ def _rollback_out(op: ProductRollbackOperation) -> dict:
         "lastErrorCode": op.last_error_code,
         "lastErrorMessage": op.last_error_message,
         "conflictDetails": op.conflict_details,
+        "forceDespiteConflict": bool(getattr(op, "force_despite_conflict", False)),
         "queuedAt": op.queued_at.isoformat() if op.queued_at else None,
         "startedAt": op.started_at.isoformat() if op.started_at else None,
         "completedAt": op.completed_at.isoformat() if op.completed_at else None,
@@ -240,6 +252,7 @@ def start_rollback(
             product_id=product_id,
             target_version_id=version_id,
             confirm=body.confirm,
+            force_despite_conflict=body.forceDespiteConflict,
         )
     except (MediaVersionError, RollbackError) as exc:
         raise _http_from_media(exc) from exc
@@ -275,9 +288,19 @@ def get_rollback_operation(operation_id: UUID, request: Request, db: DbSession, 
 
 
 @router.post("/api/rollback-operations/{operation_id}/retry", status_code=status.HTTP_202_ACCEPTED)
-def retry_rollback(operation_id: UUID, request: Request, db: DbSession, shop: CurrentShop):
+def retry_rollback(
+    operation_id: UUID,
+    request: Request,
+    db: DbSession,
+    shop: CurrentShop,
+    body: RollbackRetryBody | None = None,
+):
+    payload = body or RollbackRetryBody()
     try:
-        result = ProductRollbackService(db, shop).retry(operation_id)
+        result = ProductRollbackService(db, shop).retry(
+            operation_id,
+            force_despite_conflict=payload.forceDespiteConflict,
+        )
     except RollbackError as exc:
         raise _http_from_media(exc) from exc
     return SuccessEnvelope(
