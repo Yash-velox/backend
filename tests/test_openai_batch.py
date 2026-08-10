@@ -47,12 +47,44 @@ def test_jsonl_roundtrip_and_image_body():
         image_url="https://cdn.shopify.com/x.png",
     )
     assert body["images"][0]["image_url"] == "https://cdn.shopify.com/x.png"
+    assert "background" not in body
     line = BatchLine(custom_id="c1", method="POST", url=IMAGE_EDITS_ENDPOINT, body=body)
     raw = lines_to_jsonl([line])
     rows = parse_jsonl(raw)
     assert len(rows) == 1
     assert rows[0]["custom_id"] == "c1"
     assert rows[0]["url"] == IMAGE_EDITS_ENDPOINT
+
+
+def test_image_edit_body_skips_transparent_for_gpt_image_2():
+    body = build_image_edit_body(
+        model="gpt-image-2",
+        prompt="enhance",
+        image_url="https://cdn.shopify.com/x.png",
+        transparent_background=True,
+    )
+    assert "background" not in body
+
+
+def test_image_edit_body_sets_transparent_when_supported():
+    body = build_image_edit_body(
+        model="gpt-image-1",
+        prompt="enhance",
+        image_url="https://cdn.shopify.com/x.png",
+        transparent_background=True,
+    )
+    assert body.get("background") == "transparent"
+
+
+def test_image_edit_body_honors_transparent_false():
+    body = build_image_edit_body(
+        model="gpt-image-1",
+        prompt="enhance",
+        file_id="file-abc",
+        transparent_background=False,
+    )
+    assert "background" not in body
+    assert body["images"][0]["file_id"] == "file-abc"
 
 
 def test_description_body_includes_prior_context():

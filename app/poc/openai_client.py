@@ -8,15 +8,9 @@ import httpx
 from openai import OpenAI
 
 from app.config import settings
+from app.services.openai_image_compat import supports_transparent_background
 
 logger = logging.getLogger("app.poc.openai")
-
-# gpt-image-2 rejects background=transparent (HTTP 400 invalid_value).
-_MODELS_WITHOUT_TRANSPARENT_BG = frozenset({"gpt-image-2"})
-
-
-def _supports_transparent_background(model: str) -> bool:
-    return model.strip().lower() not in _MODELS_WITHOUT_TRANSPARENT_BG
 
 
 class OpenAIImageError(RuntimeError):
@@ -43,10 +37,10 @@ class OpenAIImageClient:
         prompt: str,
         job_id: str = "",
         step: int = 0,
-        transparent_background: bool = True,
+        transparent_background: bool = False,
     ) -> bytes:
         model = settings.openai_image_model
-        use_transparent = transparent_background and _supports_transparent_background(model)
+        use_transparent = transparent_background and supports_transparent_background(model)
         if transparent_background and not use_transparent:
             logger.info(
                 "Skipping background=transparent | model=%s does not support it",
@@ -65,8 +59,8 @@ class OpenAIImageClient:
         )
         started = time.perf_counter()
         try:
-            # Prompt text alone is not enough — GPT image models that support
-            # alpha need the API background flag (otherwise white fill).
+            # Opaque PNG by default. Only set background=transparent when explicitly
+            # requested and the model supports it (gpt-image-2 rejects that flag).
             edit_kwargs: dict = {
                 "model": model,
                 "image": ("input.png", image_bytes, "image/png"),

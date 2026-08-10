@@ -14,6 +14,7 @@ from typing import Any, Iterable
 from openai import OpenAI
 
 from app.config import settings
+from app.services.openai_image_compat import supports_transparent_background
 
 logger = logging.getLogger("app.services.openai_batch_client")
 
@@ -41,7 +42,7 @@ def build_image_edit_body(
     prompt: str,
     image_url: str | None = None,
     file_id: str | None = None,
-    transparent_background: bool = True,
+    transparent_background: bool = False,
 ) -> dict[str, Any]:
     if bool(image_url) == bool(file_id):
         raise OpenAIBatchClientError(
@@ -61,8 +62,15 @@ def build_image_edit_body(
         "size": "1024x1024",
         "output_format": "png",
     }
-    if transparent_background:
+    # Opaque PNG by default — gpt-image-2 rejects background=transparent.
+    use_transparent = transparent_background and supports_transparent_background(model)
+    if use_transparent:
         body["background"] = "transparent"
+    elif transparent_background:
+        logger.info(
+            "Skipping background=transparent | model=%s does not support it",
+            model,
+        )
     return body
 
 

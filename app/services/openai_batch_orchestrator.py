@@ -939,7 +939,7 @@ class OpenAIBatchOrchestrator:
                 prompt=prompt,
                 image_url=image_url,
                 file_id=file_id,
-                transparent_background=True,
+                transparent_background=False,
             )
         else:
             body = build_description_body(
