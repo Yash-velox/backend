@@ -45,7 +45,7 @@ class ProductPublisher:
             self.client = client
         else:
             try:
-                token = resolve_shop_access_token(shop)
+                token = resolve_shop_access_token(shop, db=self.db)
             except RuntimeError as exc:
                 raise ProductPublisherError("SHOPIFY_SCOPE_MISSING", str(exc)) from exc
             self.client = ShopifyGraphQLClient(shop_domain=shop.shop_domain, access_token=token)

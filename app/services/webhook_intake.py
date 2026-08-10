@@ -291,7 +291,7 @@ class WebhookIntakeService:
         graphql_ok = False
 
         try:
-            token = resolve_shop_access_token(shop)
+            token = resolve_shop_access_token(shop, db=self.db)
             client = ShopifyGraphQLClient(shop_domain=shop.shop_domain, access_token=token)
             node = client.fetch_product_by_gid(product_gid)
             if node:

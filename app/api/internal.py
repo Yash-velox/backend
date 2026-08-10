@@ -26,6 +26,8 @@ class ShopInstallRequest(BaseModel):
     scope: str | None = None
     refreshToken: str | None = None
     refreshTokenExpires: datetime | None = None
+    # Access-token expiry (~24h for expiring offline tokens). Do NOT send refresh expiry here.
+    accessTokenExpires: datetime | None = None
 
 
 class ShopUninstallRequest(BaseModel):
@@ -124,7 +126,7 @@ async def shop_install(request: Request, db: DbSession):
         access_token=payload.accessToken,
         scopes=payload.scope,
         refresh_token=payload.refreshToken,
-        token_expires_at=payload.refreshTokenExpires,
+        token_expires_at=payload.accessTokenExpires,
     )
     return SuccessEnvelope(
         success=True,

@@ -165,7 +165,7 @@ class PrimaryBatchService:
         if product is not None:
             return product
         try:
-            token = resolve_shop_access_token(self.shop)
+            token = resolve_shop_access_token(self.shop, db=self.db)
             client = ShopifyGraphQLClient(shop_domain=self.shop.shop_domain, access_token=token)
             node = client.fetch_product_by_gid(product_gid)
             if not node:

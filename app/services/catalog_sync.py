@@ -29,7 +29,7 @@ class CatalogSyncService:
         self.shop = shop
 
     def _client(self) -> ShopifyGraphQLClient:
-        token = resolve_shop_access_token(self.shop)
+        token = resolve_shop_access_token(self.shop, db=self.db)
         return ShopifyGraphQLClient(shop_domain=self.shop.shop_domain, access_token=token)
 
     def get_latest_run(self) -> SyncRun | None:
@@ -109,22 +109,35 @@ class CatalogSyncService:
                 media_synced,
             )
         except ShopifyGraphQLError as exc:
-            run.status = SyncRunStatus.FAILED
-            run.error_message = str(exc)
-            run.completed_at = datetime.now(timezone.utc)
-            self.db.commit()
+            self._fail_run(run, str(exc))
             logger.error("Full sync failed | shop=%s run=%s error=%s", self.shop.id, run.id, exc)
             raise
         except Exception as exc:
-            run.status = SyncRunStatus.FAILED
-            run.error_message = str(exc)[:2000]
-            run.completed_at = datetime.now(timezone.utc)
-            self.db.commit()
+            self._fail_run(run, str(exc)[:2000])
             logger.exception("Full sync crashed | shop=%s run=%s", self.shop.id, run.id)
             raise
 
         self.db.refresh(run)
         return run
+
+    def _fail_run(self, run: SyncRun, error_message: str) -> None:
+        """Mark run FAILED even if the session is poisoned by a prior IntegrityError."""
+        run_id = run.id
+        try:
+            self.db.rollback()
+        except Exception:
+            logger.exception("Rollback after sync failure failed | run=%s", run_id)
+        fresh = self.db.get(SyncRun, run_id)
+        if fresh is None:
+            return
+        fresh.status = SyncRunStatus.FAILED
+        fresh.error_message = error_message
+        fresh.completed_at = datetime.now(timezone.utc)
+        self.db.commit()
+        # Keep caller's object in sync for API response shaping.
+        run.status = fresh.status
+        run.error_message = fresh.error_message
+        run.completed_at = fresh.completed_at
 
     def upsert_product_from_shopify_node(self, node: dict[str, Any]) -> Product:
         normalized = normalize_shopify_product_node(node)

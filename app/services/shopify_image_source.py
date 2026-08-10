@@ -133,7 +133,7 @@ class ShopifyImageSourceService:
         unique_gids = list(dict.fromkeys(gids))
         client = graphql_client
         if client is None:
-            token = resolve_shop_access_token(self.shop)
+            token = resolve_shop_access_token(self.shop, db=self.db)
             client = ShopifyGraphQLClient(shop_domain=self.shop.shop_domain, access_token=token)
 
         products_found = 0

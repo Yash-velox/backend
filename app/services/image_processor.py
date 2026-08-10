@@ -404,7 +404,7 @@ class ImageProcessor:
             existing_gid = prior_version.shopify_file_gid
 
         try:
-            token = resolve_shop_access_token(shop)
+            token = resolve_shop_access_token(shop, db=self.db)
         except RuntimeError as exc:
             raise ProcessingError(str(exc), code="SHOPIFY_TOKEN_MISSING", retryable=True) from exc
 

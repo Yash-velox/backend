@@ -109,9 +109,7 @@ def health():
 
 @app.get("/tenant/checkConfig", dependencies=[Depends(require_shopify_jwt)])
 def tenant_check_config(shop: CurrentShop):
-    installed = bool(shop.encrypted_access_token) or (
-        settings.app_env in {"dev", "uat"} and bool(settings.shopify_dev_access_token)
-    )
+    installed = bool(shop.encrypted_access_token)
     return {
         "status": "ok",
         "installed": installed,

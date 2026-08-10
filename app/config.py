@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     shopify_image_download_timeout_seconds: int = 60
     shopify_image_max_download_mb: int = 30
     shopify_api_version: str = "2026-07"
-    # Dev-only fallback when shop encrypted token is empty. Never used when APP_ENV != dev.
+    # Optional bootstrap seed for first shop create in dev/uat only. API calls never read this.
     shopify_dev_access_token: str = ""
 
     # Shopify publishing
