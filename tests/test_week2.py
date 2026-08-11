@@ -333,9 +333,10 @@ def test_secondary_queue_upsert_dedupe_and_draft(db_session, shop):
     assert status_only is None
 
 
-def test_secondary_queue_skips_when_media_matches_baseline(db_session, shop):
-    """Publish/self webhooks must not create a new Secondary Queue row when media is unchanged."""
+def test_secondary_queue_enqueues_when_media_matches_baseline(db_session, shop):
+    """Enqueue first; media delta is evaluated later at Primary conversion."""
     ensure_shop_settings(db_session, shop)
+    _configure_product_type(db_session, shop, "Bags")
     product = Product(
         shop_id=shop.id,
         shopify_product_gid="gid://shopify/Product/8801",
@@ -380,15 +381,22 @@ def test_secondary_queue_skips_when_media_matches_baseline(db_session, shop):
         product_gid=product.shopify_product_gid,
         product_snapshot={"product_gid": product.shopify_product_gid, "title": "Bag", "status": "ACTIVE"},
         media_snapshot=media,
-        webhook_id="wh-publish-echo",
+        webhook_id="wh-description-or-echo",
     )
-    assert result is None
+    assert result is not None
+    assert result.status == SecondaryQueueStatus.PENDING
     assert (
         db_session.query(SecondaryQueueItem)
         .filter(SecondaryQueueItem.shopify_product_gid == product.shopify_product_gid)
         .count()
-        == 0
+        == 1
     )
+
+    batch = PrimaryBatchService(db_session, shop).convert_secondary_items([result])
+    assert batch is None
+    db_session.refresh(result)
+    assert result.status == SecondaryQueueStatus.SKIPPED_NO_ELIGIBLE_IMAGE_DELTA
+    assert result.skip_reason
 
 
 def test_secondary_queue_skips_during_active_publish(db_session, shop):

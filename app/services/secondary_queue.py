@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import (
-    ProcessingBaseline,
     Product,
     ProductPublishOperation,
     PublishStatus,
@@ -17,7 +16,6 @@ from app.models import (
     SecondaryQueueStatus,
     Shop,
 )
-from app.services.delta import compare_media_snapshots
 from app.services.prompt_resolver import PromptResolverError, assert_product_prompts_ready
 from app.services.state_machine import SECONDARY_TRANSITIONS, assert_transition
 
@@ -90,26 +88,6 @@ class SecondaryQueueService:
             .first()
         )
         return row is not None
-
-    def _media_matches_processing_baseline(
-        self,
-        product: Product | None,
-        media_snapshot: list[dict],
-    ) -> bool:
-        if product is None:
-            return False
-        baseline = (
-            self.db.query(ProcessingBaseline)
-            .filter(
-                ProcessingBaseline.shop_id == self.shop.id,
-                ProcessingBaseline.product_id == product.id,
-            )
-            .one_or_none()
-        )
-        if baseline is None or baseline.media_snapshot_json is None:
-            return False
-        delta = compare_media_snapshots(media_snapshot or [], baseline.media_snapshot_json or [])
-        return bool(delta.get("skip_reason"))
 
     def upsert_from_webhook(
         self,
@@ -190,14 +168,8 @@ class SecondaryQueueService:
                 existing.claimed_at = None
                 existing.claimed_by = None
 
-        if existing is None and self._media_matches_processing_baseline(product, media_snapshot):
-            logger.info(
-                "Secondary queue skip no media delta vs baseline | shop=%s product=%s webhook=%s",
-                self.shop.id,
-                product_gid,
-                webhook_id,
-            )
-            return None
+        # Media delta vs ProcessingBaseline is evaluated at Primary conversion
+        # (convert_secondary_items), not at Secondary Queue enqueue.
 
         if existing:
             existing.queue_revision += 1
