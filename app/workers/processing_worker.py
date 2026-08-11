@@ -217,8 +217,15 @@ class ProcessingWorker:
 
         if use_batch:
             await asyncio.to_thread(self._run_openai_batch_tick)
+            # OpenAI mode still must reclaim RETRYING/QUEUED products (stale recovery,
+            # completed-image rollup). Previously we returned early and left products
+            # stuck in RETRYING forever after a lock-timeout race.
+            await self._claim_and_process_due_products()
             return
 
+        await self._claim_and_process_due_products()
+
+    async def _claim_and_process_due_products(self) -> None:
         shop_ids = await asyncio.to_thread(self._shops_with_work)
         for shop_id in shop_ids:
             if self._stop.is_set():
@@ -245,9 +252,6 @@ class ProcessingWorker:
     def _shops_with_work(self) -> list[UUID]:
         db = SessionLocal()
         try:
-            from datetime import datetime, timezone
-
-            now = datetime.now(timezone.utc)
             rows = db.execute(
                 select(distinct(BatchProduct.shop_id)).where(
                     BatchProduct.status.in_(

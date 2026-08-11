@@ -17,10 +17,30 @@ from app.models import (
     ProcessingBatch,
     Shop,
 )
+from app.models.enums import ProcessingPhase
 from app.services.primary_batch import PrimaryBatchService
 from app.services.state_machine import BATCH_IMAGE_TRANSITIONS, BATCH_PRODUCT_TRANSITIONS, assert_transition
 
 logger = logging.getLogger("app.services.retry")
+
+# Phases where images may briefly be PROCESSING without a local output yet
+# (OpenAI result download / import). Do not treat those as dead worker locks.
+_OPENAI_IMPORT_PHASES = frozenset(
+    {
+        ProcessingPhase.WAITING_FOR_OPENAI.value,
+        ProcessingPhase.COLLECTING_OPENAI_RESULTS.value,
+        ProcessingPhase.IMPORTING_STAGE_RESULTS.value,
+        ProcessingPhase.PREPARING_NEXT_STAGE.value,
+        ProcessingPhase.AI_WORKFLOW_COMPLETE.value,
+    }
+)
+
+
+def _image_awaiting_shopify_upload(image: BatchImage) -> bool:
+    """True when OpenAI output exists locally but Shopify Files upload is not done yet."""
+    if not image.output_storage_key or image.generated_shopify_file_gid:
+        return False
+    return image.status not in {BatchImageStatus.FAILED, BatchImageStatus.COMPLETED}
 
 
 class RetryService:
@@ -32,6 +52,53 @@ class RetryService:
         if shop is None:
             return None
         return PrimaryBatchService(self.db, shop)
+
+    def _product_has_healthy_async_work(self, batch_product: BatchProduct) -> bool:
+        """Skip stale recovery while OpenAI wait / result import / Shopify upload is in flight."""
+        images = list(batch_product.images or [])
+        if any(img.status == BatchImageStatus.WAITING_FOR_PROVIDER for img in images):
+            return True
+        if any(img.status == BatchImageStatus.UPLOADING for img in images):
+            return True
+        if any(_image_awaiting_shopify_upload(img) for img in images):
+            return True
+        batch = self.db.get(ProcessingBatch, batch_product.batch_id)
+        if batch is not None and (batch.processing_phase or "") in _OPENAI_IMPORT_PHASES:
+            # Import can leave images in PROCESSING for a short window before output_storage_key
+            # is written; interrupting that window recreates the RETRYING/COMPLETED race.
+            if any(img.status == BatchImageStatus.PROCESSING for img in images):
+                return True
+        return False
+
+    def _complete_product_if_images_done(self, batch_product: BatchProduct, *, now: datetime) -> bool:
+        """Heal products whose images all finished while the product stayed locked/retrying."""
+        images = list(batch_product.images or [])
+        if not images or not all(img.status == BatchImageStatus.COMPLETED for img in images):
+            return False
+        if batch_product.status not in {
+            BatchProductStatus.PROCESSING,
+            BatchProductStatus.RETRYING,
+        }:
+            return False
+        assert_transition(
+            "batch_product",
+            BATCH_PRODUCT_TRANSITIONS,
+            batch_product.status,
+            BatchProductStatus.COMPLETED,
+        )
+        batch_product.status = BatchProductStatus.COMPLETED
+        batch_product.completed_at = now
+        batch_product.locked_by = None
+        batch_product.locked_at = None
+        batch_product.next_retry_at = None
+        batch_product.error_code = None
+        batch_product.error_message = None
+        logger.info(
+            "Stale recovery healed completed product | product=%s batch=%s",
+            batch_product.id,
+            batch_product.batch_id,
+        )
+        return True
 
     def schedule_image_retry(
         self,
@@ -151,11 +218,24 @@ class RetryService:
         now = datetime.now(timezone.utc)
 
         for batch_product in stale:
-            # Do not interrupt products waiting on OpenAI Platform Batch results.
-            if any(img.status == BatchImageStatus.WAITING_FOR_PROVIDER for img in batch_product.images):
+            # OpenAI Platform wait / import / Shopify upload can exceed the lock TTL.
+            # Interrupting those races leaves images COMPLETED and products RETRYING forever.
+            if self._product_has_healthy_async_work(batch_product):
+                logger.debug(
+                    "Stale recovery skipped healthy async work | product=%s phase_or_images=in_flight",
+                    batch_product.id,
+                )
                 continue
+
+            if self._complete_product_if_images_done(batch_product, now=now):
+                batch_ids.add(batch_product.batch_id)
+                recovered += 1
+                continue
+
             for image in batch_product.images:
                 if image.status not in (BatchImageStatus.DOWNLOADING, BatchImageStatus.PROCESSING):
+                    continue
+                if _image_awaiting_shopify_upload(image):
                     continue
                 # Prefer closing the open STARTED attempt over inserting a duplicate
                 # (uq_attempt_image_number) — that UniqueViolation previously aborted

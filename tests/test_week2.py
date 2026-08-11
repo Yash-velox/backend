@@ -1498,3 +1498,102 @@ def test_stale_recovery_closes_open_attempt_without_unique_violation(db_session,
     assert attempts[0].status == AttemptStatus.INTERRUPTED
     assert attempts[0].error_code == "STALE_LOCK"
 
+
+def _stale_locked_product(db_session, shop, *, image_status, processing_phase=None, **image_kwargs):
+    ensure_shop_settings(db_session, shop)
+    locked_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+    batch = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.MANUAL,
+        status=BatchStatus.PROCESSING,
+        product_count=1,
+        image_count=1,
+        processing_product_count=1,
+        processing_phase=processing_phase,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    bp = BatchProduct(
+        batch_id=batch.id,
+        shop_id=shop.id,
+        shopify_product_gid=f"gid://shopify/Product/stale-{uuid4()}",
+        status=BatchProductStatus.PROCESSING,
+        image_count=1,
+        locked_by="worker_old",
+        locked_at=locked_at,
+        claimed_at=locked_at,
+        started_at=locked_at,
+    )
+    db_session.add(bp)
+    db_session.flush()
+    image = BatchImage(
+        batch_product_id=bp.id,
+        shop_id=shop.id,
+        shopify_media_gid=f"gid://shopify/MediaImage/stale-{uuid4()}",
+        cdn_url="https://cdn.shopify.com/stale.png",
+        delta_type=DeltaType.INITIAL,
+        status=image_status,
+        attempt_count=1,
+        started_at=locked_at,
+        **image_kwargs,
+    )
+    db_session.add(image)
+    db_session.commit()
+    return batch, bp, image
+
+
+def test_stale_recovery_skips_waiting_for_openai_provider(db_session, shop, monkeypatch):
+    monkeypatch.setattr("app.services.retry_service.settings.processing_stale_lock_seconds", 1)
+    _batch, bp, image = _stale_locked_product(
+        db_session,
+        shop,
+        image_status=BatchImageStatus.WAITING_FOR_PROVIDER,
+        processing_phase="WAITING_FOR_OPENAI",
+    )
+
+    recovered = RetryService(db_session).recover_stale_batch_products(worker_id="worker_new")
+    assert recovered == 0
+    db_session.refresh(bp)
+    db_session.refresh(image)
+    assert bp.status == BatchProductStatus.PROCESSING
+    assert bp.locked_by == "worker_old"
+    assert image.status == BatchImageStatus.WAITING_FOR_PROVIDER
+
+
+def test_stale_recovery_skips_pending_shopify_upload(db_session, shop, monkeypatch):
+    monkeypatch.setattr("app.services.retry_service.settings.processing_stale_lock_seconds", 1)
+    _batch, bp, image = _stale_locked_product(
+        db_session,
+        shop,
+        image_status=BatchImageStatus.PROCESSING,
+        processing_phase="UPLOADING_TO_SHOPIFY_FILES",
+        output_storage_key="shop/batch/img/output.png",
+    )
+
+    recovered = RetryService(db_session).recover_stale_batch_products(worker_id="worker_new")
+    assert recovered == 0
+    db_session.refresh(bp)
+    db_session.refresh(image)
+    assert bp.status == BatchProductStatus.PROCESSING
+    assert image.status == BatchImageStatus.PROCESSING
+    assert image.error_code is None
+
+
+def test_stale_recovery_heals_product_when_all_images_completed(db_session, shop, monkeypatch):
+    monkeypatch.setattr("app.services.retry_service.settings.processing_stale_lock_seconds", 1)
+    _batch, bp, image = _stale_locked_product(
+        db_session,
+        shop,
+        image_status=BatchImageStatus.COMPLETED,
+        processing_phase="READY_TO_PUBLISH",
+        generated_shopify_file_gid="gid://shopify/MediaImage/generated-1",
+        completed_at=datetime.now(timezone.utc),
+    )
+
+    recovered = RetryService(db_session).recover_stale_batch_products(worker_id="worker_new")
+    assert recovered == 1
+    db_session.refresh(bp)
+    assert bp.status == BatchProductStatus.COMPLETED
+    assert bp.locked_by is None
+    assert bp.error_code is None
+

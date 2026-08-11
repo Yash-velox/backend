@@ -245,8 +245,30 @@ class OpenAIBatchOrchestrator:
             primary.openai_requests_failed = row.failed_count
             if row.status in {OpenAIBatchStatus.VALIDATING, OpenAIBatchStatus.IN_PROGRESS, OpenAIBatchStatus.FINALIZING}:
                 primary.processing_phase = ProcessingPhase.WAITING_FOR_OPENAI.value
+                self._heartbeat_product_locks(primary.id)
             elif row.status == OpenAIBatchStatus.COMPLETED:
                 primary.processing_phase = ProcessingPhase.COLLECTING_OPENAI_RESULTS.value
+
+    def _heartbeat_product_locks(self, primary_batch_id: UUID) -> None:
+        """Keep product locks fresh while OpenAI Platform work is still in progress.
+
+        Stale recovery uses locked_at age. OpenAI batches often run longer than
+        processing_stale_lock_seconds; refreshing prevents false STALE_LOCK retries.
+        """
+        now = datetime.now(timezone.utc)
+        products = (
+            self.db.query(BatchProduct)
+            .options(selectinload(BatchProduct.images))
+            .filter(
+                BatchProduct.batch_id == primary_batch_id,
+                BatchProduct.status == BatchProductStatus.PROCESSING,
+                BatchProduct.locked_at.is_not(None),
+            )
+            .all()
+        )
+        for product in products:
+            if any(img.status == BatchImageStatus.WAITING_FOR_PROVIDER for img in product.images):
+                product.locked_at = now
 
     # ---------------------------------------------------------------- import
     def import_batch_results(self, row: OpenAIBatch, client: OpenAIBatchClient | None = None) -> None:

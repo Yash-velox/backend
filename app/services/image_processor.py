@@ -284,6 +284,17 @@ class ImageProcessor:
                 code="PUBLISH_OUTPUT_MISSING",
                 retryable=True,
             )
+        # Hold the product lock fresh during multi-image Shopify uploads so the
+        # parallel stale-recovery loop does not interrupt a healthy finalize.
+        now = datetime.now(timezone.utc)
+        if batch_product.status == BatchProductStatus.PROCESSING:
+            batch_product.locked_by = batch_product.locked_by or worker_id
+            batch_product.locked_at = now
+        elif batch_product.status == BatchProductStatus.RETRYING:
+            # Mid-race: stale recovery already flipped the product. Keep finalizing
+            # images; product rollup below can still COMPLETE from RETRYING.
+            batch_product.locked_by = worker_id
+            batch_product.locked_at = now
         attempt_number = max(image.attempt_count, 1)
         existing_numbers = {
             row[0]
@@ -304,14 +315,26 @@ class ImageProcessor:
         )
         self.db.add(attempt)
         self.db.flush()
-        if image.status in {BatchImageStatus.PROCESSING, BatchImageStatus.WAITING_FOR_PROVIDER}:
+        if image.status in {
+            BatchImageStatus.PROCESSING,
+            BatchImageStatus.WAITING_FOR_PROVIDER,
+            BatchImageStatus.RETRYING,
+        }:
             if image.status == BatchImageStatus.WAITING_FOR_PROVIDER:
                 assert_transition(
                     "batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.PROCESSING
                 )
                 image.status = BatchImageStatus.PROCESSING
-            assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.UPLOADING)
-            image.status = BatchImageStatus.UPLOADING
+            if image.status == BatchImageStatus.PROCESSING:
+                assert_transition(
+                    "batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.UPLOADING
+                )
+                image.status = BatchImageStatus.UPLOADING
+            elif image.status == BatchImageStatus.RETRYING:
+                assert_transition(
+                    "batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.UPLOADING
+                )
+                image.status = BatchImageStatus.UPLOADING
             self.db.commit()
         self._upload_generated_output(
             shop=shop,
@@ -327,7 +350,10 @@ class ImageProcessor:
         self.db.refresh(batch_product)
         images = sorted(batch_product.images, key=lambda i: i.created_at)
         if all(i.status == BatchImageStatus.COMPLETED for i in images):
-            if batch_product.status == BatchProductStatus.PROCESSING:
+            if batch_product.status in {
+                BatchProductStatus.PROCESSING,
+                BatchProductStatus.RETRYING,
+            }:
                 assert_transition(
                     "batch_product",
                     BATCH_PRODUCT_TRANSITIONS,
@@ -338,6 +364,9 @@ class ImageProcessor:
                 batch_product.completed_at = datetime.now(timezone.utc)
                 batch_product.locked_by = None
                 batch_product.locked_at = None
+                batch_product.next_retry_at = None
+                batch_product.error_code = None
+                batch_product.error_message = None
                 batch_product.prompt_override_json = None
                 self._advance_baseline_on_success(batch_product)
             batch = self._primary_batch_service(batch_product.shop_id).get_batch(batch_product.batch_id)
