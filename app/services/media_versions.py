@@ -245,17 +245,21 @@ class MediaVersionsService:
         return version
 
     def _deactivate_all(self, product_id: UUID) -> None:
-        versions = (
+        """Clear active flag for this product.
+
+        Uses a bulk UPDATE + flush so PostgreSQL partial unique index
+        ``ix_product_media_versions_active`` never sees two active rows mid-flush.
+        """
+        (
             self.db.query(ProductMediaVersion)
             .filter(
                 ProductMediaVersion.shop_id == self.shop.id,
                 ProductMediaVersion.product_id == product_id,
                 ProductMediaVersion.is_active.is_(True),
             )
-            .all()
+            .update({ProductMediaVersion.is_active: False}, synchronize_session="fetch")
         )
-        for v in versions:
-            v.is_active = False
+        self.db.flush()
 
     def activate_existing_version(
         self,
@@ -266,9 +270,15 @@ class MediaVersionsService:
         """Mark an existing ORIGINAL/PUBLISHED version active without creating a ROLLBACK row."""
         if version.shop_id != self.shop.id:
             raise MediaVersionError("VERSION_NOT_FOUND", "Version not found")
+        self.db.refresh(version)
         if version.is_active:
+            if rollback_operation_id is not None:
+                version.rollback_operation_id = rollback_operation_id
+                self.db.flush()
             return version
         self._deactivate_all(version.product_id)
+        # Re-load after bulk deactivate so identity map is consistent.
+        self.db.refresh(version)
         version.is_active = True
         version.activated_at = datetime.now(timezone.utc)
         if rollback_operation_id is not None:

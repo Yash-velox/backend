@@ -208,3 +208,46 @@ def test_shop_isolation_versions(client, db_session, shop, SessionLocal):
 
     res = client.get(f"/api/products/{catalog.id}/media-versions")
     assert res.status_code == 404
+
+
+def test_activate_existing_version_clears_prior_active(db_session, shop):
+    """Partial unique index on is_active must not raise when switching active version."""
+    product = _seed_catalog_product(db_session, shop)
+    svc = MediaVersionsService(db_session, shop)
+    snap_a = {
+        "product_gid": product.shopify_product_gid,
+        "featured_media_gid": "gid://shopify/MediaImage/1",
+        "media": [_media("gid://shopify/MediaImage/1", 0, featured=True)],
+        "variants": [],
+    }
+    snap_b = {
+        "product_gid": product.shopify_product_gid,
+        "featured_media_gid": "gid://shopify/MediaImage/2",
+        "media": [_media("gid://shopify/MediaImage/2", 0, featured=True)],
+        "variants": [],
+    }
+    v1 = svc.create_version(
+        product=product,
+        snapshot=snap_a,
+        version_type=MediaVersionType.ORIGINAL,
+        activate=True,
+    )
+    v2 = svc.create_version(
+        product=product,
+        snapshot=snap_b,
+        version_type=MediaVersionType.PUBLISHED,
+        activate=True,
+    )
+    db_session.commit()
+    assert v2.is_active is True
+    assert svc.active_version(product.id).id == v2.id
+
+    # Switch back to v1 — previously could UniqueViolation on ix_product_media_versions_active.
+    activated = svc.activate_existing_version(v1)
+    db_session.commit()
+    db_session.refresh(v1)
+    db_session.refresh(v2)
+    assert activated.id == v1.id
+    assert v1.is_active is True
+    assert v2.is_active is False
+    assert svc.active_version(product.id).id == v1.id

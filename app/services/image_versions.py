@@ -425,9 +425,25 @@ class ImageVersionsService:
             version: ImageVersion | None = None
             if file_gid:
                 version = self.find_by_file_gid(str(file_gid))
-            if version is None and media_gid:
-                # Prefer original matching media gid when file mapping missing.
-                version = self.get_original(product_id=product_id, source_media_gid=str(media_gid))
+            # Only link durable pipeline outputs (GENERATED / non-original). Do not fall back to
+            # every ORIGINAL row via media_gid — that bloated Active snapshot with all gallery images.
+            if version is None and (file_gid or media_gid):
+                q = self.db.query(ImageVersion).filter(
+                    ImageVersion.shop_id == self.shop.id,
+                    ImageVersion.product_id == product_id,
+                    ImageVersion.is_original.is_(False),
+                )
+                if file_gid:
+                    version = q.filter(ImageVersion.shopify_file_gid == str(file_gid)).one_or_none()
+                if version is None and media_gid:
+                    version = (
+                        q.filter(
+                            (ImageVersion.shopify_media_gid == str(media_gid))
+                            | (ImageVersion.source_media_gid == str(media_gid))
+                        )
+                        .order_by(ImageVersion.version_number.desc())
+                        .first()
+                    )
             if version is None:
                 continue
             version.is_published = True

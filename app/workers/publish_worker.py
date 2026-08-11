@@ -276,19 +276,30 @@ class PublishWorker:
         except Exception:
             logger.exception("Rollback run failed | op=%s", operation_id)
             try:
+                db.rollback()
+            except Exception:
+                logger.exception("Session rollback failed in rollback worker | op=%s", operation_id)
+            try:
                 op = (
                     db.query(ProductRollbackOperation)
                     .filter(ProductRollbackOperation.id == operation_id)
                     .one_or_none()
                 )
-                if op and op.status == RollbackStatus.ROLLING_BACK:
+                if op and op.status in {RollbackStatus.QUEUED, RollbackStatus.ROLLING_BACK}:
                     op.status = RollbackStatus.ROLLBACK_FAILED
+                    op.current_stage = "ROLLBACK_FAILED"
                     op.last_error_code = "ROLLBACK_FAILED"
                     op.last_error_message = "Unexpected rollback worker failure"
                     op.completed_at = datetime.now(timezone.utc)
+                    op.locked_by = None
+                    op.locked_at = None
                     db.commit()
             except Exception:
                 logger.exception("Failed to mark rollback op failed | op=%s", operation_id)
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
         finally:
             db.close()
 

@@ -9,6 +9,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.core.shop_resolver import create_shopify_graphql_client
 from app.models import (
@@ -577,11 +578,19 @@ class ProductRollbackService:
             "alreadyActive": bool(active and active.id == target.id),
         }
 
-    def _check_target_files(self, target: ProductMediaVersion) -> dict[str, Any]:
+    def _check_target_files(
+        self,
+        target: ProductMediaVersion,
+        *,
+        commit: bool = True,
+    ) -> dict[str, Any]:
         media = (target.items_json or {}).get("media") or []
         if not media:
             self.versions.mark_unavailable(target, "Version has no media items")
-            self.db.commit()
+            if commit:
+                self.db.commit()
+            else:
+                self.db.flush()
             return {"eligible": False, "reason": "VERSION_INCOMPLETE", "warnings": []}
 
         # Rollback restores durable Shopify Files (CDN). Require file identity per item.
@@ -593,7 +602,10 @@ class ProductRollbackService:
         if missing_file_identity:
             reason = "Version media missing Shopify file/CDN identity"
             self.versions.mark_unavailable(target, reason)
-            self.db.commit()
+            if commit:
+                self.db.commit()
+            else:
+                self.db.flush()
             return {"eligible": False, "reason": reason, "warnings": []}
 
         file_gids = [m.get("file_gid") or m.get("media_gid") for m in media]
@@ -624,12 +636,18 @@ class ProductRollbackService:
         if missing:
             reason = f"Historical Shopify files missing: {', '.join(missing[:3])}"
             self.versions.mark_unavailable(target, reason)
-            self.db.commit()
+            if commit:
+                self.db.commit()
+            else:
+                self.db.flush()
             return {"eligible": False, "reason": reason, "warnings": warnings}
         if not_ready:
             reason = f"Historical Shopify files not ready: {', '.join(not_ready[:3])}"
             self.versions.mark_unavailable(target, reason)
-            self.db.commit()
+            if commit:
+                self.db.commit()
+            else:
+                self.db.flush()
             return {"eligible": False, "reason": reason, "warnings": warnings}
 
         # Enrich snapshot CDN URLs from live Shopify Files (preview + conflict identity).
@@ -642,9 +660,10 @@ class ProductRollbackService:
 
         if not target.rollback_eligible:
             self.versions.mark_eligible(target)
+        if commit:
             self.db.commit()
         else:
-            self.db.commit()
+            self.db.flush()
         return {"eligible": True, "reason": None, "warnings": warnings}
 
     def run(self, operation_id: UUID) -> ProductRollbackOperation:
@@ -673,7 +692,7 @@ class ProductRollbackService:
 
         try:
             self._set_stage(op, "VALIDATING_TARGET")
-            eligibility = self._check_target_files(target)
+            eligibility = self._check_target_files(target, commit=False)
             if not eligibility["eligible"]:
                 raise RollbackError("VERSION_FILE_MISSING", eligibility.get("reason") or "Target files unavailable")
 
@@ -898,23 +917,137 @@ class ProductRollbackService:
 
         except RollbackError as exc:
             if attached_target or detached_current:
-                return self._compensate_and_fail(op, pre_snapshot, target_file_gids, detached_current, exc)
+                return self._safe_compensate_and_fail(
+                    op, pre_snapshot, target_file_gids, detached_current, exc
+                )
             if exc.code == "ROLLBACK_CONFLICT":
                 return self._fail_conflict(op, exc)
             return self._fail(op, exc.code, str(exc), conflict=exc.conflict)
         except ShopifyGraphQLError as exc:
             wrapped = RollbackError("ROLLBACK_ATTACH_FAILED", str(exc))
             if attached_target or detached_current:
-                return self._compensate_and_fail(op, pre_snapshot, target_file_gids, detached_current, wrapped)
+                return self._safe_compensate_and_fail(
+                    op, pre_snapshot, target_file_gids, detached_current, wrapped
+                )
             return self._fail(op, wrapped.code, str(exc))
         except PublishCompensationError as exc:
             return self._fail_restore(op, exc.code, str(exc))
+        except IntegrityError as exc:
+            logger.exception("Rollback integrity error | op=%s", operation_id)
+            try:
+                self.db.rollback()
+            except Exception:
+                logger.exception("Session rollback failed after integrity error | op=%s", operation_id)
+            op = (
+                self.db.query(ProductRollbackOperation)
+                .filter(
+                    ProductRollbackOperation.id == operation_id,
+                    ProductRollbackOperation.shop_id == self.shop.id,
+                )
+                .one_or_none()
+            )
+            if not op:
+                raise
+            # Unique active-version race: Shopify media may already be restored — retry activate.
+            try:
+                target = self.versions.get_version(op.product_id, op.target_version_id)
+                result = self.versions.activate_existing_version(
+                    target,
+                    rollback_operation_id=op.id,
+                )
+                try:
+                    from app.services.image_versions import ImageVersionsService
+
+                    media_items = list((result.items_json or {}).get("media") or [])
+                    ImageVersionsService(self.db, self.shop).mark_published_for_product_version(
+                        product_id=op.product_id,
+                        product_media_version_id=result.id,
+                        media_items=media_items,
+                        actor_type="rollback",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to link image versions after activate recovery | op=%s",
+                        op.id,
+                    )
+                op.result_version_id = result.id
+                op.status = RollbackStatus.ROLLED_BACK
+                op.current_stage = "ROLLED_BACK"
+                op.completed_at = datetime.now(timezone.utc)
+                op.last_error_code = None
+                op.last_error_message = None
+                self.db.commit()
+                logger.info(
+                    "Rollback recovered after integrity error | op=%s target=%s",
+                    op.id,
+                    result.id,
+                )
+                return op
+            except Exception:
+                logger.exception("Rollback activate recovery failed | op=%s", op.id)
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+                op = (
+                    self.db.query(ProductRollbackOperation)
+                    .filter(ProductRollbackOperation.id == operation_id)
+                    .one_or_none()
+                )
+                if op:
+                    return self._fail(
+                        op,
+                        "ROLLBACK_ACTIVATE_FAILED",
+                        "Shopify media restore may have succeeded but activating the version failed",
+                    )
+                raise
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unexpected rollback failure | op=%s", operation_id)
+            try:
+                self.db.rollback()
+            except Exception:
+                logger.exception("Session rollback failed after unexpected rollback error | op=%s", operation_id)
+            op = (
+                self.db.query(ProductRollbackOperation)
+                .filter(
+                    ProductRollbackOperation.id == operation_id,
+                    ProductRollbackOperation.shop_id == self.shop.id,
+                )
+                .one_or_none()
+            )
+            if not op:
+                raise
             wrapped = RollbackError("ROLLBACK_FAILED", str(exc))
             if attached_target or detached_current:
-                return self._compensate_and_fail(op, pre_snapshot, target_file_gids, detached_current, wrapped)
+                return self._safe_compensate_and_fail(
+                    op, pre_snapshot, target_file_gids, detached_current, wrapped
+                )
             return self._fail(op, "ROLLBACK_FAILED", str(exc))
+
+    def _safe_compensate_and_fail(
+        self,
+        op: ProductRollbackOperation,
+        pre_snapshot: dict[str, Any] | None,
+        target_file_gids: list[str],
+        detached_current: bool,
+        exc: RollbackError,
+    ) -> ProductRollbackOperation:
+        try:
+            return self._compensate_and_fail(op, pre_snapshot, target_file_gids, detached_current, exc)
+        except Exception:
+            logger.exception("Compensation path crashed | op=%s", op.id)
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+            fresh = (
+                self.db.query(ProductRollbackOperation)
+                .filter(ProductRollbackOperation.id == op.id)
+                .one_or_none()
+            )
+            if fresh:
+                return self._fail(fresh, exc.code, str(exc), conflict=exc.conflict)
+            raise
 
     def _compensate_and_fail(
         self,
