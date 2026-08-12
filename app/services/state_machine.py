@@ -13,6 +13,7 @@ from app.models.enums import (
 SECONDARY_TRANSITIONS: dict[SecondaryQueueStatus, set[SecondaryQueueStatus]] = {
     SecondaryQueueStatus.PENDING: {
         SecondaryQueueStatus.CLAIMED,
+        SecondaryQueueStatus.CONVERTED,
         SecondaryQueueStatus.SKIPPED_NO_ELIGIBLE_IMAGE_DELTA,
         SecondaryQueueStatus.FAILED_CONVERSION,
     },

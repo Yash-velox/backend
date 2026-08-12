@@ -283,77 +283,412 @@ class PrimaryBatchService:
         )
         return batch
 
+    def _resolve_product_for_secondary(self, item: SecondaryQueueItem) -> Product | None:
+        product = None
+        if item.product_id:
+            product = (
+                self.db.query(Product)
+                .options(selectinload(Product.media))
+                .filter(Product.id == item.product_id)
+                .one_or_none()
+            )
+        if product is None:
+            product = (
+                self.db.query(Product)
+                .options(selectinload(Product.media))
+                .filter(
+                    Product.shop_id == self.shop.id,
+                    Product.shopify_product_gid == item.shopify_product_gid,
+                )
+                .one_or_none()
+            )
+        return product
+
+    def _prepare_baseline_media(
+        self, product: Product | None, *, now: datetime
+    ) -> list[dict]:
+        """Freeze / read ProcessingBaseline media used for delta detection."""
+        if product is None:
+            return []
+        baseline = self._get_or_create_baseline(product)
+        # Only auto-seed when media_snapshot_json is None (never frozen).
+        # An explicit [] means "no prior media" (seeded at webhook before upsert)
+        # and must not be replaced by the post-webhook catalog, or new images
+        # would be hidden. Title-only with None still seeds from catalog so
+        # existing images are not treated as first-seen NEW.
+        if baseline.media_snapshot_json is None:
+            catalog_media = media_snapshots_from_models(
+                [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
+            )
+            if catalog_media:
+                baseline.media_snapshot_json = catalog_media
+                baseline.product_snapshot_json = (
+                    baseline.product_snapshot_json or product_snapshot_from_model(product)
+                )
+                baseline.evaluated_at = now
+                self.db.flush()
+        return list(baseline.media_snapshot_json or [])
+
+    def _inflight_media_snapshots(self, product_gid: str) -> list[dict]:
+        """Media already represented by in-flight automatic Primary work for this product.
+
+        Used so a new QUEUED generation does not re-queue images already covered by a
+        PROCESSING/RETRYING BatchProduct.
+        """
+        images = (
+            self.db.query(BatchImage)
+            .join(BatchProduct, BatchImage.batch_product_id == BatchProduct.id)
+            .join(ProcessingBatch, BatchProduct.batch_id == ProcessingBatch.id)
+            .filter(
+                BatchProduct.shop_id == self.shop.id,
+                BatchProduct.shopify_product_gid == product_gid,
+                BatchProduct.status.in_(
+                    (BatchProductStatus.PROCESSING, BatchProductStatus.RETRYING)
+                ),
+                ProcessingBatch.trigger_type == TriggerType.AUTOMATIC,
+            )
+            .all()
+        )
+        snapshots: list[dict] = []
+        for image in images:
+            snapshots.append(
+                {
+                    "media_gid": image.shopify_media_gid,
+                    "file_gid": image.shopify_file_gid,
+                    "cdn_url": image.cdn_url,
+                    "filename": image.original_filename,
+                    "width": image.width,
+                    "height": image.height,
+                    "mime_type": image.mime_type,
+                    "fingerprint": image.source_fingerprint,
+                }
+            )
+        return snapshots
+
+    def _effective_baseline_media(
+        self, product: Product | None, product_gid: str, *, now: datetime
+    ) -> list[dict]:
+        baseline = self._prepare_baseline_media(product, now=now)
+        inflight = self._inflight_media_snapshots(product_gid)
+        if not inflight:
+            return baseline
+        seen: set[str] = set()
+        merged: list[dict] = []
+        for entry in baseline + inflight:
+            gid = str(entry.get("media_gid") or entry.get("shopify_media_gid") or "")
+            if gid and gid in seen:
+                continue
+            if gid:
+                seen.add(gid)
+            merged.append(entry)
+        return merged
+
+    def _find_queued_automatic_batch_product(
+        self, product_gid: str, *, for_update: bool = True
+    ) -> BatchProduct | None:
+        """Find the single automatic QUEUED BatchProduct generation for this product.
+
+        Batch may already be PROCESSING (other products started) — the product row is
+        still refreshable until *this* BatchProduct leaves QUEUED. We never use that
+        batch for capacity fills of *other* products once the batch is PROCESSING.
+        """
+        stmt = (
+            select(BatchProduct)
+            .join(ProcessingBatch, BatchProduct.batch_id == ProcessingBatch.id)
+            .where(
+                BatchProduct.shop_id == self.shop.id,
+                BatchProduct.shopify_product_gid == product_gid,
+                BatchProduct.status == BatchProductStatus.QUEUED,
+                ProcessingBatch.trigger_type == TriggerType.AUTOMATIC,
+            )
+            .order_by(BatchProduct.created_at.asc(), BatchProduct.id.asc())
+            .limit(1)
+        )
+        if for_update:
+            dialect = self.db.bind.dialect.name if self.db.bind is not None else ""
+            if dialect == "postgresql":
+                stmt = stmt.with_for_update(of=BatchProduct)
+            else:
+                stmt = stmt.with_for_update()
+        return self.db.execute(stmt).scalars().first()
+
+    def _batch_product_count(self, batch_id: UUID) -> int:
+        return int(
+            self.db.query(func.count(BatchProduct.id))
+            .filter(BatchProduct.batch_id == batch_id)
+            .scalar()
+            or 0
+        )
+
+    def _lock_oldest_fillable_automatic_batch(
+        self, *, capacity: int
+    ) -> ProcessingBatch | None:
+        """Oldest AUTOMATIC + QUEUED batch with free product capacity, row-locked."""
+        dialect = self.db.bind.dialect.name if self.db.bind is not None else ""
+        stmt = (
+            select(ProcessingBatch)
+            .where(
+                ProcessingBatch.shop_id == self.shop.id,
+                ProcessingBatch.trigger_type == TriggerType.AUTOMATIC,
+                ProcessingBatch.status == BatchStatus.QUEUED,
+            )
+            .order_by(ProcessingBatch.created_at.asc(), ProcessingBatch.id.asc())
+        )
+        if dialect == "postgresql":
+            stmt = stmt.with_for_update(of=ProcessingBatch)
+        else:
+            stmt = stmt.with_for_update()
+
+        candidates = list(self.db.execute(stmt).scalars().all())
+        for batch in candidates:
+            if self._batch_product_count(batch.id) < capacity:
+                return batch
+        return None
+
+    def _create_automatic_batch(self, shop_settings: ShopSettings, *, now: datetime) -> ProcessingBatch:
+        batch = ProcessingBatch(
+            shop_id=self.shop.id,
+            trigger_type=TriggerType.AUTOMATIC,
+            status=BatchStatus.QUEUED,
+            settings_snapshot_json={
+                "batch_interval_minutes": shop_settings.batch_interval_minutes,
+                "auto_batch_product_limit": settings.auto_batch_product_limit,
+            },
+            started_at=now,
+        )
+        self.db.add(batch)
+        self.db.flush()
+        logger.info(
+            "Created new automatic batch because no eligible queued capacity remained | shop=%s batch=%s",
+            self.shop.id,
+            batch.id,
+        )
+        return batch
+
+    def _allocate_automatic_batch_for_insert(
+        self, shop_settings: ShopSettings, *, now: datetime, capacity: int
+    ) -> ProcessingBatch:
+        batch = self._lock_oldest_fillable_automatic_batch(capacity=capacity)
+        if batch is not None:
+            logger.info(
+                "Added product to existing automatic queued batch | shop=%s batch=%s capacity=%s",
+                self.shop.id,
+                batch.id,
+                capacity,
+            )
+            return batch
+        return self._create_automatic_batch(shop_settings, now=now)
+
+    def _replace_batch_images(self, batch_product: BatchProduct, delta_images: list[dict]) -> int:
+        """Replace QUEUED BatchImage rows for a still-QUEUED BatchProduct."""
+        if batch_product.status != BatchProductStatus.QUEUED:
+            raise PrimaryBatchError("Cannot rebuild images for a non-QUEUED BatchProduct")
+        (
+            self.db.query(BatchImage)
+            .filter(BatchImage.batch_product_id == batch_product.id)
+            .delete(synchronize_session=False)
+        )
+        self.db.flush()
+        created = 0
+        for media in delta_images:
+            delta_type = DeltaType(media.get("delta_type", DeltaType.NEW.value))
+            self.db.add(
+                BatchImage(
+                    batch_product_id=batch_product.id,
+                    shop_id=self.shop.id,
+                    shopify_media_gid=media.get("media_gid") or "",
+                    shopify_file_gid=media.get("file_gid"),
+                    cdn_url=media.get("cdn_url") or "",
+                    original_filename=media.get("filename"),
+                    width=media.get("width"),
+                    height=media.get("height"),
+                    mime_type=media.get("mime_type"),
+                    source_fingerprint=media.get("fingerprint"),
+                    delta_type=delta_type,
+                    status=BatchImageStatus.QUEUED,
+                )
+            )
+            created += 1
+        batch_product.image_count = created
+        self.db.flush()
+        return created
+
+    def _refresh_queued_batch_product(
+        self,
+        batch_product: BatchProduct,
+        *,
+        eligible_product: dict,
+        eligible_media: list[dict],
+        delta_images: list[dict],
+        product: Product | None,
+    ) -> ProcessingBatch:
+        # Re-check immutability under lock: never mutate started work.
+        self.db.refresh(batch_product)
+        if batch_product.status != BatchProductStatus.QUEUED:
+            raise PrimaryBatchError(
+                f"BatchProduct {batch_product.id} is no longer QUEUED; refusing refresh"
+            )
+        batch = (
+            self.db.query(ProcessingBatch)
+            .filter(ProcessingBatch.id == batch_product.batch_id)
+            .one()
+        )
+        if batch.trigger_type != TriggerType.AUTOMATIC:
+            raise PrimaryBatchError(
+                f"Batch {batch.id} is not automatic; refusing refresh"
+            )
+
+        batch_product.product_id = product.id if product else batch_product.product_id
+        batch_product.product_snapshot_json = eligible_product
+        batch_product.prompt_snapshot_json = None
+        batch_product.baseline_snapshot_json = {
+            "product": eligible_product,
+            "media": eligible_media,
+        }
+        self._replace_batch_images(batch_product, delta_images)
+        self.refresh_batch_counters(batch)
+        logger.info(
+            "Refreshed queued primary product with latest secondary snapshot | shop=%s product=%s batch=%s batch_product=%s images=%s",
+            self.shop.id,
+            batch_product.shopify_product_gid,
+            batch.id,
+            batch_product.id,
+            len(delta_images),
+        )
+        return batch
+
+    def _remove_queued_batch_product_no_delta(self, batch_product: BatchProduct) -> ProcessingBatch | None:
+        """Drop a QUEUED product that no longer has an eligible delta after refresh."""
+        batch = (
+            self.db.query(ProcessingBatch)
+            .filter(ProcessingBatch.id == batch_product.batch_id)
+            .one()
+        )
+        self.db.delete(batch_product)
+        self.db.flush()
+        self.refresh_batch_counters(batch)
+        if (
+            batch.product_count == 0
+            and batch.status == BatchStatus.QUEUED
+            and batch.trigger_type == TriggerType.AUTOMATIC
+        ):
+            logger.info(
+                "Deleted empty automatic queued batch after no-delta refresh | shop=%s batch=%s",
+                self.shop.id,
+                batch.id,
+            )
+            self.db.delete(batch)
+            self.db.flush()
+            return None
+        return batch
+
+    def _insert_queued_batch_product(
+        self,
+        batch: ProcessingBatch,
+        *,
+        product_gid: str,
+        eligible_product: dict,
+        eligible_media: list[dict],
+        delta_images: list[dict],
+        product: Product | None,
+        capacity: int,
+    ) -> BatchProduct:
+        # Capacity re-check while batch row is locked by caller.
+        if batch.status != BatchStatus.QUEUED or batch.trigger_type != TriggerType.AUTOMATIC:
+            raise PrimaryBatchError("Cannot insert into a non-automatic QUEUED batch")
+        if self._batch_product_count(batch.id) >= capacity:
+            raise PrimaryBatchError(f"Automatic batch {batch.id} is at capacity ({capacity})")
+
+        batch_product = BatchProduct(
+            batch_id=batch.id,
+            shop_id=self.shop.id,
+            shopify_product_gid=product_gid,
+            product_id=product.id if product else None,
+            product_snapshot_json=eligible_product,
+            prompt_snapshot_json=None,
+            # Conflict check compares against media at process start (eligible),
+            # not prior ProcessingBaseline (used only for delta detection above).
+            baseline_snapshot_json={
+                "product": eligible_product,
+                "media": eligible_media,
+            },
+            status=BatchProductStatus.QUEUED,
+            image_count=len(delta_images),
+        )
+        self.db.add(batch_product)
+        self.db.flush()
+        self._replace_batch_images(batch_product, delta_images)
+        self.refresh_batch_counters(batch)
+        return batch_product
+
+    def _mark_secondary_converted(
+        self, item: SecondaryQueueItem, batch: ProcessingBatch | None
+    ) -> None:
+        assert_transition(
+            "secondary_queue",
+            SECONDARY_TRANSITIONS,
+            item.status,
+            SecondaryQueueStatus.CONVERTED,
+        )
+        item.status = SecondaryQueueStatus.CONVERTED
+        item.converted_batch_id = batch.id if batch else None
+        item.skip_reason = None
+        item.failure_reason = None
+
+    def _mark_secondary_skipped_no_delta(
+        self,
+        item: SecondaryQueueItem,
+        *,
+        product: Product | None,
+        eligible_product: dict,
+        eligible_media: list[dict],
+        skip_reason: str,
+    ) -> None:
+        assert_transition(
+            "secondary_queue",
+            SECONDARY_TRANSITIONS,
+            item.status,
+            SecondaryQueueStatus.SKIPPED_NO_ELIGIBLE_IMAGE_DELTA,
+        )
+        item.status = SecondaryQueueStatus.SKIPPED_NO_ELIGIBLE_IMAGE_DELTA
+        item.skip_reason = skip_reason
+        if product:
+            self._advance_evaluated_baseline(
+                product,
+                product_snapshot=eligible_product,
+                media_snapshot=eligible_media,
+            )
+
     def convert_secondary_items(self, items: list[SecondaryQueueItem]) -> ProcessingBatch | None:
+        """Convert claimed Secondary Queue items into automatic Primary work.
+
+        Rules:
+        - Refresh an existing automatic QUEUED BatchProduct for the same product (no new slot).
+        - Otherwise insert into the oldest automatic QUEUED batch with free capacity.
+        - Never fill MANUAL or PROCESSING batches.
+        - Exclude in-flight PROCESSING/RETRYING media from the new delta.
+        """
         if not items:
             return None
 
         shop_settings = ensure_shop_settings(self.db, self.shop)
         now = datetime.now(timezone.utc)
-        batch: ProcessingBatch | None = None
-        batch_products_created = 0
-        batch_images_created = 0
+        capacity = max(int(settings.auto_batch_product_limit), 1)
+        touched_batches: dict[UUID, ProcessingBatch] = {}
+        first_batch: ProcessingBatch | None = None
 
         for item in items:
             try:
-                product = None
-                if item.product_id:
-                    product = (
-                        self.db.query(Product)
-                        .options(selectinload(Product.media))
-                        .filter(Product.id == item.product_id)
-                        .one_or_none()
-                    )
-                if product is None:
-                    product = (
-                        self.db.query(Product)
-                        .options(selectinload(Product.media))
-                        .filter(
-                            Product.shop_id == self.shop.id,
-                            Product.shopify_product_gid == item.shopify_product_gid,
-                        )
-                        .one_or_none()
-                    )
-
+                product = self._resolve_product_for_secondary(item)
                 eligible_product = item.eligible_product_snapshot_json or {}
                 eligible_media = item.eligible_media_snapshot_json or []
+                product_gid = item.shopify_product_gid
 
-                baseline_media: list[dict] | None = None
-                if product:
-                    baseline = self._get_or_create_baseline(product)
-                    # Only auto-seed when media_snapshot_json is None (never frozen).
-                    # An explicit [] means "no prior media" (seeded at webhook before upsert)
-                    # and must not be replaced by the post-webhook catalog, or new images
-                    # would be hidden. Title-only with None still seeds from catalog so
-                    # existing images are not treated as first-seen NEW.
-                    if baseline.media_snapshot_json is None:
-                        catalog_media = media_snapshots_from_models(
-                            [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
-                        )
-                        if catalog_media:
-                            baseline.media_snapshot_json = catalog_media
-                            baseline.product_snapshot_json = (
-                                baseline.product_snapshot_json
-                                or product_snapshot_from_model(product)
-                            )
-                            baseline.evaluated_at = now
-                            self.db.flush()
-                    baseline_media = baseline.media_snapshot_json or []
-                else:
-                    baseline = None
-
-                delta = compare_media_snapshots(eligible_media, baseline_media)
-
-                if delta["skip_reason"]:
-                    item.status = SecondaryQueueStatus.SKIPPED_NO_ELIGIBLE_IMAGE_DELTA
-                    item.skip_reason = delta["skip_reason"]
-                    if product:
-                        self._advance_evaluated_baseline(
-                            product,
-                            product_snapshot=eligible_product,
-                            media_snapshot=eligible_media,
-                        )
-                    self.db.commit()
-                    continue
+                effective_baseline = self._effective_baseline_media(
+                    product, product_gid, now=now
+                )
+                delta = compare_media_snapshots(eligible_media, effective_baseline)
+                delta_images = delta["new"] + delta["replaced"]
 
                 type_override = None
                 if product is None or not (product.product_type or "").strip():
@@ -363,8 +698,72 @@ class PrimaryBatchService:
                 label = (
                     (product.title if product else None)
                     or eligible_product.get("title")
-                    or item.shopify_product_gid
+                    or product_gid
                 )
+
+                queued_bp = self._find_queued_automatic_batch_product(product_gid, for_update=True)
+
+                if queued_bp is not None:
+                    # Prompt gate only when we still have work to keep/refresh.
+                    if not delta["skip_reason"]:
+                        try:
+                            self._require_prompts_ready(
+                                product,
+                                product_type_override=str(type_override) if type_override else None,
+                                product_label=str(label) if label else None,
+                            )
+                        except PrimaryBatchError as exc:
+                            assert_transition(
+                                "secondary_queue",
+                                SECONDARY_TRANSITIONS,
+                                item.status,
+                                SecondaryQueueStatus.FAILED_CONVERSION,
+                            )
+                            item.status = SecondaryQueueStatus.FAILED_CONVERSION
+                            item.failure_reason = str(exc)[:2000]
+                            item.skip_reason = None
+                            self.db.commit()
+                            continue
+
+                    if delta["skip_reason"]:
+                        removed_batch = self._remove_queued_batch_product_no_delta(queued_bp)
+                        self._mark_secondary_skipped_no_delta(
+                            item,
+                            product=product,
+                            eligible_product=eligible_product,
+                            eligible_media=eligible_media,
+                            skip_reason=delta["skip_reason"],
+                        )
+                        if removed_batch is not None:
+                            touched_batches[removed_batch.id] = removed_batch
+                        self.db.commit()
+                        continue
+
+                    batch = self._refresh_queued_batch_product(
+                        queued_bp,
+                        eligible_product=eligible_product,
+                        eligible_media=eligible_media,
+                        delta_images=delta_images,
+                        product=product,
+                    )
+                    self._mark_secondary_converted(item, batch)
+                    touched_batches[batch.id] = batch
+                    if first_batch is None:
+                        first_batch = batch
+                    self.db.commit()
+                    continue
+
+                if delta["skip_reason"]:
+                    self._mark_secondary_skipped_no_delta(
+                        item,
+                        product=product,
+                        eligible_product=eligible_product,
+                        eligible_media=eligible_media,
+                        skip_reason=delta["skip_reason"],
+                    )
+                    self.db.commit()
+                    continue
+
                 try:
                     self._require_prompts_ready(
                         product,
@@ -384,64 +783,89 @@ class PrimaryBatchService:
                     self.db.commit()
                     continue
 
-                if batch is None:
-                    batch = ProcessingBatch(
-                        shop_id=self.shop.id,
-                        trigger_type=TriggerType.AUTOMATIC,
-                        status=BatchStatus.QUEUED,
-                        settings_snapshot_json={
-                            "batch_interval_minutes": shop_settings.batch_interval_minutes,
-                        },
-                        started_at=now,
+                processing_exists = (
+                    self.db.query(BatchProduct.id)
+                    .join(ProcessingBatch, BatchProduct.batch_id == ProcessingBatch.id)
+                    .filter(
+                        BatchProduct.shop_id == self.shop.id,
+                        BatchProduct.shopify_product_gid == product_gid,
+                        BatchProduct.status.in_(
+                            (BatchProductStatus.PROCESSING, BatchProductStatus.RETRYING)
+                        ),
+                        ProcessingBatch.trigger_type == TriggerType.AUTOMATIC,
                     )
-                    self.db.add(batch)
-                    self.db.flush()
-
-                delta_images = delta["new"] + delta["replaced"]
-
-                batch_product = BatchProduct(
-                    batch_id=batch.id,
-                    shop_id=self.shop.id,
-                    shopify_product_gid=item.shopify_product_gid,
-                    product_id=product.id if product else None,
-                    product_snapshot_json=eligible_product,
-                    prompt_snapshot_json=None,
-                    # Conflict check compares against media at process start (eligible),
-                    # not prior ProcessingBaseline (used only for delta detection above).
-                    baseline_snapshot_json={
-                        "product": eligible_product,
-                        "media": eligible_media,
-                    },
-                    status=BatchProductStatus.QUEUED,
-                    image_count=len(delta_images),
+                    .first()
+                    is not None
                 )
-                self.db.add(batch_product)
-                self.db.flush()
-
-                for media in delta_images:
-                    delta_type = DeltaType(media.get("delta_type", DeltaType.NEW.value))
-                    self.db.add(
-                        BatchImage(
-                            batch_product_id=batch_product.id,
-                            shop_id=self.shop.id,
-                            shopify_media_gid=media.get("media_gid") or "",
-                            shopify_file_gid=media.get("file_gid"),
-                            cdn_url=media.get("cdn_url") or "",
-                            original_filename=media.get("filename"),
-                            width=media.get("width"),
-                            height=media.get("height"),
-                            mime_type=media.get("mime_type"),
-                            source_fingerprint=media.get("fingerprint"),
-                            delta_type=delta_type,
-                            status=BatchImageStatus.QUEUED,
-                        )
+                if processing_exists:
+                    logger.info(
+                        "Existing product processing; created new queued generation | shop=%s product=%s",
+                        self.shop.id,
+                        product_gid,
                     )
-                    batch_images_created += 1
 
-                item.status = SecondaryQueueStatus.CONVERTED
-                item.converted_batch_id = batch.id
-                item.skip_reason = None
-                batch_products_created += 1
+                # Insert with savepoint so a unique-QUEUED race can fall back to refresh.
+                batch: ProcessingBatch | None = None
+                try:
+                    with self.db.begin_nested():
+                        batch = self._allocate_automatic_batch_for_insert(
+                            shop_settings, now=now, capacity=capacity
+                        )
+                        # Re-lock capacity path: if allocate created new batch while another
+                        # fillable batch appeared, prefer fillable oldest under lock again.
+                        if self._batch_product_count(batch.id) >= capacity:
+                            batch = self._allocate_automatic_batch_for_insert(
+                                shop_settings, now=now, capacity=capacity
+                            )
+                        self._insert_queued_batch_product(
+                            batch,
+                            product_gid=product_gid,
+                            eligible_product=eligible_product,
+                            eligible_media=eligible_media,
+                            delta_images=delta_images,
+                            product=product,
+                            capacity=capacity,
+                        )
+                except IntegrityError:
+                    # Concurrent converter created the QUEUED generation first.
+                    self.db.expire_all()
+                    raced = self._find_queued_automatic_batch_product(
+                        product_gid, for_update=True
+                    )
+                    if raced is None:
+                        raise
+                    logger.info(
+                        "Concurrent queued product insert raced; refreshing winner | shop=%s product=%s",
+                        self.shop.id,
+                        product_gid,
+                    )
+                    batch = self._refresh_queued_batch_product(
+                        raced,
+                        eligible_product=eligible_product,
+                        eligible_media=eligible_media,
+                        delta_images=delta_images,
+                        product=product,
+                    )
+                except PrimaryBatchError:
+                    # Capacity race: retry allocate once more outside the failed path.
+                    batch = self._allocate_automatic_batch_for_insert(
+                        shop_settings, now=now, capacity=capacity
+                    )
+                    self._insert_queued_batch_product(
+                        batch,
+                        product_gid=product_gid,
+                        eligible_product=eligible_product,
+                        eligible_media=eligible_media,
+                        delta_images=delta_images,
+                        product=product,
+                        capacity=capacity,
+                    )
+
+                assert batch is not None
+                self._mark_secondary_converted(item, batch)
+                touched_batches[batch.id] = batch
+                if first_batch is None:
+                    first_batch = batch
                 self.db.commit()
             except Exception as exc:
                 logger.exception(
@@ -449,27 +873,60 @@ class PrimaryBatchService:
                     self.shop.id,
                     item.id,
                 )
-                item.status = SecondaryQueueStatus.FAILED_CONVERSION
-                item.failure_reason = str(exc)[:2000]
-                self.db.commit()
+                try:
+                    self.db.rollback()
+                except Exception:
+                    logger.exception("Rollback after conversion failure failed")
+                # Re-bind item after rollback if needed
+                item = self.db.merge(item)
+                try:
+                    if item.status in {
+                        SecondaryQueueStatus.CLAIMED,
+                        SecondaryQueueStatus.PENDING,
+                    }:
+                        assert_transition(
+                            "secondary_queue",
+                            SECONDARY_TRANSITIONS,
+                            item.status,
+                            SecondaryQueueStatus.FAILED_CONVERSION,
+                        )
+                        item.status = SecondaryQueueStatus.FAILED_CONVERSION
+                        item.failure_reason = str(exc)[:2000]
+                        self.db.commit()
+                except Exception:
+                    logger.exception(
+                        "Failed to mark secondary item FAILED_CONVERSION | item=%s", item.id
+                    )
+                    self.db.rollback()
 
-        if batch is None:
-            return None
+        for batch in touched_batches.values():
+            # Row may have been deleted (empty after no-delta refresh).
+            still = (
+                self.db.query(ProcessingBatch)
+                .filter(ProcessingBatch.id == batch.id)
+                .one_or_none()
+            )
+            if still is None:
+                continue
+            self.refresh_batch_counters(still)
+        if touched_batches:
+            self.db.commit()
 
-        batch.product_count = batch_products_created
-        batch.image_count = batch_images_created
-        batch.pending_product_count = batch_products_created
-        self.refresh_batch_counters(batch)
-        self.db.commit()
-        self.db.refresh(batch)
-        logger.info(
-            "Automatic batch converted | shop=%s batch=%s products=%s images=%s",
-            self.shop.id,
-            batch.id,
-            batch.product_count,
-            batch.image_count,
-        )
-        return batch
+        if first_batch is not None:
+            first_batch = (
+                self.db.query(ProcessingBatch)
+                .filter(ProcessingBatch.id == first_batch.id)
+                .one_or_none()
+            )
+        if first_batch is not None:
+            self.db.refresh(first_batch)
+            logger.info(
+                "Automatic batch conversion complete | shop=%s primary_batch=%s touched=%s",
+                self.shop.id,
+                first_batch.id,
+                len(touched_batches),
+            )
+        return first_batch
 
     def refresh_batch_counters(self, batch: ProcessingBatch) -> ProcessingBatch:
         # Session uses autoflush=False; flush so in-transaction status changes are

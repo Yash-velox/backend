@@ -422,6 +422,16 @@ class BatchProduct(Base):
         UniqueConstraint("batch_id", "shopify_product_gid", name="uq_batch_product"),
         Index("ix_batch_products_batch_status", "batch_id", "status"),
         Index("ix_batch_products_claim", "status", "claimed_at"),
+        Index("ix_batch_products_shop_product_status", "shop_id", "shopify_product_gid", "status"),
+        # At most one QUEUED Primary generation per shop+product (PROCESSING + QUEUED is allowed).
+        Index(
+            "uq_batch_product_queued_shop_product",
+            "shop_id",
+            "shopify_product_gid",
+            unique=True,
+            sqlite_where=text("status = 'QUEUED'"),
+            postgresql_where=text("status = 'QUEUED'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
