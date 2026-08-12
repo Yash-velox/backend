@@ -217,6 +217,7 @@ def get_media_version(product_id: UUID, version_id: UUID, request: Request, db: 
                     "versionNumber": iv.version_number,
                     "versionType": iv.version_type.value,
                     "shopifyFileGid": iv.shopify_file_gid,
+                    "shopifyMediaGid": iv.shopify_media_gid,
                     "shopifyCdnUrl": iv.shopify_cdn_url,
                     "fileSizeBytes": iv.file_size_bytes,
                     "width": iv.width,
