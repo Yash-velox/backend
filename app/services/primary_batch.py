@@ -283,6 +283,144 @@ class PrimaryBatchService:
         )
         return batch
 
+    def create_selective_manual_batch(
+        self,
+        product_gid: str,
+        media_gids: list[str],
+        *,
+        prompt_override: list[dict] | None = None,
+        settings_extra: dict | None = None,
+    ) -> ProcessingBatch:
+        """Create a one-product manual batch for selected live images only.
+
+        Baseline snapshot is the full live gallery so publish conflict checks stay
+        accurate. Only the selected images are queued for AI work.
+        """
+        product = self._load_or_refresh_product(product_gid)
+        if product is None:
+            raise PrimaryBatchError(f"Product not found: {product_gid}")
+        self._require_prompts_ready(product)
+
+        wanted: list[str] = []
+        seen: set[str] = set()
+        for raw in media_gids:
+            gid = str(raw or "").strip()
+            if gid and gid not in seen:
+                seen.add(gid)
+                wanted.append(gid)
+        if not wanted:
+            raise PrimaryBatchError("Select at least one live image to reprocess.")
+
+        visible = [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
+        if not visible:
+            raise PrimaryBatchError(f"Product has no visible media: {product_gid}")
+        by_media = {m.shopify_media_gid: m for m in visible}
+        by_file = {m.shopify_file_gid: m for m in visible if m.shopify_file_gid}
+        selected = []
+        missing: list[str] = []
+        for gid in wanted:
+            media = by_media.get(gid) or by_file.get(gid)
+            if media is None:
+                missing.append(gid)
+            else:
+                selected.append(media)
+        if missing:
+            raise PrimaryBatchError(
+                "One or more selected images are not on the live product."
+            )
+
+        inflight = (
+            self.db.query(BatchProduct)
+            .filter(
+                BatchProduct.shop_id == self.shop.id,
+                BatchProduct.shopify_product_gid == product.shopify_product_gid,
+                BatchProduct.status.in_(
+                    (
+                        BatchProductStatus.QUEUED,
+                        BatchProductStatus.PROCESSING,
+                        BatchProductStatus.RETRYING,
+                    )
+                ),
+            )
+            .first()
+        )
+        if inflight:
+            raise PrimaryBatchError(
+                "This product already has processing in progress. Wait for it to finish."
+            )
+
+        shop_settings = ensure_shop_settings(self.db, self.shop)
+        now = datetime.now(timezone.utc)
+        snap: dict = {
+            "batch_interval_minutes": shop_settings.batch_interval_minutes,
+            "manual_batch_product_limit": settings.manual_batch_product_limit,
+        }
+        if settings_extra:
+            snap.update(settings_extra)
+
+        batch = ProcessingBatch(
+            shop_id=self.shop.id,
+            trigger_type=TriggerType.MANUAL,
+            status=BatchStatus.QUEUED,
+            settings_snapshot_json=snap,
+        )
+        self.db.add(batch)
+        self.db.flush()
+
+        product_snapshot = product_snapshot_from_model(product)
+        full_media_snapshot = media_snapshots_from_models(visible)
+        batch_product = BatchProduct(
+            batch_id=batch.id,
+            shop_id=self.shop.id,
+            shopify_product_gid=product.shopify_product_gid,
+            product_id=product.id,
+            product_snapshot_json=product_snapshot,
+            prompt_snapshot_json=None,
+            prompt_override_json=prompt_override,
+            baseline_snapshot_json={
+                "product": product_snapshot,
+                "media": full_media_snapshot,
+            },
+            status=BatchProductStatus.QUEUED,
+            image_count=len(selected),
+        )
+        self.db.add(batch_product)
+        self.db.flush()
+
+        for media in selected:
+            self.db.add(
+                BatchImage(
+                    batch_product_id=batch_product.id,
+                    shop_id=self.shop.id,
+                    shopify_media_gid=media.shopify_media_gid,
+                    shopify_file_gid=media.shopify_file_gid,
+                    cdn_url=media.cdn_url or "",
+                    original_filename=media.original_filename,
+                    width=media.width,
+                    height=media.height,
+                    mime_type=media.mime_type,
+                    source_fingerprint=media.content_fingerprint,
+                    delta_type=DeltaType.REPLACED,
+                    status=BatchImageStatus.QUEUED,
+                )
+            )
+
+        batch.product_count = 1
+        batch.image_count = len(selected)
+        batch.pending_product_count = 1
+        batch.started_at = now
+        self._get_or_create_baseline(product)
+        self.db.commit()
+        self.db.refresh(batch)
+        logger.info(
+            "Live reprocess batch created | shop=%s batch=%s product=%s images=%s",
+            self.shop.id,
+            batch.id,
+            product.shopify_product_gid,
+            batch.image_count,
+        )
+        return batch
+
     def _resolve_product_for_secondary(self, item: SecondaryQueueItem) -> Product | None:
         product = None
         if item.product_id:
@@ -1012,6 +1150,18 @@ class PrimaryBatchService:
                         "Publish trigger after batch terminal failed | batch=%s",
                         batch.id,
                     )
+
+        try:
+            from app.services.publish_trigger import PublishTriggerService
+
+            PublishTriggerService(self.db, self.shop).maybe_auto_publish_completed_products(
+                batch, commit=False
+            )
+        except Exception:
+            logger.exception(
+                "Auto-publish of completed products failed | batch=%s",
+                batch.id,
+            )
 
         self.db.flush()
         return batch

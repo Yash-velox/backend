@@ -19,7 +19,8 @@ from app.models import (
     PublishStatus,
     Shop,
 )
-from app.services.primary_batch import PrimaryBatchService
+from app.services.media_versions import product_has_active_media_op
+from app.services.primary_batch import PrimaryBatchError, PrimaryBatchService
 from app.services.prompt_resolver import PromptResolver, PromptResolverError
 from app.services.prompt_variables import PromptVariableError, validate_prompt_variables
 from app.services.state_machine import BATCH_IMAGE_TRANSITIONS, BATCH_PRODUCT_TRANSITIONS, assert_transition
@@ -49,6 +50,21 @@ BLOCKING_PUBLISH_STATUSES = frozenset(
     {
         PublishStatus.QUEUED,
         PublishStatus.PUBLISHING,
+    }
+)
+
+LIVE_REPROCESS_NOTE = (
+    "Edited prompts apply to this live reprocess only and do not change saved Prompt Configuration. "
+    "After you apply, selected live images are processed and published automatically. "
+    "That apply cannot be undone on its own — revert a stored complete version (v1, v2, …) to restore "
+    "an earlier image set."
+)
+
+INFLIGHT_PRODUCT_STATUSES = frozenset(
+    {
+        BatchProductStatus.QUEUED,
+        BatchProductStatus.PROCESSING,
+        BatchProductStatus.RETRYING,
     }
 )
 
@@ -274,6 +290,137 @@ class ReprocessService:
             "imageId": str(image.id),
             "usedPromptOverride": override is not None,
         }
+
+    def preview_live(self, catalog_product_id: UUID) -> dict[str, Any]:
+        product = self._get_catalog_product(catalog_product_id)
+        self._assert_live_reprocessable(product)
+        images = self._live_media_out(product)
+        if not images:
+            raise ReprocessError(
+                "This product has no live images to reprocess.",
+                code="REPROCESS_NO_LIVE_IMAGES",
+            )
+        try:
+            resolved = self.resolver.resolve_for_product(product, image=None, image_position=1)
+        except PromptResolverError as exc:
+            raise ReprocessError(str(exc), code=exc.code) from exc
+        steps = [
+            {
+                "step": s.step_order,
+                "name": s.name,
+                "promptTemplate": s.prompt_text,
+                "renderedPrompt": s.rendered_prompt,
+                "variables": s.variables,
+            }
+            for s in resolved
+        ]
+        return {
+            "scope": "live",
+            "productId": str(product.id),
+            "shopifyProductGid": product.shopify_product_gid,
+            "productType": product.product_type,
+            "imageCount": len(images),
+            "images": images,
+            "oneTimeOverride": True,
+            "autoPublish": True,
+            "note": LIVE_REPROCESS_NOTE,
+            "steps": steps,
+        }
+
+    def reprocess_live(
+        self,
+        catalog_product_id: UUID,
+        *,
+        media_gids: list[str],
+        steps: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        product = self._get_catalog_product(catalog_product_id)
+        self._assert_live_reprocessable(product)
+        override = normalize_override_steps(steps)
+        try:
+            batch = self.primary.create_selective_manual_batch(
+                product.shopify_product_gid,
+                media_gids,
+                prompt_override=override,
+                settings_extra={"live_reprocess": True, "auto_publish": True},
+            )
+        except PrimaryBatchError as exc:
+            raise ReprocessError(str(exc), code="REPROCESS_NOT_ELIGIBLE") from exc
+        batch_product = (
+            self.db.query(BatchProduct)
+            .filter(BatchProduct.batch_id == batch.id, BatchProduct.shop_id == self.shop.id)
+            .one()
+        )
+        return {
+            "scope": "live",
+            "batchId": str(batch.id),
+            "productId": str(product.id),
+            "batchProductId": str(batch_product.id),
+            "shopifyProductGid": product.shopify_product_gid,
+            "imageCount": batch.image_count,
+            "usedPromptOverride": override is not None,
+            "autoPublish": True,
+        }
+
+    def _get_catalog_product(self, product_id: UUID) -> Product:
+        product = (
+            self.db.query(Product)
+            .options(selectinload(Product.media))
+            .filter(Product.id == product_id, Product.shop_id == self.shop.id)
+            .one_or_none()
+        )
+        if product is None:
+            raise ReprocessError("Product not found", code="PRODUCT_NOT_FOUND", status_code=404)
+        return product
+
+    def _assert_live_reprocessable(self, product: Product) -> None:
+        lock = product_has_active_media_op(
+            self.db, shop_id=self.shop.id, shopify_product_gid=product.shopify_product_gid
+        )
+        if lock == "PUBLISH_ALREADY_ACTIVE":
+            raise ReprocessError(
+                "Cannot reprocess while a publish operation is in progress.",
+                code="REPROCESS_PUBLISH_ACTIVE",
+            )
+        if lock == "ROLLBACK_ALREADY_ACTIVE":
+            raise ReprocessError(
+                "Cannot reprocess while a rollback is in progress.",
+                code="REPROCESS_ROLLBACK_ACTIVE",
+            )
+        inflight = (
+            self.db.query(BatchProduct)
+            .filter(
+                BatchProduct.shop_id == self.shop.id,
+                BatchProduct.shopify_product_gid == product.shopify_product_gid,
+                BatchProduct.status.in_(list(INFLIGHT_PRODUCT_STATUSES)),
+            )
+            .first()
+        )
+        if inflight:
+            raise ReprocessError(
+                "This product already has processing in progress. Wait for it to finish.",
+                code="REPROCESS_NOT_ELIGIBLE",
+            )
+
+    def _live_media_out(self, product: Product) -> list[dict[str, Any]]:
+        rows = [
+            m
+            for m in (product.media or [])
+            if m.is_visible and m.is_active and m.cdn_url
+        ]
+        rows.sort(key=lambda m: (m.position is None, m.position or 0, str(m.shopify_media_gid)))
+        return [
+            {
+                "mediaGid": m.shopify_media_gid,
+                "fileGid": m.shopify_file_gid,
+                "cdnUrl": m.cdn_url,
+                "filename": m.original_filename,
+                "altText": m.alt_text,
+                "position": m.position,
+                "isPrimary": bool(m.is_primary),
+            }
+            for m in rows
+        ]
 
     def _queue_product(
         self,

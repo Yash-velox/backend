@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -16,6 +16,7 @@ from app.models import (
     DeltaType,
     ProcessingBatch,
     Product,
+    ProductMedia,
     TriggerType,
 )
 from app.services.prompt_configuration import PromptConfigurationService
@@ -169,3 +170,115 @@ def test_reprocess_rejects_processing_product(db_session, shop):
     with pytest.raises(ReprocessError) as exc:
         ReprocessService(db_session, shop).reprocess_product(bp.id)
     assert exc.value.code == "REPROCESS_NOT_ELIGIBLE"
+
+
+def _add_live_media(db_session, shop, product: Product, *, count: int = 2) -> list[ProductMedia]:
+    rows: list[ProductMedia] = []
+    for i in range(count):
+        row = ProductMedia(
+            shop_id=shop.id,
+            product_id=product.id,
+            shopify_media_gid=f"gid://shopify/MediaImage/{uuid4().hex[:8]}",
+            shopify_file_gid=f"gid://shopify/MediaImage/{uuid4().hex[:8]}",
+            cdn_url=f"https://cdn.shopify.com/live-{i}.png",
+            original_filename=f"live-{i}.png",
+            is_visible=True,
+            is_active=True,
+            is_primary=i == 0,
+            position=i,
+        )
+        db_session.add(row)
+        rows.append(row)
+    db_session.commit()
+    for row in rows:
+        db_session.refresh(row)
+    return rows
+
+
+def test_preview_and_reprocess_live_selected_images(db_session, shop):
+    product = _product(db_session, shop)
+    _configure_rings(db_session, shop)
+    media = _add_live_media(db_session, shop, product, count=3)
+
+    svc = ReprocessService(db_session, shop)
+    preview = svc.preview_live(product.id)
+    assert preview["scope"] == "live"
+    assert preview["autoPublish"] is True
+    assert len(preview["images"]) == 3
+    assert len(preview["steps"]) == 1
+
+    selected = [media[0].shopify_media_gid, media[2].shopify_media_gid]
+    result = svc.reprocess_live(
+        product.id,
+        media_gids=selected,
+        steps=[{"name": "Live", "promptTemplate": "Fix {{product_title}} only"}],
+    )
+    assert result["scope"] == "live"
+    assert result["autoPublish"] is True
+    assert result["imageCount"] == 2
+    assert result["usedPromptOverride"] is True
+
+    batch = db_session.query(ProcessingBatch).filter_by(id=UUID(result["batchId"])).one()
+    assert batch.settings_snapshot_json["live_reprocess"] is True
+    assert batch.settings_snapshot_json["auto_publish"] is True
+    bp = db_session.query(BatchProduct).filter_by(batch_id=batch.id).one()
+    assert bp.prompt_override_json[0]["promptTemplate"].startswith("Fix")
+    images = db_session.query(BatchImage).filter_by(batch_product_id=bp.id).all()
+    assert len(images) == 2
+    assert {i.shopify_media_gid for i in images} == set(selected)
+    baseline_media = (bp.baseline_snapshot_json or {}).get("media") or []
+    assert len(baseline_media) == 3
+
+
+def test_live_reprocess_rejects_inflight_product(db_session, shop):
+    product = _product(db_session, shop)
+    _configure_rings(db_session, shop)
+    media = _add_live_media(db_session, shop, product, count=1)
+    _batch_with_product(db_session, shop, product, status=BatchProductStatus.PROCESSING)
+
+    with pytest.raises(ReprocessError) as exc:
+        ReprocessService(db_session, shop).reprocess_live(
+            product.id, media_gids=[media[0].shopify_media_gid]
+        )
+    assert exc.value.code == "REPROCESS_NOT_ELIGIBLE"
+
+
+def test_live_reprocess_rejects_unknown_media(db_session, shop):
+    product = _product(db_session, shop)
+    _configure_rings(db_session, shop)
+    _add_live_media(db_session, shop, product, count=1)
+
+    with pytest.raises(ReprocessError) as exc:
+        ReprocessService(db_session, shop).reprocess_live(
+            product.id, media_gids=["gid://shopify/MediaImage/missing"]
+        )
+    assert exc.value.code == "REPROCESS_NOT_ELIGIBLE"
+
+
+def test_live_reprocess_preview_and_apply_api(client, db_session, shop):
+    product = _product(db_session, shop)
+    _configure_rings(db_session, shop)
+    media = _add_live_media(db_session, shop, product, count=2)
+
+    preview = client.get(f"/api/products/{product.id}/live-reprocess/preview")
+    assert preview.status_code == 200
+    body = preview.json()["data"]
+    assert body["scope"] == "live"
+    assert len(body["images"]) == 2
+    assert body["steps"]
+
+    versions = client.get(f"/api/products/{product.id}/media-versions")
+    assert versions.status_code == 200
+    assert len(versions.json()["data"]["liveMedia"]) == 2
+
+    applied = client.post(
+        f"/api/products/{product.id}/live-reprocess",
+        json={
+            "mediaGids": [media[0].shopify_media_gid],
+            "steps": [{"name": "Live", "promptTemplate": "Clean {{product_title}}"}],
+        },
+    )
+    assert applied.status_code == 202
+    data = applied.json()["data"]
+    assert data["imageCount"] == 1
+    assert data["autoPublish"] is True

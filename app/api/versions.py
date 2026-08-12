@@ -10,9 +10,10 @@ from pydantic import BaseModel, Field
 
 from app.core.deps import CurrentShop, DbSession
 from app.models import ProductMediaVersion, ProductRollbackOperation
-from app.schemas.week2 import SuccessEnvelope
+from app.schemas.week2 import ReprocessPromptStepIn, SuccessEnvelope
 from app.services.media_versions import MediaVersionError, MediaVersionsService
 from app.services.product_rollback import RollbackError, ProductRollbackService
+from app.services.reprocess_service import ReprocessError, ReprocessService
 
 router = APIRouter(tags=["media-versions"])
 
@@ -34,6 +35,11 @@ class RollbackRetryBody(BaseModel):
         default=False,
         description="When true, retry and skip the conflict hard-stop (still records conflict details).",
     )
+
+
+class LiveReprocessBody(BaseModel):
+    mediaGids: list[str] = Field(min_length=1)
+    steps: list[ReprocessPromptStepIn] | None = None
 
 
 def _cdn_lookup_from_linked(linked_images: list | None) -> dict[str, str]:
@@ -153,6 +159,10 @@ def _http_from_media(exc: MediaVersionError | RollbackError) -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": str(exc)})
 
 
+def _http_from_reprocess(exc: ReprocessError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
 @router.get("/api/products/media-versions")
 def search_products_with_versions(
     request: Request,
@@ -174,13 +184,18 @@ def search_products_with_versions(
 def list_media_versions(product_id: UUID, request: Request, db: DbSession, shop: CurrentShop):
     try:
         versions = MediaVersionsService(db, shop).list_versions(product_id)
+        live_media = MediaVersionsService(db, shop).live_media(product_id)
     except MediaVersionError as exc:
         raise _http_from_media(exc) from exc
     return SuccessEnvelope(
         success=True,
         message="Media versions.",
         requestId=_request_id(request),
-        data={"items": [_version_out(v) for v in versions], "count": len(versions)},
+        data={
+            "items": [_version_out(v) for v in versions],
+            "liveMedia": live_media,
+            "count": len(versions),
+        },
     )
 
 
@@ -218,6 +233,45 @@ def get_media_version(product_id: UUID, version_id: UUID, request: Request, db: 
         message="Media version detail.",
         requestId=_request_id(request),
         data=_version_out(version, include_items=True, linked_images=linked),
+    )
+
+
+@router.get("/api/products/{product_id}/live-reprocess/preview")
+def preview_live_reprocess(product_id: UUID, request: Request, db: DbSession, shop: CurrentShop):
+    try:
+        data = ReprocessService(db, shop).preview_live(product_id)
+    except ReprocessError as exc:
+        raise _http_from_reprocess(exc) from exc
+    return SuccessEnvelope(
+        success=True,
+        message="Live reprocess prompt preview.",
+        requestId=_request_id(request),
+        data=data,
+    )
+
+
+@router.post("/api/products/{product_id}/live-reprocess", status_code=status.HTTP_202_ACCEPTED)
+def start_live_reprocess(
+    product_id: UUID,
+    body: LiveReprocessBody,
+    request: Request,
+    db: DbSession,
+    shop: CurrentShop,
+):
+    try:
+        steps = [s.model_dump(exclude_none=True) for s in body.steps] if body.steps is not None else None
+        data = ReprocessService(db, shop).reprocess_live(
+            product_id,
+            media_gids=body.mediaGids,
+            steps=steps,
+        )
+    except ReprocessError as exc:
+        raise _http_from_reprocess(exc) from exc
+    return SuccessEnvelope(
+        success=True,
+        message="Selected live images queued for reprocess. They will publish automatically when processing finishes.",
+        requestId=_request_id(request),
+        data=data,
     )
 
 
