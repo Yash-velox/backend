@@ -8,12 +8,13 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models import (
     BatchProduct,
     MediaVersionType,
     Product,
+    ProductMedia,
     ProductMediaVersion,
     ProductPublishOperation,
     ProductRollbackOperation,
@@ -62,6 +63,20 @@ def product_has_active_media_op(db: Session, *, shop_id: UUID, shopify_product_g
     return None
 
 
+def _live_media_out(media: ProductMedia) -> dict[str, Any]:
+    return {
+        "mediaGid": media.shopify_media_gid,
+        "fileGid": media.shopify_file_gid,
+        "cdnUrl": media.cdn_url,
+        "filename": media.original_filename,
+        "altText": media.alt_text,
+        "position": media.position,
+        "isPrimary": bool(media.is_primary),
+        "width": media.width,
+        "height": media.height,
+    }
+
+
 def _normalize_items(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Ensure items_json is a full publish-style snapshot dict."""
     if "media" in snapshot:
@@ -83,12 +98,23 @@ class MediaVersionsService:
     def get_product(self, product_id: UUID) -> Product:
         product = (
             self.db.query(Product)
+            .options(selectinload(Product.media))
             .filter(Product.id == product_id, Product.shop_id == self.shop.id)
             .one_or_none()
         )
         if not product:
             raise MediaVersionError("VERSION_NOT_FOUND", "Product not found")
         return product
+
+    def live_media(self, product_id: UUID) -> list[dict[str, Any]]:
+        product = self.get_product(product_id)
+        rows = [
+            m
+            for m in (product.media or [])
+            if m.is_visible and m.is_active and m.cdn_url
+        ]
+        rows.sort(key=lambda m: (m.position is None, m.position or 0, str(m.shopify_media_gid)))
+        return [_live_media_out(m) for m in rows]
 
     def list_versions(self, product_id: UUID) -> list[ProductMediaVersion]:
         self.get_product(product_id)

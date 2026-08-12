@@ -240,11 +240,8 @@ class PublishTriggerService:
 
         self.db.flush()
 
-        settings_row = (
-            self.db.query(ShopSettings).filter(ShopSettings.shop_id == self.shop.id).one_or_none()
-        )
         queued = 0
-        if settings_row and settings_row.auto_publish_processed_images:
+        if self.should_auto_publish(batch):
             result = self.enqueue_ready_for_batch(
                 batch.id,
                 trigger=PublishTriggerSource.AUTO,
@@ -335,8 +332,10 @@ class PublishTriggerService:
             .filter(ProcessingBatch.id == product.batch_id, ProcessingBatch.shop_id == self.shop.id)
             .one_or_none()
         )
-        if not batch or not is_batch_processing_terminal(batch):
-            raise PublishEnqueueError("PUBLISH_BATCH_NOT_TERMINAL", "Batch processing is not finished")
+        if not batch:
+            raise PublishEnqueueError("PUBLISH_BATCH_NOT_TERMINAL", "Batch not found")
+        # A completed product can publish while sibling products in the same batch
+        # are still processing. Manual Publish All still waits for batch terminal.
 
         _, checksum, assets = validate_publishable_outputs(self.db, product)
         key = build_idempotency_key(
@@ -463,3 +462,58 @@ class PublishTriggerService:
             "status": PublishStatus.QUEUED.value,
             "message": "Product publishing has been queued.",
         }
+
+    def should_auto_publish(self, batch: ProcessingBatch) -> bool:
+        snap = batch.settings_snapshot_json if isinstance(batch.settings_snapshot_json, dict) else {}
+        if snap.get("live_reprocess") or snap.get("auto_publish"):
+            return True
+        settings_row = (
+            self.db.query(ShopSettings).filter(ShopSettings.shop_id == self.shop.id).one_or_none()
+        )
+        return bool(settings_row and settings_row.auto_publish_processed_images)
+
+    def maybe_auto_publish_completed_products(
+        self, batch: ProcessingBatch, *, commit: bool = True
+    ) -> dict[str, int]:
+        """Enqueue publish for completed products when auto-publish (or live reprocess) is on.
+
+        Does not wait for the rest of the batch to finish.
+        """
+        if batch.shop_id != self.shop.id:
+            return {"queued": 0}
+        if not self.should_auto_publish(batch):
+            return {"queued": 0}
+
+        products = (
+            self.db.query(BatchProduct)
+            .filter(
+                BatchProduct.batch_id == batch.id,
+                BatchProduct.shop_id == self.shop.id,
+                BatchProduct.status == BatchProductStatus.COMPLETED,
+            )
+            .all()
+        )
+        queued = 0
+        for product in products:
+            if product.publish_status in {
+                PublishStatus.PUBLISHED,
+                PublishStatus.QUEUED,
+                PublishStatus.PUBLISHING,
+            }:
+                continue
+            try:
+                result = self.enqueue_product(
+                    product.id, trigger=PublishTriggerSource.AUTO, commit=False
+                )
+                status = result.get("status")
+                if status == PublishStatus.QUEUED.value and "already" not in (
+                    result.get("message") or ""
+                ).lower():
+                    queued += 1
+            except PublishEnqueueError:
+                continue
+        if commit:
+            self.db.commit()
+        else:
+            self.db.flush()
+        return {"queued": queued}

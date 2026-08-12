@@ -1077,6 +1077,65 @@ def test_secondary_queue_api(client, shop, db_session):
     assert listing.json()["data"]["items"]
 
 
+def test_secondary_queue_list_newest_first_page_size_seven(client, shop, db_session):
+    ensure_shop_settings(db_session, shop)
+    now = datetime.now(timezone.utc)
+    older = SecondaryQueueItem(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/oldest",
+        status=SecondaryQueueStatus.PENDING,
+        queue_revision=1,
+        webhook_count=1,
+        first_queued_at=now - timedelta(hours=2),
+        last_queued_at=now - timedelta(hours=2),
+    )
+    newer = SecondaryQueueItem(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/newest",
+        status=SecondaryQueueStatus.PENDING,
+        queue_revision=1,
+        webhook_count=1,
+        first_queued_at=now - timedelta(hours=1),
+        last_queued_at=now,
+    )
+    db_session.add_all([older, newer])
+    db_session.commit()
+
+    listing = client.get("/api/secondary-queue?page=1&pageSize=7")
+    assert listing.status_code == 200
+    payload = listing.json()["data"]
+    ids = [item["id"] for item in payload["items"]]
+    assert ids[0] == str(newer.id)
+    assert str(older.id) in ids
+    assert payload["pagination"]["pageSize"] == 7
+
+
+def test_primary_batch_list_newest_first_page_size_seven(client, shop, db_session):
+    ensure_shop_settings(db_session, shop)
+    now = datetime.now(timezone.utc)
+    older = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.AUTOMATIC,
+        status=BatchStatus.QUEUED,
+        created_at=now - timedelta(hours=2),
+    )
+    newer = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.AUTOMATIC,
+        status=BatchStatus.QUEUED,
+        created_at=now,
+    )
+    db_session.add_all([older, newer])
+    db_session.commit()
+
+    listing = client.get("/api/batches?page=1&pageSize=7")
+    assert listing.status_code == 200
+    payload = listing.json()["data"]
+    ids = [item["id"] for item in payload["items"]]
+    assert ids[0] == str(newer.id)
+    assert payload["pagination"]["pageSize"] == 7
+
+
 def test_manual_batch_api(client, shop, db_session):
     ensure_shop_settings(db_session, shop)
     product = Product(

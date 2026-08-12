@@ -143,17 +143,29 @@ def test_auto_publish_setting_can_enable(client, shop, db_session):
     assert row.auto_publish_processed_images is True
 
 
-def test_batch_not_terminal_blocks_publish(db_session, shop, tmp_path, monkeypatch):
+def test_completed_product_can_publish_while_batch_still_processing(db_session, shop, tmp_path, monkeypatch):
     monkeypatch.setattr("app.config.settings.processing_output_directory", str(tmp_path / "processed"))
     batch, product, _ = _seed_completed_batch(db_session, shop, tmp_path)
     batch.status = BatchStatus.PROCESSING
     batch.pending_product_count = 1
-    batch.completed_product_count = 0
+    batch.completed_product_count = 1
     db_session.commit()
     assert not is_batch_processing_terminal(batch)
+    result = PublishTriggerService(db_session, shop).enqueue_product(product.id)
+    assert result["status"] == PublishStatus.QUEUED.value
+    db_session.refresh(product)
+    assert product.publish_status == PublishStatus.QUEUED
+
+
+def test_publish_all_still_requires_batch_terminal(db_session, shop, tmp_path, monkeypatch):
+    monkeypatch.setattr("app.config.settings.processing_output_directory", str(tmp_path / "processed"))
+    batch, product, _ = _seed_completed_batch(db_session, shop, tmp_path)
+    batch.status = BatchStatus.PROCESSING
+    batch.pending_product_count = 1
+    db_session.commit()
     svc = PublishTriggerService(db_session, shop)
     try:
-        svc.enqueue_product(product.id)
+        svc.enqueue_ready_for_batch(batch.id)
         assert False, "expected error"
     except PublishEnqueueError as exc:
         assert exc.code == "PUBLISH_BATCH_NOT_TERMINAL"
@@ -251,6 +263,28 @@ def test_auto_publish_enqueues_on_terminal(db_session, shop, tmp_path, monkeypat
     db_session.commit()
     batch, product, _ = _seed_completed_batch(db_session, shop, tmp_path)
     result = PublishTriggerService(db_session, shop).on_batch_terminal(batch)
+    db_session.refresh(product)
+    assert result["queued"] >= 1
+    assert product.publish_status == PublishStatus.QUEUED
+    assert db_session.query(ProductPublishOperation).count() == 1
+
+
+def test_auto_publish_enqueues_completed_product_while_batch_processing(
+    db_session, shop, tmp_path, monkeypatch
+):
+    monkeypatch.setattr("app.config.settings.processing_output_directory", str(tmp_path / "processed"))
+    ensure_shop_settings(db_session, shop)
+    settings = db_session.query(ShopSettings).filter_by(shop_id=shop.id).one()
+    settings.auto_publish_processed_images = True
+    db_session.commit()
+    batch, product, _ = _seed_completed_batch(db_session, shop, tmp_path)
+    batch.status = BatchStatus.PROCESSING
+    batch.pending_product_count = 1
+    batch.processing_product_count = 0
+    batch.completed_product_count = 1
+    db_session.commit()
+
+    result = PublishTriggerService(db_session, shop).maybe_auto_publish_completed_products(batch)
     db_session.refresh(product)
     assert result["queued"] >= 1
     assert product.publish_status == PublishStatus.QUEUED

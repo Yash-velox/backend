@@ -38,6 +38,11 @@ class ReprocessRequest(BaseModel):
     steps: list[ReprocessPromptStepIn] | None = None
 
 
+class LiveReprocessRequest(BaseModel):
+    mediaGids: list[str] = Field(min_length=1)
+    steps: list[ReprocessPromptStepIn] | None = None
+
+
 class SettingsOut(BaseModel):
     autoSyncEnabled: bool
     autoPublishProcessedImages: bool
