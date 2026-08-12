@@ -161,7 +161,7 @@ def list_batches(
     db: DbSession,
     shop: CurrentShop,
     page: int = Query(1, ge=1),
-    pageSize: int = Query(20, ge=1, le=100),
+    pageSize: int = Query(7, ge=1, le=100),
     status: str | None = Query(None),
 ):
     status_filter: BatchStatus | None = None

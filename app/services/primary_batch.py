@@ -1232,7 +1232,7 @@ class PrimaryBatchService:
         *,
         status: BatchStatus | None = None,
         page: int = 1,
-        page_size: int = 20,
+        page_size: int = 7,
     ) -> tuple[list[ProcessingBatch], int]:
         page = max(1, page)
         page_size = min(max(1, page_size), 100)

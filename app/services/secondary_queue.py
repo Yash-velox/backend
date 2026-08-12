@@ -225,7 +225,7 @@ class SecondaryQueueService:
         *,
         status: SecondaryQueueStatus | None = None,
         page: int = 1,
-        page_size: int = 20,
+        page_size: int = 7,
     ) -> tuple[list[SecondaryQueueItem], int]:
         page = max(1, page)
         page_size = min(max(1, page_size), 100)
@@ -234,7 +234,10 @@ class SecondaryQueueService:
             q = q.filter(SecondaryQueueItem.status == status)
         total = q.count()
         items = (
-            q.order_by(SecondaryQueueItem.first_queued_at.asc())
+            q.order_by(
+                SecondaryQueueItem.last_queued_at.desc(),
+                SecondaryQueueItem.created_at.desc(),
+            )
             .offset((page - 1) * page_size)
             .limit(page_size)
             .all()
