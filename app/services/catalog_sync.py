@@ -60,7 +60,8 @@ class CatalogSyncService:
             media_synced=0,
         )
         self.db.add(run)
-        self.db.flush()
+        self.db.commit()
+        self.db.refresh(run)
 
         products_synced = 0
         media_synced = 0
