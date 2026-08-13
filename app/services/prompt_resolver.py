@@ -8,10 +8,12 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.models import BatchImage, Product, Shop
+from app.models import BatchImage, Product, PromptConfiguration, PromptStep, Shop
 from app.models.enums import PromptStepType
 from app.services.prompt_product_types import (
+    CENTRAL_PROMPT_DISPLAY_NAME,
     PromptProductTypeService,
+    is_central_product_type,
     normalize_product_type_name,
 )
 from app.services.prompt_variables import (
@@ -60,66 +62,113 @@ class PromptResolver:
         if product is not None and product.shop_id != self.shop.id:
             raise PromptResolverError("Product does not belong to this shop.", code="SHOP_MISMATCH")
 
+        display = (raw_type or "").strip()
         normalized = normalize_product_type_name(raw_type)
-        if not normalized:
-            raise PromptResolverError(
-                "This product has no Shopify product type. "
-                "Assign a product type in Shopify or configure prompts after setting one.",
-                code="PRODUCT_TYPE_MISSING",
-                retryable=False,
-            )
 
+        type_steps = None
+        if normalized:
+            type_steps = self._try_resolve_product_type(
+                normalized,
+                display_name=display or normalized,
+                product=product,
+                image=image,
+                image_position=image_position,
+            )
+            if type_steps is not None:
+                return type_steps
+
+        # Missing / unconfigured / disabled / no enabled steps / no product type → Central Prompt.
+        return self._resolve_central(
+            product=product,
+            product_type_display=display or CENTRAL_PROMPT_DISPLAY_NAME,
+            image=image,
+            image_position=image_position,
+        )
+
+    def _try_resolve_product_type(
+        self,
+        normalized: str,
+        *,
+        display_name: str,
+        product: Product | None,
+        image: BatchImage | None,
+        image_position: int | None,
+    ) -> list[ResolvedPromptStep] | None:
+        """Return type-specific steps, or None when Central Prompt should be used."""
         ppt = self.types.find_by_normalized_name(normalized)
         if ppt is None:
-            # Attempt a sync in case types were never imported.
             self.types.sync_shopify_product_types()
             self.db.flush()
             ppt = self.types.find_by_normalized_name(normalized)
 
-        display = (raw_type or "").strip() or normalized
-        if ppt is None:
-            raise PromptResolverError(
-                f'No active prompt configuration is available for product type "{display}". '
-                "Configure prompts for this product type before processing.",
-                code="PROMPT_NOT_CONFIGURED",
-                retryable=False,
-            )
+        if ppt is None or is_central_product_type(ppt):
+            return None
 
         config = self.types._ensure_configuration(ppt)
         if not config.is_enabled:
+            return None
+
+        enabled_steps = self._enabled_steps(config)
+        if not enabled_steps:
+            return None
+
+        return self._render_steps(
+            enabled_steps,
+            product=product,
+            product_type_display=ppt.name or display_name,
+            image=image,
+            image_position=image_position,
+        )
+
+    def _resolve_central(
+        self,
+        *,
+        product: Product | None,
+        product_type_display: str,
+        image: BatchImage | None,
+        image_position: int | None,
+    ) -> list[ResolvedPromptStep]:
+        central = self.types.ensure_central_prompt()
+        config = self.types._ensure_configuration(central)
+        config.is_enabled = True
+        enabled_steps = self._enabled_steps(config)
+        if not enabled_steps:
             raise PromptResolverError(
-                f'Prompt configuration for product type "{ppt.name}" is disabled.',
-                code="PROMPT_CONFIGURATION_DISABLED",
+                f'No active {CENTRAL_PROMPT_DISPLAY_NAME} steps are available. '
+                f"Configure {CENTRAL_PROMPT_DISPLAY_NAME} before processing products "
+                "without a ready product-type prompt.",
+                code="PROMPT_NOT_CONFIGURED",
                 retryable=False,
             )
+        return self._render_steps(
+            enabled_steps,
+            product=product,
+            product_type_display=product_type_display,
+            image=image,
+            image_position=image_position,
+        )
 
-        from app.models import PromptStep
-
+    def _enabled_steps(self, config: PromptConfiguration) -> list[PromptStep]:
         all_steps = (
             self.db.query(PromptStep)
             .filter(PromptStep.prompt_configuration_id == config.id)
             .order_by(PromptStep.step_order.asc())
             .all()
         )
-        enabled_steps = [s for s in all_steps if s.is_enabled]
-        if not enabled_steps:
-            if not all_steps:
-                raise PromptResolverError(
-                    f'No active prompt configuration is available for product type "{ppt.name}". '
-                    "Configure prompts for this product type before processing.",
-                    code="PROMPT_NOT_CONFIGURED",
-                    retryable=False,
-                )
-            raise PromptResolverError(
-                f'No enabled prompt steps for product type "{ppt.name}". '
-                "Enable at least one step before processing.",
-                code="PROMPT_NO_ENABLED_STEPS",
-                retryable=False,
-            )
+        return [s for s in all_steps if s.is_enabled]
 
+    def _render_steps(
+        self,
+        enabled_steps: list[PromptStep],
+        *,
+        product: Product | None,
+        product_type_display: str,
+        image: BatchImage | None,
+        image_position: int | None,
+    ) -> list[ResolvedPromptStep]:
         values = self._build_variable_values(
             product,
-            product_type_display=ppt.name,
+            product_type_display=product_type_display,
             image=image,
             image_position=image_position,
         )

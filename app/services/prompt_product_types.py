@@ -30,6 +30,18 @@ ACTIVE_BATCH_PRODUCT_STATUSES = (
     BatchProductStatus.RETRYING,
 )
 
+# Reserved shop-level fallback prompt (one per shop). Not a real Shopify product type.
+CENTRAL_PROMPT_NORMALIZED_NAME = "__central__"
+CENTRAL_PROMPT_DISPLAY_NAME = "Central Prompt"
+
+
+def is_central_product_type(row: PromptProductType | None) -> bool:
+    if row is None:
+        return False
+    if row.source == PromptProductTypeSource.SYSTEM:
+        return True
+    return row.normalized_name == CENTRAL_PROMPT_NORMALIZED_NAME
+
 
 class PromptProductTypeError(ValueError):
     def __init__(self, message: str, *, code: str, status_code: int = 400) -> None:
@@ -71,12 +83,62 @@ class PromptProductTypeService:
         self.db = db
         self.shop = shop
 
+    def ensure_central_prompt(self) -> PromptProductType:
+        """Create or return the always-on shop-level Central Prompt row."""
+        row = (
+            self.db.query(PromptProductType)
+            .options(
+                selectinload(PromptProductType.configuration).selectinload(PromptConfiguration.steps)
+            )
+            .filter(
+                PromptProductType.shop_id == self.shop.id,
+                PromptProductType.normalized_name == CENTRAL_PROMPT_NORMALIZED_NAME,
+            )
+            .one_or_none()
+        )
+        if row is None:
+            row = (
+                self.db.query(PromptProductType)
+                .options(
+                    selectinload(PromptProductType.configuration).selectinload(
+                        PromptConfiguration.steps
+                    )
+                )
+                .filter(
+                    PromptProductType.shop_id == self.shop.id,
+                    PromptProductType.source == PromptProductTypeSource.SYSTEM,
+                )
+                .one_or_none()
+            )
+        if row is None:
+            row = PromptProductType(
+                shop_id=self.shop.id,
+                name=CENTRAL_PROMPT_DISPLAY_NAME,
+                normalized_name=CENTRAL_PROMPT_NORMALIZED_NAME,
+                source=PromptProductTypeSource.SYSTEM,
+                is_active=True,
+            )
+            self.db.add(row)
+            self.db.flush()
+            logger.info("Created Central Prompt | shop=%s", self.shop.id)
+
+        # Keep reserved identity stable even if an older row drifted.
+        row.name = CENTRAL_PROMPT_DISPLAY_NAME
+        row.normalized_name = CENTRAL_PROMPT_NORMALIZED_NAME
+        row.source = PromptProductTypeSource.SYSTEM
+        row.is_active = True
+        config = self._ensure_configuration(row)
+        if not config.is_enabled:
+            config.is_enabled = True
+        return row
+
     def sync_shopify_product_types(self) -> int:
         """Upsert distinct non-empty product types from synchronized products.
 
         Does not delete types that disappeared from the catalog.
-        Does not overwrite MANUAL rows that share a normalized name.
+        Does not overwrite MANUAL or SYSTEM rows that share a normalized name.
         """
+        self.ensure_central_prompt()
         rows = (
             self.db.query(Product.product_type)
             .filter(
@@ -91,7 +153,7 @@ class PromptProductTypeService:
         created = 0
         for (raw_type,) in rows:
             normalized = normalize_product_type_name(raw_type)
-            if not normalized:
+            if not normalized or normalized == CENTRAL_PROMPT_NORMALIZED_NAME:
                 continue
             name = display_name(raw_type or "")
             existing = (
@@ -119,6 +181,9 @@ class PromptProductTypeService:
                 if not existing.name and name:
                     existing.name = name
                 existing.is_active = True
+            elif is_central_product_type(existing):
+                # Never let a catalog value overwrite the reserved Central Prompt row.
+                continue
 
         if created:
             self.db.flush()
@@ -136,6 +201,15 @@ class PromptProductTypeService:
             raise PromptProductTypeError(
                 "Product type name is required.",
                 code="PROMPT_PRODUCT_TYPE_INVALID",
+                status_code=422,
+            )
+        if (
+            normalized == CENTRAL_PROMPT_NORMALIZED_NAME
+            or display.casefold() == CENTRAL_PROMPT_DISPLAY_NAME.casefold()
+        ):
+            raise PromptProductTypeError(
+                f'"{CENTRAL_PROMPT_DISPLAY_NAME}" is reserved for the shop-level fallback prompt.',
+                code="PROMPT_PRODUCT_TYPE_RESERVED",
                 status_code=422,
             )
 
@@ -169,6 +243,7 @@ class PromptProductTypeService:
         return row
 
     def get(self, product_type_id: UUID) -> PromptProductType:
+        self.ensure_central_prompt()
         row = (
             self.db.query(PromptProductType)
             .options(
@@ -186,7 +261,9 @@ class PromptProductTypeService:
                 code="PROMPT_PRODUCT_TYPE_NOT_FOUND",
                 status_code=404,
             )
-        self._ensure_configuration(row)
+        config = self._ensure_configuration(row)
+        if is_central_product_type(row) and not config.is_enabled:
+            config.is_enabled = True
         return row
 
     def list(
@@ -220,9 +297,18 @@ class PromptProductTypeService:
             )
 
         rows = q.order_by(PromptProductType.name.asc()).all()
+        # Always pin Central Prompt above product-type rows.
+        rows.sort(
+            key=lambda r: (
+                0 if is_central_product_type(r) else 1,
+                (r.name or "").casefold(),
+            )
+        )
         items: list[dict[str, Any]] = []
         for row in rows:
             config = self._ensure_configuration(row)
+            if is_central_product_type(row) and not config.is_enabled:
+                config.is_enabled = True
             steps = (
                 self.db.query(PromptStep)
                 .filter(PromptStep.prompt_configuration_id == config.id)
@@ -230,7 +316,7 @@ class PromptProductTypeService:
             )
             step_count = len(steps)
             enabled_step_count = sum(1 for s in steps if s.is_enabled)
-            is_enabled = config.is_enabled if config else True
+            is_enabled = True if is_central_product_type(row) else (config.is_enabled if config else True)
             computed = compute_list_status(
                 step_count=step_count,
                 enabled_step_count=enabled_step_count,
@@ -255,6 +341,7 @@ class PromptProductTypeService:
                     "enabledStepCount": enabled_step_count,
                     "status": computed.value,
                     "isEnabled": is_enabled,
+                    "isCentral": is_central_product_type(row),
                     "updatedAt": updated_at if step_count > 0 else None,
                     "createdAt": row.created_at,
                 }
@@ -267,6 +354,12 @@ class PromptProductTypeService:
 
     def delete_manual(self, product_type_id: UUID) -> None:
         row = self.get(product_type_id)
+        if is_central_product_type(row):
+            raise PromptProductTypeError(
+                "Central Prompt cannot be deleted.",
+                code="PROMPT_CENTRAL_DELETE_FORBIDDEN",
+                status_code=403,
+            )
         if row.source != PromptProductTypeSource.MANUAL:
             raise PromptProductTypeError(
                 "Shopify-sourced product types cannot be deleted.",

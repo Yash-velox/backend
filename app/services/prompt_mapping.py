@@ -1,6 +1,6 @@
 """Legacy facade — product-type prompts are resolved via PromptResolver at process time.
 
-Kept for any transitional imports; does not provide a default jewelry prompt.
+Falls back to the shop Central Prompt when a product type has no ready configuration.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from app.services.prompt_resolver import PromptResolver, PromptResolverError
 
 
 class PromptMappingService:
-    """Compatibility wrapper around PromptResolver (no default fallback)."""
+    """Compatibility wrapper around PromptResolver (Central Prompt fallback included)."""
 
     def __init__(self, db: Session | None = None, shop: Shop | None = None) -> None:
         self.db = db
@@ -23,12 +23,12 @@ class PromptMappingService:
     def resolve_for_product_type(self, product_type: str | None) -> list[dict[str, Any]]:
         """Deprecated path used only when db/shop are available.
 
-        Without a DB-backed configuration this raises — there is no global default prompt.
+        Uses product-type prompts when ready; otherwise the shop Central Prompt.
         """
         if self.db is None or self.shop is None:
             raise PromptResolverError(
                 "Prompt mapping requires a shop-scoped database session. "
-                "Configure prompts for the product type before processing.",
+                "Configure the Central Prompt or a product-type prompt before processing.",
                 code="PROMPT_NOT_CONFIGURED",
                 retryable=False,
             )

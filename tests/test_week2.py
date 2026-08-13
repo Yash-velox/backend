@@ -60,6 +60,19 @@ def _configure_product_type(db_session, shop, product_type: str, *, prompt: str 
         is_enabled=True,
     )
     db_session.commit()
+
+
+def _configure_central(db_session, shop, *, prompt: str = "Central {{product_title}}") -> None:
+    types = PromptProductTypeService(db_session, shop)
+    central = types.ensure_central_prompt()
+    db_session.flush()
+    PromptConfigurationService(db_session, shop).add_step(
+        central.id,
+        name="Central Step",
+        prompt_text=prompt,
+        is_enabled=True,
+    )
+    db_session.commit()
 from app.services.webhook_intake import detect_status_only, is_draft_transition, product_gid_from_webhook_payload
 
 
@@ -589,8 +602,37 @@ def test_manual_batch_rejects_unconfigured_product_type(db_session, shop):
         assert False, "expected PrimaryBatchError"
     except PrimaryBatchError as exc:
         assert "Loose Charm" in str(exc)
-        assert "prompt configuration" in str(exc).lower() or "PROMPT" in str(exc) or "Configure" in str(exc)
+        assert "prompt" in str(exc).lower() or "PROMPT" in str(exc) or "Configure" in str(exc) or "Central" in str(exc)
     assert db_session.query(ProcessingBatch).count() == 0
+
+
+def test_manual_batch_uses_central_prompt_when_type_unconfigured(db_session, shop):
+    ensure_shop_settings(db_session, shop)
+    _configure_central(db_session, shop)
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/421",
+        title="Central Charm",
+        status="ACTIVE",
+        product_type="StillUnconfigured",
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(
+        ProductMedia(
+            shop_id=shop.id,
+            product_id=product.id,
+            shopify_media_gid="gid://shopify/MediaImage/421",
+            cdn_url="https://cdn.shopify.com/charm2.png",
+            is_visible=True,
+            is_active=True,
+        )
+    )
+    db_session.commit()
+
+    batch = PrimaryBatchService(db_session, shop).create_manual_batch(["gid://shopify/Product/421"])
+    assert batch.product_count == 1
+    assert db_session.query(BatchProduct).filter(BatchProduct.batch_id == batch.id).count() == 1
 
 
 def test_secondary_conversion_skips_no_delta(db_session, shop):
@@ -999,7 +1041,51 @@ def test_secondary_conversion_fails_unconfigured_product_type(db_session, shop):
     assert item.status == SecondaryQueueStatus.FAILED_CONVERSION
     assert item.failure_reason
     assert "Orphan Ring" in item.failure_reason
-    assert "prompt" in item.failure_reason.lower() or "Configure" in item.failure_reason
+    assert "prompt" in item.failure_reason.lower() or "Configure" in item.failure_reason or "Central" in item.failure_reason
+
+
+def test_secondary_conversion_uses_central_when_type_unconfigured(db_session, shop):
+    ensure_shop_settings(db_session, shop)
+    _configure_central(db_session, shop)
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/781",
+        title="Fallback Ring",
+        status="ACTIVE",
+        product_type="MysteryType",
+    )
+    db_session.add(product)
+    db_session.flush()
+    item = SecondaryQueueItem(
+        shop_id=shop.id,
+        shopify_product_gid=product.shopify_product_gid,
+        product_id=product.id,
+        status=SecondaryQueueStatus.CLAIMED,
+        eligible_product_snapshot_json={
+            "shopify_product_gid": product.shopify_product_gid,
+            "title": "Fallback Ring",
+            "product_type": "MysteryType",
+        },
+        eligible_media_snapshot_json=[
+            {
+                "media_gid": "gid://shopify/MediaImage/781",
+                "cdn_url": "https://cdn.shopify.com/new-ring.png",
+                "filename": "new-ring.png",
+                "width": 20,
+                "height": 20,
+            },
+        ],
+        claimed_by="worker_test",
+        claimed_at=datetime.now(timezone.utc),
+    )
+    db_session.add(item)
+    db_session.commit()
+
+    batch = PrimaryBatchService(db_session, shop).convert_secondary_items([item])
+    assert batch is not None
+    db_session.refresh(item)
+    assert item.status == SecondaryQueueStatus.CONVERTED
+    assert db_session.query(BatchProduct).filter(BatchProduct.batch_id == batch.id).count() == 1
 
 
 def test_auto_batch_trigger_by_interval_only(db_session, shop):

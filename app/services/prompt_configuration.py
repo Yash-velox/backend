@@ -42,7 +42,21 @@ class PromptConfigurationService:
         return product_type, config
 
     def set_enabled(self, product_type_id: UUID, is_enabled: bool) -> PromptConfiguration:
-        _, config = self.get_detail(product_type_id)
+        from app.services.prompt_product_types import is_central_product_type
+
+        product_type, config = self.get_detail(product_type_id)
+        if is_central_product_type(product_type):
+            if not is_enabled:
+                raise PromptProductTypeError(
+                    "Central Prompt cannot be disabled. It is the shop-level fallback for all products.",
+                    code="PROMPT_CENTRAL_DISABLE_FORBIDDEN",
+                    status_code=403,
+                )
+            config.is_enabled = True
+            config.updated_at = datetime.now(timezone.utc)
+            self.db.commit()
+            self.db.refresh(config)
+            return config
         config.is_enabled = bool(is_enabled)
         config.updated_at = datetime.now(timezone.utc)
         self.db.commit()

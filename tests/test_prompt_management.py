@@ -71,15 +71,36 @@ def test_sync_shopify_product_types_dedupes_and_ignores_blank(db_session, shop):
     assert created == 2
 
     items, total = svc.list()
-    assert total == 2
+    assert total == 3  # Central Prompt + Rings + Charms
     names = {i["name"] for i in items}
     assert "Charms" in names
-    sources = {i["source"] for i in items}
+    assert "Central Prompt" in names
+    assert items[0]["name"] == "Central Prompt"
+    assert items[0]["source"] == "SYSTEM"
+    assert items[0]["isCentral"] is True
+    catalog = [i for i in items if not i["isCentral"]]
+    sources = {i["source"] for i in catalog}
     assert sources == {"SHOPIFY"}
-    assert all(i["status"] == "NOT_CONFIGURED" for i in items)
+    assert all(i["status"] == "NOT_CONFIGURED" for i in catalog)
 
     # Idempotent
     assert svc.sync_shopify_product_types() == 0
+
+
+def test_central_prompt_cannot_be_disabled_or_deleted(client, db_session, shop):
+    listed = client.get("/api/prompts/product-types").json()["data"]["items"]
+    central = next(i for i in listed if i["isCentral"] or i["source"] == "SYSTEM")
+    forbidden_disable = client.patch(
+        f"/api/prompts/product-types/{central['id']}/configuration",
+        json={"isEnabled": False},
+    )
+    assert forbidden_disable.status_code == 403
+
+    forbidden_delete = client.delete(f"/api/prompts/product-types/{central['id']}")
+    assert forbidden_delete.status_code == 403
+
+    reserved = client.post("/api/prompts/product-types", json={"name": "Central Prompt"})
+    assert reserved.status_code == 422
 
 
 def test_manual_product_type_add_and_duplicate(db_session, shop, client):
@@ -205,34 +226,54 @@ def test_variable_validation_and_render():
 def test_resolver_errors(db_session, shop):
     product = _add_product(db_session, shop, title="No Type", product_type=None)
     resolver = PromptResolver(db_session, shop)
+    # No product type and empty Central Prompt → not configured.
     with pytest.raises(PromptResolverError) as missing:
         resolver.resolve_for_product(product)
-    assert missing.value.code == "PRODUCT_TYPE_MISSING"
+    assert missing.value.code == "PROMPT_NOT_CONFIGURED"
+    assert "Central Prompt" in str(missing.value)
 
     typed = _add_product(db_session, shop, title="Bracelet", product_type="Bracelets")
     with pytest.raises(PromptResolverError) as unconfigured:
         resolver.resolve_for_product(typed)
     assert unconfigured.value.code == "PROMPT_NOT_CONFIGURED"
 
-    # Configure then disable
+    # Configure Central Prompt — unconfigured / disabled type / no steps all fall back to it.
     types = PromptProductTypeService(db_session, shop)
+    central = types.ensure_central_prompt()
+    db_session.commit()
+    cfg = PromptConfigurationService(db_session, shop)
+    cfg.add_step(
+        central.id,
+        name="Central Step",
+        prompt_text="Central for {{product_title}}",
+        is_enabled=True,
+    )
+
+    no_type_steps = resolver.resolve_for_product(product)
+    assert len(no_type_steps) == 1
+    assert "No Type" in no_type_steps[0].rendered_prompt
+
+    unconfigured_steps = resolver.resolve_for_product(typed)
+    assert len(unconfigured_steps) == 1
+    assert "Bracelet" in unconfigured_steps[0].rendered_prompt
+
     types.sync_shopify_product_types()
     db_session.commit()
     ppt = types.find_by_normalized_name("bracelets")
     assert ppt is not None
-    cfg = PromptConfigurationService(db_session, shop)
     cfg.add_step(ppt.id, name="Step", prompt_text="Enhance {{product_type}}", is_enabled=True)
     cfg.set_enabled(ppt.id, False)
-    with pytest.raises(PromptResolverError) as disabled:
-        resolver.resolve_for_product(typed)
-    assert disabled.value.code == "PROMPT_CONFIGURATION_DISABLED"
+    disabled_fallback = resolver.resolve_for_product(typed)
+    assert len(disabled_fallback) == 1
+    assert "Central for Bracelet" in disabled_fallback[0].rendered_prompt
 
     cfg.set_enabled(ppt.id, True)
     steps = cfg.get_detail(ppt.id)[1].steps
-    cfg.set_step_status(steps[0].id, False)
-    with pytest.raises(PromptResolverError) as no_steps:
-        resolver.resolve_for_product(typed)
-    assert no_steps.value.code == "PROMPT_NO_ENABLED_STEPS"
+    for step in steps:
+        cfg.set_step_status(step.id, False)
+    no_steps_fallback = resolver.resolve_for_product(typed)
+    assert len(no_steps_fallback) == 1
+    assert "Central for Bracelet" in no_steps_fallback[0].rendered_prompt
 
 
 def test_resolver_order_and_render(db_session, shop):
@@ -267,6 +308,7 @@ def test_shop_isolation(db_session, shop, client):
     items = client.get("/api/prompts/product-types").json()["data"]["items"]
     names = {i["name"] for i in items}
     assert "Only Mine" in names
+    assert "Central Prompt" in names
     assert "Other Type" not in names
 
 

@@ -58,6 +58,7 @@ class PromptProductTypeListItemOut(BaseModel):
     enabledStepCount: int
     status: str
     isEnabled: bool
+    isCentral: bool = False
     updatedAt: datetime | None = None
     createdAt: datetime
 
@@ -68,6 +69,7 @@ class PromptConfigurationDetailOut(BaseModel):
     name: str
     source: str
     isEnabled: bool
+    isCentral: bool = False
     status: str
     stepCount: int
     enabledStepCount: int

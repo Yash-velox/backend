@@ -25,6 +25,7 @@ from app.services.prompt_product_types import (
     PromptProductTypeError,
     PromptProductTypeService,
     compute_list_status,
+    is_central_product_type,
 )
 from app.services.prompt_variables import extract_variables, list_supported_variables
 
@@ -94,6 +95,7 @@ def list_product_types(
                     "enabledStepCount": i["enabledStepCount"],
                     "status": i["status"],
                     "isEnabled": i["isEnabled"],
+                    "isCentral": bool(i.get("isCentral")),
                     "updatedAt": i["updatedAt"].isoformat() if i["updatedAt"] else None,
                     "createdAt": i["createdAt"].isoformat() if i["createdAt"] else None,
                 }
@@ -154,10 +156,12 @@ def get_product_type(
     steps = sorted(config.steps or [], key=lambda s: s.step_order)
     step_count = len(steps)
     enabled_step_count = sum(1 for s in steps if s.is_enabled)
+    central = is_central_product_type(product_type)
+    is_enabled = True if central else config.is_enabled
     status = compute_list_status(
         step_count=step_count,
         enabled_step_count=enabled_step_count,
-        is_enabled=config.is_enabled,
+        is_enabled=is_enabled,
     )
     detail = PromptConfigurationDetailOut(
         id=config.id,
@@ -166,7 +170,8 @@ def get_product_type(
         source=product_type.source.value
         if isinstance(product_type.source, PromptProductTypeSource)
         else str(product_type.source),
-        isEnabled=config.is_enabled,
+        isEnabled=is_enabled,
+        isCentral=central,
         status=status.value,
         stepCount=step_count,
         enabledStepCount=enabled_step_count,
@@ -205,7 +210,7 @@ def update_configuration(
     svc = PromptConfigurationService(db, shop)
     try:
         config = svc.set_enabled(product_type_id, payload.isEnabled)
-    except PromptProductTypeError as exc:
+    except (PromptProductTypeError, PromptConfigurationError) as exc:
         _raise_domain(exc)
         raise
     return SuccessEnvelope(

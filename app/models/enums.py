@@ -148,6 +148,7 @@ class WebhookProcessingResult(str, enum.Enum):
 class PromptProductTypeSource(str, enum.Enum):
     SHOPIFY = "SHOPIFY"
     MANUAL = "MANUAL"
+    SYSTEM = "SYSTEM"
 
 
 class PromptListStatus(str, enum.Enum):
