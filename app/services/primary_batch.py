@@ -228,7 +228,7 @@ class PrimaryBatchService:
             product_snapshot = product_snapshot_from_model(product)
             media_snapshot = media_snapshots_from_models(visible_media)
             # Publish conflict baseline must be the live media set at enqueue time.
-            # ProcessingBaseline may be empty on first run (delta tracking only) — do not
+            # ProcessingBaseline may be empty on first run (delta tracking only) - do not
             # copy its null media into baseline_snapshot_json or publish always conflicts.
             self._get_or_create_baseline(product)
 
@@ -526,7 +526,7 @@ class PrimaryBatchService:
     ) -> BatchProduct | None:
         """Find the single automatic QUEUED BatchProduct generation for this product.
 
-        Batch may already be PROCESSING (other products started) — the product row is
+        Batch may already be PROCESSING (other products started) - the product row is
         still refreshable until *this* BatchProduct leaves QUEUED. We never use that
         batch for capacity fills of *other* products once the batch is PROCESSING.
         """
@@ -1274,7 +1274,10 @@ class PrimaryBatchService:
 
     def should_create_automatic_batch(self, shop_settings: ShopSettings) -> bool:
         """True when Auto Sync is on and the oldest pending Secondary Queue item
-        has waited at least ``batch_interval_minutes`` (time-only trigger)."""
+        has waited at least ``batch_interval_minutes`` (time-only trigger).
+
+        ``0`` means no wait: any PENDING item is eligible on the next worker tick.
+        """
         if not shop_settings.auto_sync_enabled:
             return False
 

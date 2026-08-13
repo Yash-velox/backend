@@ -122,7 +122,7 @@ def test_media_fingerprint_ignores_alt_for_content():
     }
     b = dict(a)
     b["alt_text"] = "new"
-    # fingerprint helper uses content fields; alt may or may not be included — delta ignores alt-only
+    # fingerprint helper uses content fields; alt may or may not be included - delta ignores alt-only
     fp_a = media_fingerprint(a)
     fp_b = media_fingerprint({**b, "alt_text": "ignored-for-fp"})
     # At minimum fingerprint is stable for same content keys used by helper
@@ -244,7 +244,7 @@ def test_refresh_batch_counters_sees_unflushed_status(db_session, shop):
     db_session.commit()
 
     bp.status = BatchProductStatus.PROCESSING
-    # Intentionally no explicit flush — refresh_batch_counters must flush itself.
+    # Intentionally no explicit flush - refresh_batch_counters must flush itself.
     PrimaryBatchService(db_session, shop).refresh_batch_counters(batch)
     db_session.commit()
     db_session.refresh(batch)
@@ -281,6 +281,13 @@ def test_settings_validation(db_session, shop, monkeypatch):
     updated = svc.update(auto_sync_enabled=True, batch_interval_minutes=10)
     assert updated.auto_sync_enabled is True
     assert updated.batch_interval_minutes == 10
+    zero = svc.update(batch_interval_minutes=0)
+    assert zero.batch_interval_minutes == 0
+    try:
+        svc.update(batch_interval_minutes=-1)
+        assert False
+    except SettingsValidationError:
+        pass
     try:
         svc.update(batch_interval_minutes=999)
         assert False
@@ -1125,6 +1132,29 @@ def test_auto_batch_trigger_by_interval_only(db_session, shop):
     assert svc.should_create_automatic_batch(settings_row) is True
 
 
+def test_auto_batch_trigger_zero_interval_immediate(db_session, shop):
+    """0 minutes means convert on the next worker tick (no wait)."""
+    settings_row = ensure_shop_settings(db_session, shop)
+    settings_row.auto_sync_enabled = True
+    settings_row.batch_interval_minutes = 0
+    db_session.commit()
+
+    svc = PrimaryBatchService(db_session, shop)
+    assert svc.should_create_automatic_batch(settings_row) is False
+
+    db_session.add(
+        SecondaryQueueItem(
+            shop_id=shop.id,
+            shopify_product_gid="gid://shopify/Product/201",
+            status=SecondaryQueueStatus.PENDING,
+            first_queued_at=datetime.now(timezone.utc),
+            last_queued_at=datetime.now(timezone.utc),
+        )
+    )
+    db_session.commit()
+    assert svc.should_create_automatic_batch(settings_row) is True
+
+
 def test_settings_api(client, shop, db_session):
     ensure_shop_settings(db_session, shop)
     db_session.commit()
@@ -1141,6 +1171,13 @@ def test_settings_api(client, shop, db_session):
     assert data["autoSyncEnabled"] is True
     assert data["batchIntervalMinutes"] == 12
     assert "maxProductsPerBatch" not in data
+
+    res = client.put(
+        "/api/settings",
+        json={"batchIntervalMinutes": 0},
+    )
+    assert res.status_code == 200
+    assert res.json()["data"]["batchIntervalMinutes"] == 0
 
 
 def test_secondary_queue_api(client, shop, db_session):
@@ -1471,7 +1508,7 @@ def test_webhook_seeds_baseline_before_catalog_upsert_so_new_image_converts(db_s
         .filter(ProcessingBaseline.product_id == product.id)
         .one()
     )
-    # Pre-sync freeze must keep only the old image — not the newly upserted one.
+    # Pre-sync freeze must keep only the old image - not the newly upserted one.
     assert baseline.media_snapshot_json is not None
     assert len(baseline.media_snapshot_json) == 1
     assert baseline.media_snapshot_json[0]["media_gid"].endswith("/100")

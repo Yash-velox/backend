@@ -34,8 +34,8 @@ class SettingsService:
         if auto_publish_processed_images is not None:
             row.auto_publish_processed_images = auto_publish_processed_images
         if batch_interval_minutes is not None:
-            if batch_interval_minutes < 1:
-                raise SettingsValidationError("batch_interval_minutes must be at least 1")
+            if batch_interval_minutes < 0:
+                raise SettingsValidationError("batch_interval_minutes cannot be negative")
             cap = settings.batch_interval_minutes_cap
             if batch_interval_minutes > cap:
                 raise SettingsValidationError(f"batch_interval_minutes cannot exceed {cap}")
