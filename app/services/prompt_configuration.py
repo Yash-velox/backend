@@ -48,7 +48,7 @@ class PromptConfigurationService:
         if is_central_product_type(product_type):
             if not is_enabled:
                 raise PromptProductTypeError(
-                    "Central Prompt cannot be disabled. It is the shop-level fallback for all products.",
+                    "System Prompt cannot be disabled. It is the shop-level fallback for all products.",
                     code="PROMPT_CENTRAL_DISABLE_FORBIDDEN",
                     status_code=403,
                 )
@@ -72,7 +72,15 @@ class PromptConfigurationService:
         is_enabled: bool = True,
         step_type: str | PromptStepType = PromptStepType.IMAGE,
     ) -> PromptStep:
-        _, config = self.get_detail(product_type_id)
+        from app.services.prompt_product_types import is_central_product_type
+
+        product_type, config = self.get_detail(product_type_id)
+        if is_central_product_type(product_type) and len(config.steps) >= 1:
+            raise PromptConfigurationError(
+                "System Prompt supports a single prompt only.",
+                code="PROMPT_SYSTEM_SINGLE_ONLY",
+                status_code=400,
+            )
         cleaned_name, cleaned_text = self._validate_step_fields(name, prompt_text)
         next_order = (max((s.step_order for s in config.steps), default=0)) + 1
         resolved_type = (

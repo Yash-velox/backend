@@ -1,6 +1,6 @@
 """Legacy facade - product-type prompts are resolved via PromptResolver at process time.
 
-Falls back to the shop Central Prompt when a product type has no ready configuration.
+Falls back to the shop System Prompt when a product type has no ready configuration.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from app.services.prompt_resolver import PromptResolver, PromptResolverError
 
 
 class PromptMappingService:
-    """Compatibility wrapper around PromptResolver (Central Prompt fallback included)."""
+    """Compatibility wrapper around PromptResolver (System Prompt fallback included)."""
 
     def __init__(self, db: Session | None = None, shop: Shop | None = None) -> None:
         self.db = db
@@ -23,12 +23,12 @@ class PromptMappingService:
     def resolve_for_product_type(self, product_type: str | None) -> list[dict[str, Any]]:
         """Deprecated path used only when db/shop are available.
 
-        Uses product-type prompts when ready; otherwise the shop Central Prompt.
+        Uses product-type prompts when ready; otherwise the shop System Prompt.
         """
         if self.db is None or self.shop is None:
             raise PromptResolverError(
                 "Prompt mapping requires a shop-scoped database session. "
-                "Configure the Central Prompt or a product-type prompt before processing.",
+                "Configure the System Prompt or a product-type prompt before processing.",
                 code="PROMPT_NOT_CONFIGURED",
                 retryable=False,
             )

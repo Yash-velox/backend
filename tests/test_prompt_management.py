@@ -23,7 +23,7 @@ from app.models import (
     TriggerType,
 )
 from app.services.image_processor import ImageProcessor
-from app.services.prompt_configuration import PromptConfigurationService
+from app.services.prompt_configuration import PromptConfigurationError, PromptConfigurationService
 from app.services.prompt_product_types import PromptProductTypeService, normalize_product_type_name
 from app.services.prompt_resolver import PromptResolver, PromptResolverError
 from app.services.prompt_variables import (
@@ -71,11 +71,11 @@ def test_sync_shopify_product_types_dedupes_and_ignores_blank(db_session, shop):
     assert created == 2
 
     items, total = svc.list()
-    assert total == 3  # Central Prompt + Rings + Charms
+    assert total == 3  # System Prompt + Rings + Charms
     names = {i["name"] for i in items}
     assert "Charms" in names
-    assert "Central Prompt" in names
-    assert items[0]["name"] == "Central Prompt"
+    assert "System Prompt" in names
+    assert items[0]["name"] == "System Prompt"
     assert items[0]["source"] == "SYSTEM"
     assert items[0]["isCentral"] is True
     catalog = [i for i in items if not i["isCentral"]]
@@ -99,7 +99,7 @@ def test_central_prompt_cannot_be_disabled_or_deleted(client, db_session, shop):
     forbidden_delete = client.delete(f"/api/prompts/product-types/{central['id']}")
     assert forbidden_delete.status_code == 403
 
-    reserved = client.post("/api/prompts/product-types", json={"name": "Central Prompt"})
+    reserved = client.post("/api/prompts/product-types", json={"name": "System Prompt"})
     assert reserved.status_code == 422
 
 
@@ -226,18 +226,18 @@ def test_variable_validation_and_render():
 def test_resolver_errors(db_session, shop):
     product = _add_product(db_session, shop, title="No Type", product_type=None)
     resolver = PromptResolver(db_session, shop)
-    # No product type and empty Central Prompt → not configured.
+    # No product type and empty System Prompt → not configured.
     with pytest.raises(PromptResolverError) as missing:
         resolver.resolve_for_product(product)
     assert missing.value.code == "PROMPT_NOT_CONFIGURED"
-    assert "Central Prompt" in str(missing.value)
+    assert "System Prompt" in str(missing.value)
 
     typed = _add_product(db_session, shop, title="Bracelet", product_type="Bracelets")
     with pytest.raises(PromptResolverError) as unconfigured:
         resolver.resolve_for_product(typed)
     assert unconfigured.value.code == "PROMPT_NOT_CONFIGURED"
 
-    # Configure Central Prompt - unconfigured / disabled type / no steps all fall back to it.
+    # Configure System Prompt - unconfigured / disabled type / no steps all fall back to it.
     types = PromptProductTypeService(db_session, shop)
     central = types.ensure_central_prompt()
     db_session.commit()
@@ -276,6 +276,32 @@ def test_resolver_errors(db_session, shop):
     assert "Central for Bracelet" in no_steps_fallback[0].rendered_prompt
 
 
+def test_system_prompt_single_step_only(db_session, shop):
+    types = PromptProductTypeService(db_session, shop)
+    central = types.ensure_central_prompt()
+    db_session.commit()
+    cfg = PromptConfigurationService(db_session, shop)
+    cfg.add_step(
+        central.id,
+        name="System Prompt",
+        prompt_text="Single shop prompt for {{product_title}}",
+        is_enabled=True,
+    )
+    with pytest.raises(PromptConfigurationError) as exc:
+        cfg.add_step(
+            central.id,
+            name="Second",
+            prompt_text="Must not be allowed",
+            is_enabled=True,
+        )
+    assert exc.value.code == "PROMPT_SYSTEM_SINGLE_ONLY"
+
+    product = _add_product(db_session, shop, title="Solo", product_type=None)
+    resolved = PromptResolver(db_session, shop).resolve_for_product(product)
+    assert len(resolved) == 1
+    assert "Solo" in resolved[0].rendered_prompt
+
+
 def test_resolver_order_and_render(db_session, shop):
     product = _add_product(db_session, shop, title="Diamond Ring", product_type="Rings")
     types = PromptProductTypeService(db_session, shop)
@@ -308,7 +334,7 @@ def test_shop_isolation(db_session, shop, client):
     items = client.get("/api/prompts/product-types").json()["data"]["items"]
     names = {i["name"] for i in items}
     assert "Only Mine" in names
-    assert "Central Prompt" in names
+    assert "System Prompt" in names
     assert "Other Type" not in names
 
 

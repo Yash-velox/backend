@@ -77,7 +77,7 @@ class PromptResolver:
             if type_steps is not None:
                 return type_steps
 
-        # Missing / unconfigured / disabled / no enabled steps / no product type → Central Prompt.
+        # Missing / unconfigured / disabled / no enabled steps / no product type → System Prompt.
         return self._resolve_central(
             product=product,
             product_type_display=display or CENTRAL_PROMPT_DISPLAY_NAME,
@@ -94,7 +94,7 @@ class PromptResolver:
         image: BatchImage | None,
         image_position: int | None,
     ) -> list[ResolvedPromptStep] | None:
-        """Return type-specific steps, or None when Central Prompt should be used."""
+        """Return type-specific steps, or None when System Prompt should be used."""
         ppt = self.types.find_by_normalized_name(normalized)
         if ppt is None:
             self.types.sync_shopify_product_types()
@@ -134,14 +134,15 @@ class PromptResolver:
         enabled_steps = self._enabled_steps(config)
         if not enabled_steps:
             raise PromptResolverError(
-                f'No active {CENTRAL_PROMPT_DISPLAY_NAME} steps are available. '
-                f"Configure {CENTRAL_PROMPT_DISPLAY_NAME} before processing products "
+                f"No {CENTRAL_PROMPT_DISPLAY_NAME} is configured. "
+                f"Save a {CENTRAL_PROMPT_DISPLAY_NAME} before processing products "
                 "without a ready product-type prompt.",
                 code="PROMPT_NOT_CONFIGURED",
                 retryable=False,
             )
+        # System Prompt is a single prompt — never run sequential steps.
         return self._render_steps(
-            enabled_steps,
+            enabled_steps[:1],
             product=product,
             product_type_display=product_type_display,
             image=image,

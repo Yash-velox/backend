@@ -32,7 +32,7 @@ ACTIVE_BATCH_PRODUCT_STATUSES = (
 
 # Reserved shop-level fallback prompt (one per shop). Not a real Shopify product type.
 CENTRAL_PROMPT_NORMALIZED_NAME = "__central__"
-CENTRAL_PROMPT_DISPLAY_NAME = "Central Prompt"
+CENTRAL_PROMPT_DISPLAY_NAME = "System Prompt"
 
 
 def is_central_product_type(row: PromptProductType | None) -> bool:
@@ -84,7 +84,7 @@ class PromptProductTypeService:
         self.shop = shop
 
     def ensure_central_prompt(self) -> PromptProductType:
-        """Create or return the always-on shop-level Central Prompt row."""
+        """Create or return the always-on shop-level System Prompt row."""
         row = (
             self.db.query(PromptProductType)
             .options(
@@ -120,7 +120,7 @@ class PromptProductTypeService:
             )
             self.db.add(row)
             self.db.flush()
-            logger.info("Created Central Prompt | shop=%s", self.shop.id)
+            logger.info("Created System Prompt | shop=%s", self.shop.id)
 
         # Keep reserved identity stable even if an older row drifted.
         row.name = CENTRAL_PROMPT_DISPLAY_NAME
@@ -182,7 +182,7 @@ class PromptProductTypeService:
                     existing.name = name
                 existing.is_active = True
             elif is_central_product_type(existing):
-                # Never let a catalog value overwrite the reserved Central Prompt row.
+                # Never let a catalog value overwrite the reserved System Prompt row.
                 continue
 
         if created:
@@ -297,7 +297,7 @@ class PromptProductTypeService:
             )
 
         rows = q.order_by(PromptProductType.name.asc()).all()
-        # Always pin Central Prompt above product-type rows.
+        # Always pin System Prompt above product-type rows.
         rows.sort(
             key=lambda r: (
                 0 if is_central_product_type(r) else 1,
@@ -356,7 +356,7 @@ class PromptProductTypeService:
         row = self.get(product_type_id)
         if is_central_product_type(row):
             raise PromptProductTypeError(
-                "Central Prompt cannot be deleted.",
+                "System Prompt cannot be deleted.",
                 code="PROMPT_CENTRAL_DELETE_FORBIDDEN",
                 status_code=403,
             )
