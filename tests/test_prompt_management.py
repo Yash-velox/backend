@@ -1,4 +1,4 @@
-"""Prompt Management — product types, steps, variables, and process-time resolution."""
+"""Prompt Management - product types, steps, variables, and process-time resolution."""
 
 from __future__ import annotations
 
@@ -237,7 +237,7 @@ def test_resolver_errors(db_session, shop):
         resolver.resolve_for_product(typed)
     assert unconfigured.value.code == "PROMPT_NOT_CONFIGURED"
 
-    # Configure Central Prompt — unconfigured / disabled type / no steps all fall back to it.
+    # Configure Central Prompt - unconfigured / disabled type / no steps all fall back to it.
     types = PromptProductTypeService(db_session, shop)
     central = types.ensure_central_prompt()
     db_session.commit()

@@ -172,7 +172,7 @@ class ImageProcessor:
 
         if batch_product.status != BatchProductStatus.PROCESSING:
             logger.warning(
-                "Skip batch product — not processing | id=%s status=%s",
+                "Skip batch product - not processing | id=%s status=%s",
                 batch_product.id,
                 batch_product.status,
             )
@@ -195,7 +195,7 @@ class ImageProcessor:
             any_retrying = any(i.status == BatchImageStatus.RETRYING for i in batch_product.images)
             if any_retrying:
                 # Permanent failure on one image can coexist with earlier RETRYING
-                # rows from stale recovery — never leave the product locked in
+                # rows from stale recovery - never leave the product locked in
                 # PROCESSING or the worker will never reclaim it.
                 if batch_product.status == BatchProductStatus.PROCESSING:
                     assert_transition(
@@ -239,7 +239,7 @@ class ImageProcessor:
                 batch_product.prompt_override_json = None
                 self._advance_baseline_on_success(batch_product)
             else:
-                # Exiting without a terminal state — always drop the lock so
+                # Exiting without a terminal state - always drop the lock so
                 # another poll / recover can continue remaining work.
                 batch_product.locked_by = None
                 batch_product.locked_at = None

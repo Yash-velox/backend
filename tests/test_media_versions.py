@@ -242,7 +242,7 @@ def test_activate_existing_version_clears_prior_active(db_session, shop):
     assert v2.is_active is True
     assert svc.active_version(product.id).id == v2.id
 
-    # Switch back to v1 — previously could UniqueViolation on ix_product_media_versions_active.
+    # Switch back to v1 - previously could UniqueViolation on ix_product_media_versions_active.
     activated = svc.activate_existing_version(v1)
     db_session.commit()
     db_session.refresh(v1)

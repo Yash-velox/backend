@@ -48,7 +48,7 @@ def access_token_needs_refresh(shop: Shop, *, now: datetime | None = None) -> bo
         updated = _ensure_aware(shop.updated_at)
         return updated <= current - proactive
 
-    # Unknown age with a stored token — refresh when credentials exist (handled by caller).
+    # Unknown age with a stored token - refresh when credentials exist (handled by caller).
     return bool(shop.encrypted_access_token)
 
 

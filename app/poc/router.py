@@ -123,7 +123,7 @@ def get_job(job_id: str):
     cleanup_expired_jobs()
     job = poc_job_store.get_job(job_id)
     if not job:
-        logger.warning("Job status — not found | job=%s", job_id)
+        logger.warning("Job status - not found | job=%s", job_id)
         raise HTTPException(status_code=404, detail="Job not found")
     progress = _job_to_progress(job)
     logger.info(

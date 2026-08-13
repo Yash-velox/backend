@@ -271,7 +271,7 @@ class WebhookIntakeService:
         #
         # Freeze an empty ProcessingBaseline from *pre-sync* catalog media before upsert.
         # Conversion used to seed empty baselines from the post-upsert catalog, which
-        # already included newly added images — Secondary Queue then skipped with
+        # already included newly added images - Secondary Queue then skipped with
         # "No eligible new or replaced images detected".
         #
         # Failures here must not fail the webhook (Shopify would retry 5xx). Worst case

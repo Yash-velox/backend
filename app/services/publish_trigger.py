@@ -158,7 +158,7 @@ def validate_publishable_outputs(db: Session, batch_product: BatchProduct) -> tu
             size = 0
             upload_status = "READY"
         elif local_key and storage.exists(local_key):
-            # Legacy fallback only — new COMPLETED images must have Shopify Files.
+            # Legacy fallback only - new COMPLETED images must have Shopify Files.
             path = storage.resolve_path(local_key)
             try:
                 size, data = validate_png_file(path)

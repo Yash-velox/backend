@@ -62,7 +62,7 @@ def build_image_edit_body(
         "size": "1024x1024",
         "output_format": "png",
     }
-    # Opaque PNG by default — gpt-image-2 rejects background=transparent.
+    # Opaque PNG by default - gpt-image-2 rejects background=transparent.
     use_transparent = transparent_background and supports_transparent_background(model)
     if use_transparent:
         body["background"] = "transparent"

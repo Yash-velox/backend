@@ -61,7 +61,7 @@ class BatchService:
         return self._primary(shop_id).get_batch_products(batch_id)
 
     def get_batch_items(self, *, shop_id: UUID, batch_id: UUID) -> list[BatchProduct]:
-        """Legacy alias — batch items are now batch products."""
+        """Legacy alias - batch items are now batch products."""
         return self.get_batch_products(shop_id=shop_id, batch_id=batch_id)
 
     def claim_pending_batch(

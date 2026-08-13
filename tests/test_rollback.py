@@ -512,8 +512,8 @@ def test_rollback_allows_rematerialized_live_media_gids(db_session, shop):
 def test_rollback_api_shop_scoped(client, db_session, shop):
     product, original, _published = _seed_product_with_versions(db_session, shop)
     res = client.get(f"/api/products/{product.id}/media-versions/{original.id}/rollback-preview")
-    # Preview hits Shopify for file status — mock via service path is heavy; just ensure auth + ownership works
-    # Without mock the client may fail on Shopify — patch at GraphQL level via dependency is complex.
+    # Preview hits Shopify for file status - mock via service path is heavy; just ensure auth + ownership works
+    # Without mock the client may fail on Shopify - patch at GraphQL level via dependency is complex.
     # Use enqueue without confirm to validate API validation.
     res = client.post(
         f"/api/products/{product.id}/media-versions/{original.id}/rollback",
@@ -525,7 +525,7 @@ def test_rollback_api_shop_scoped(client, db_session, shop):
 
 
 def test_compare_by_files_matches_cdn_to_media_gid():
-    """Active has CDN+GID; live has only the same MediaImage GID — must not false-conflict."""
+    """Active has CDN+GID; live has only the same MediaImage GID - must not false-conflict."""
     from app.services.product_rollback import _compare_by_files
 
     expected = {
@@ -553,7 +553,7 @@ def test_compare_by_files_matches_cdn_to_media_gid():
                 "file_gid": "gid://shopify/MediaImage/33272640831571",
                 "position": 0,
                 "alt_text": "",
-                # Live snapshot missing CDN — old matcher preferred cdn on expected and media on live.
+                # Live snapshot missing CDN - old matcher preferred cdn on expected and media on live.
                 "cdn_url": None,
                 "is_primary": True,
             }

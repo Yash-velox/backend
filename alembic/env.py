@@ -7,7 +7,7 @@ from sqlalchemy import engine_from_config, pool
 
 from app.config import settings
 from app.db.base import Base
-from app.models import (  # noqa: F401 — register metadata
+from app.models import (  # noqa: F401 - register metadata
     BatchImage,
     BatchProduct,
     ProcessingAttempt,

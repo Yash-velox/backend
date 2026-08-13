@@ -53,7 +53,7 @@ def build_rollback_idempotency_key(
 
 
 def _cdn_identity(url: str | None) -> str | None:
-    """Stable CDN key: path only (strip host/query — MediaImage GIDs rematerialize, ?v= changes)."""
+    """Stable CDN key: path only (strip host/query - MediaImage GIDs rematerialize, ?v= changes)."""
     if not url or not isinstance(url, str):
         return None
     raw = url.strip()
@@ -948,7 +948,7 @@ class ProductRollbackService:
             )
             if not op:
                 raise
-            # Unique active-version race: Shopify media may already be restored — retry activate.
+            # Unique active-version race: Shopify media may already be restored - retry activate.
             try:
                 target = self.versions.get_version(op.product_id, op.target_version_id)
                 result = self.versions.activate_existing_version(

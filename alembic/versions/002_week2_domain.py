@@ -1,4 +1,4 @@
-"""Week 2 domain schema — resets incompatible queue-phase tables.
+"""Week 2 domain schema - resets incompatible queue-phase tables.
 
 Revision ID: 002_week2_domain
 Revises: 001_processing_queue

@@ -413,7 +413,7 @@ class ShopifyGraphQLClient:
             ):
                 self._unauthorized_retried = True
                 logger.warning(
-                    "Shopify GraphQL 401 — refreshing shops token and retrying | shop=%s",
+                    "Shopify GraphQL 401 - refreshing shops token and retrying | shop=%s",
                     self.shop_domain,
                 )
                 try:

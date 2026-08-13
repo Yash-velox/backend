@@ -339,7 +339,7 @@ class MediaVersionsService:
             )
             if not product:
                 logger.warning(
-                    "Skip version create — catalog product missing | gid=%s",
+                    "Skip version create - catalog product missing | gid=%s",
                     batch_product.shopify_product_gid,
                 )
                 return None

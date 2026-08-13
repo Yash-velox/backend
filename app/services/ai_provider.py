@@ -1,4 +1,4 @@
-"""AI provider routing — Phase 1 OPEN_AI; Phase 2 external_llm microservice."""
+"""AI provider routing - Phase 1 OPEN_AI; Phase 2 external_llm microservice."""
 
 from __future__ import annotations
 

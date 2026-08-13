@@ -16,7 +16,7 @@ class MediaDeltaResult(TypedDict):
 
 
 def cdn_path_identity(url: str | None) -> str | None:
-    """Stable CDN key: path only (strip host/query — GID namespaces and ?v= change)."""
+    """Stable CDN key: path only (strip host/query - GID namespaces and ?v= change)."""
     if not url or not isinstance(url, str):
         return None
     raw = url.strip()
@@ -89,7 +89,7 @@ def _content_fields_changed(eligible: dict[str, Any], baseline: dict[str, Any]) 
     for field in ("filename", "width", "height"):
         if (eligible_n.get(field) or None) != (baseline_n.get(field) or None):
             return True
-    # mime_type is often missing on REST webhooks — only compare when both sides set it.
+    # mime_type is often missing on REST webhooks - only compare when both sides set it.
     eligible_mime = eligible_n.get("mime_type") or None
     baseline_mime = baseline_n.get("mime_type") or None
     if eligible_mime and baseline_mime and eligible_mime != baseline_mime:
@@ -157,7 +157,7 @@ def compare_media_snapshots(
             continue
 
         if matched_by_cdn:
-            # Same CDN asset under a different GID namespace — only content fields matter.
+            # Same CDN asset under a different GID namespace - only content fields matter.
             if _content_fields_changed(eligible_n, baseline_entry):
                 item = dict(eligible_n)
                 item["delta_type"] = DeltaType.REPLACED.value

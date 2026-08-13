@@ -56,7 +56,7 @@ BLOCKING_PUBLISH_STATUSES = frozenset(
 LIVE_REPROCESS_NOTE = (
     "Edited prompts apply to this live reprocess only and do not change saved Prompt Configuration. "
     "After you apply, selected live images are processed and published automatically. "
-    "That apply cannot be undone on its own — revert a stored complete version (v1, v2, …) to restore "
+    "That apply cannot be undone on its own - revert a stored complete version (v1, v2, …) to restore "
     "an earlier image set."
 )
 

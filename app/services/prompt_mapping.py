@@ -1,4 +1,4 @@
-"""Legacy facade — product-type prompts are resolved via PromptResolver at process time.
+"""Legacy facade - product-type prompts are resolved via PromptResolver at process time.
 
 Falls back to the shop Central Prompt when a product type has no ready configuration.
 """

@@ -18,7 +18,7 @@ SUPPORTED_PROMPT_VARIABLES: frozenset[str] = frozenset(
     }
 )
 
-# Only simple {{identifier}} placeholders — no expressions, dots, or filters.
+# Only simple {{identifier}} placeholders - no expressions, dots, or filters.
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 # Catch any {{...}} that is not a simple identifier (reject nested/expressions).
 _ANY_PLACEHOLDER_RE = re.compile(r"\{\{([^{}]+)\}\}")

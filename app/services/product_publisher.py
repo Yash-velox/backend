@@ -278,7 +278,7 @@ class ProductPublisher:
                         f"New media missing after attach: {mid}",
                     )
 
-            # Detach only the sources we replaced — never wipe the rest of the gallery.
+            # Detach only the sources we replaced - never wipe the rest of the gallery.
             # Delta/auto batches process NEW/REPLACED images only; other live images must stay.
             self._set_stage(op, product, PublishStatus.PUBLISHING, "DETACHING_OLD_SET")
             live_by_media = {
@@ -341,7 +341,7 @@ class ProductPublisher:
                         "SHOPIFY_VERIFICATION_FAILED",
                         "Final product media does not match published set",
                     )
-            # Only the replaced sources must be gone — untouched gallery images stay.
+            # Only the replaced sources must be gone - untouched gallery images stay.
             leftover_sources = source_ids & final_ids - {x for x in expected_new if x}
             if leftover_sources:
                 # Also treat file-gid overlap as still attached

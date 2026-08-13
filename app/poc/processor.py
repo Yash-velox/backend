@@ -22,7 +22,7 @@ def process_job(job: JobRecord, from_step: int = 1) -> None:
     try:
         client = OpenAIImageClient()
     except OpenAIImageError as exc:
-        logger.error("Job aborted — OpenAI client unavailable | job=%s error=%s", job.job_id, exc)
+        logger.error("Job aborted - OpenAI client unavailable | job=%s error=%s", job.job_id, exc)
         poc_job_store.mark_job_failed(job, from_step, str(exc))
         return
 
@@ -46,7 +46,7 @@ def process_job(job: JobRecord, from_step: int = 1) -> None:
                 step.step,
                 "Image generation finished without a step output.",
             )
-            logger.error("Job failed — missing step output file | job=%s step=%s", job.job_id, step.step)
+            logger.error("Job failed - missing step output file | job=%s step=%s", job.job_id, step.step)
             return
         input_bytes = Path(step.output_file).read_bytes()
 

@@ -1,4 +1,4 @@
-# Image Enhancement — Backend (FastAPI)
+# Image Enhancement - Backend (FastAPI)
 
 API + Postgres-backed Shopify product-image processing queue (asyncio worker).
 

@@ -212,7 +212,7 @@ class ProcessingWorker:
         try:
             use_batch = primary_queue_uses_openai_batch()
         except OpenAIBatchOrchestratorError:
-            logger.exception("OpenAI Batch configuration error — Primary Queue work blocked")
+            logger.exception("OpenAI Batch configuration error - Primary Queue work blocked")
             return
 
         if use_batch:
@@ -303,11 +303,11 @@ async def kickoff_batch_processing(batch_id: UUID) -> None:
     try:
         batch = db.get(ProcessingBatch, batch_id)
         if batch is None:
-            logger.warning("Manual batch kickoff skipped — batch missing | batch_id=%s", batch_id)
+            logger.warning("Manual batch kickoff skipped - batch missing | batch_id=%s", batch_id)
             return
         shop = db.get(Shop, batch.shop_id)
         if shop is None:
-            logger.warning("Manual batch kickoff skipped — shop missing | batch_id=%s", batch_id)
+            logger.warning("Manual batch kickoff skipped - shop missing | batch_id=%s", batch_id)
             return
 
         if batch.status == BatchStatus.QUEUED:
@@ -316,7 +316,7 @@ async def kickoff_batch_processing(batch_id: UUID) -> None:
             batch.started_at = datetime.now(timezone.utc)
             db.commit()
 
-        # Claim QUEUED rows into PROCESSING before process_batch_product — that
+        # Claim QUEUED rows into PROCESSING before process_batch_product - that
         # path only accepts PROCESSING and would otherwise no-op and leave work idle.
         primary = PrimaryBatchService(db, shop)
         dialect = db.bind.dialect.name if db.bind is not None else ""

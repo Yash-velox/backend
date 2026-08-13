@@ -238,7 +238,7 @@ class RetryService:
                 if _image_awaiting_shopify_upload(image):
                     continue
                 # Prefer closing the open STARTED attempt over inserting a duplicate
-                # (uq_attempt_image_number) — that UniqueViolation previously aborted
+                # (uq_attempt_image_number) - that UniqueViolation previously aborted
                 # recovery and left products stuck in PROCESSING forever.
                 open_attempt = (
                     self.db.query(ProcessingAttempt)

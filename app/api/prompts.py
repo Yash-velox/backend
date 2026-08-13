@@ -1,4 +1,4 @@
-"""Prompt Management API — product types and sequential prompt steps."""
+"""Prompt Management API - product types and sequential prompt steps."""
 
 from __future__ import annotations
 

@@ -426,7 +426,7 @@ class ImageVersionsService:
             if file_gid:
                 version = self.find_by_file_gid(str(file_gid))
             # Only link durable pipeline outputs (GENERATED / non-original). Do not fall back to
-            # every ORIGINAL row via media_gid — that bloated Active snapshot with all gallery images.
+            # every ORIGINAL row via media_gid - that bloated Active snapshot with all gallery images.
             if version is None and (file_gid or media_gid):
                 q = self.db.query(ImageVersion).filter(
                     ImageVersion.shop_id == self.shop.id,
@@ -610,7 +610,7 @@ class ImageVersionsService:
         products_with_versions = len(per_product)
 
         warnings: list[dict[str, Any]] = []
-        # Count GENERATED Files versions only — ORIGINAL catalog baselines are not app-created storage.
+        # Count GENERATED Files versions only - ORIGINAL catalog baselines are not app-created storage.
         if generated_count >= settings.image_storage_warn_total_versions:
             warnings.append(
                 {
@@ -633,7 +633,7 @@ class ImageVersionsService:
                     "message": (
                         f"Average recorded size of generated versions is about {avg_mb:.1f} MB "
                         f"(threshold {settings.image_storage_warn_avg_generated_mb:g} MB). "
-                        "Based only on stored file_size_bytes metadata — not Shopify account usage."
+                        "Based only on stored file_size_bytes metadata - not Shopify account usage."
                     ),
                     "valueMb": round(avg_mb, 2),
                     "thresholdMb": settings.image_storage_warn_avg_generated_mb,
@@ -708,7 +708,7 @@ def backfill_originals_for_shop(db: Session, shop: Shop) -> dict[str, int]:
             scanned += 1
             if not media.shopify_media_gid:
                 logger.warning(
-                    "Skip original backfill — missing media gid | product=%s media=%s",
+                    "Skip original backfill - missing media gid | product=%s media=%s",
                     product.id,
                     media.id,
                 )

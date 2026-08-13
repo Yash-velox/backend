@@ -36,7 +36,7 @@ async def lifespan(_app: FastAPI):
         await processing_worker.start()
         await publish_worker.start()
     else:
-        logger.info("Automatic processing disabled — workers not started")
+        logger.info("Automatic processing disabled - workers not started")
     try:
         yield
     finally:

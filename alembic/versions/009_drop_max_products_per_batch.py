@@ -1,4 +1,4 @@
-"""Drop max_products_per_batch — automatic batches are time-triggered only.
+"""Drop max_products_per_batch - automatic batches are time-triggered only.
 
 Revision ID: 009_drop_max_products_per_batch
 Revises: 008_openai_batch_api

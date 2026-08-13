@@ -13,7 +13,7 @@ from app.models import Shop, ShopSettings, ShopStatus
 def _dev_access_token_seed_allowed() -> bool:
     """Allow seeding shops from SHOPIFY_DEV_ACCESS_TOKEN only on first create (dev/uat).
 
-    API callers must still resolve from the shops table — never read env at call time.
+    API callers must still resolve from the shops table - never read env at call time.
     """
     return settings.app_env in {"dev", "uat"} and bool(settings.shopify_dev_access_token)
 
