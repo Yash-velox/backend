@@ -17,7 +17,7 @@ class ConfigurationUpdateRequest(BaseModel):
 
 
 class PromptStepCreateRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=150)
+    name: str = Field(default="", max_length=150)
     promptText: str = Field(min_length=1, max_length=20000)
     isEnabled: bool = True
     stepType: str = "IMAGE"

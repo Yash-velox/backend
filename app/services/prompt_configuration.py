@@ -205,16 +205,10 @@ class PromptConfigurationService:
         return step
 
     def _validate_step_fields(self, name: str, prompt_text: str) -> tuple[str, str]:
-        cleaned_name = (name or "").strip()
-        if not cleaned_name:
-            raise PromptConfigurationError(
-                "Step name is required.",
-                code="PROMPT_STEP_INVALID",
-                status_code=422,
-            )
+        cleaned_name = (name or "").strip() or "Untitled prompt"
         if len(cleaned_name) > MAX_STEP_NAME_LENGTH:
             raise PromptConfigurationError(
-                f"Step name must be at most {MAX_STEP_NAME_LENGTH} characters.",
+                f"Prompt title must be at most {MAX_STEP_NAME_LENGTH} characters.",
                 code="PROMPT_STEP_INVALID",
                 status_code=422,
             )
