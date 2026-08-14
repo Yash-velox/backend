@@ -171,6 +171,7 @@ class PromptProductTypeService:
                     normalized_name=normalized,
                     source=PromptProductTypeSource.SHOPIFY,
                     is_active=True,
+                    created_at=datetime.now(timezone.utc).replace(tzinfo=None),
                 )
                 self.db.add(row)
                 self.db.flush()
@@ -228,12 +229,14 @@ class PromptProductTypeService:
                 status_code=409,
             )
 
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         row = PromptProductType(
             shop_id=self.shop.id,
             name=display,
             normalized_name=normalized,
             source=PromptProductTypeSource.MANUAL,
             is_active=True,
+            created_at=now,
         )
         self.db.add(row)
         self.db.flush()
@@ -296,11 +299,13 @@ class PromptProductTypeService:
                 )
             )
 
-        rows = q.order_by(PromptProductType.name.asc()).all()
-        # Always pin System Prompt above product-type rows.
+        rows = q.order_by(PromptProductType.created_at.desc()).all()
+        # System Prompt stays first; remaining types are newest-first so a
+        # just-added row appears at the top of the product-type list.
         rows.sort(
             key=lambda r: (
                 0 if is_central_product_type(r) else 1,
+                -(r.created_at.timestamp() if r.created_at else 0),
                 (r.name or "").casefold(),
             )
         )

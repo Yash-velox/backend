@@ -116,6 +116,16 @@ def test_manual_product_type_add_and_duplicate(db_session, shop, client):
     assert dup.status_code == 409
 
 
+def test_newly_added_product_type_lists_after_system_prompt(client):
+    client.post("/api/prompts/product-types", json={"name": "Older Type"})
+    newest = client.post("/api/prompts/product-types", json={"name": "Zebra Newest"}).json()["data"]
+
+    listed = client.get("/api/prompts/product-types").json()["data"]["items"]
+    assert listed[0]["name"] == "System Prompt"
+    assert listed[1]["id"] == newest["id"]
+    assert listed[1]["name"] == "Zebra Newest"
+
+
 def test_shopify_type_cannot_be_deleted_manual_can(db_session, shop, client):
     _add_product(db_session, shop, title="Ring", product_type="Rings")
     PromptProductTypeService(db_session, shop).sync_shopify_product_types()
