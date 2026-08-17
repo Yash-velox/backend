@@ -18,14 +18,14 @@ class ConfigurationUpdateRequest(BaseModel):
 
 class PromptStepCreateRequest(BaseModel):
     name: str = Field(default="", max_length=150)
-    promptText: str = Field(min_length=1, max_length=20000)
+    promptText: str = Field(min_length=1)
     isEnabled: bool = True
     stepType: str = "IMAGE"
 
 
 class PromptStepUpdateRequest(BaseModel):
     name: str | None = Field(default=None, max_length=150)
-    promptText: str | None = Field(default=None, max_length=20000)
+    promptText: str | None = Field(default=None, min_length=1)
     isEnabled: bool | None = None
     stepType: str | None = None
 

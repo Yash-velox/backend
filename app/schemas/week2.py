@@ -129,6 +129,10 @@ class BatchProductOut(BaseModel):
     batchId: UUID
     shopifyProductGid: str
     productId: UUID | None = None
+    title: str | None = None
+    handle: str | None = None
+    adminUrl: str | None = None
+    storefrontUrl: str | None = None
     status: str
     publishStatus: str | None = None
     imageCount: int

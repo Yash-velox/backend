@@ -204,6 +204,27 @@ def test_configuration_and_steps_lifecycle(client, db_session, shop):
     assert detail["status"] == "DISABLED"
 
 
+def test_prompt_step_accepts_text_over_previous_character_limit(client):
+    created = client.post("/api/prompts/product-types", json={"name": "Long Prompts"}).json()["data"]
+    pt_id = created["id"]
+    long_text = "Enhance {{product_title}}. " + ("Keep the jewelry sharp. " * 900)
+    assert len(long_text) > 20000
+
+    created_step = client.post(
+        f"/api/prompts/product-types/{pt_id}/steps",
+        json={"name": "Long", "promptText": long_text, "isEnabled": True},
+    )
+    assert created_step.status_code == 200, created_step.text
+    assert created_step.json()["data"]["promptText"] == long_text
+
+    updated = client.put(
+        f"/api/prompts/steps/{created_step.json()['data']['id']}",
+        json={"promptText": long_text + " Extra."},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["data"]["promptText"].endswith("Extra.")
+
+
 def test_not_ready_when_all_steps_disabled(client):
     created = client.post("/api/prompts/product-types", json={"name": "Chains"}).json()["data"]
     pt_id = created["id"]

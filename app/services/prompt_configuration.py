@@ -12,7 +12,6 @@ from app.services.prompt_product_types import PromptProductTypeError, PromptProd
 from app.services.prompt_variables import PromptVariableError, validate_prompt_variables
 
 MAX_STEP_NAME_LENGTH = 150
-MAX_PROMPT_TEXT_LENGTH = 20000
 
 
 class PromptConfigurationError(ValueError):
@@ -224,12 +223,6 @@ class PromptConfigurationService:
         if not cleaned_text.strip():
             raise PromptConfigurationError(
                 "Prompt text is required.",
-                code="PROMPT_STEP_INVALID",
-                status_code=422,
-            )
-        if len(cleaned_text) > MAX_PROMPT_TEXT_LENGTH:
-            raise PromptConfigurationError(
-                f"Prompt text must be at most {MAX_PROMPT_TEXT_LENGTH} characters.",
                 code="PROMPT_STEP_INVALID",
                 status_code=422,
             )

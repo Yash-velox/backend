@@ -1265,6 +1265,7 @@ def test_manual_batch_api(client, shop, db_session):
         shop_id=shop.id,
         shopify_product_gid="gid://shopify/Product/88",
         title="Bag",
+        handle="bag",
         status="ACTIVE",
         product_type="Bags",
     )
@@ -1289,6 +1290,14 @@ def test_manual_batch_api(client, shop, db_session):
     assert body["success"] is True
     assert body["data"]["productCount"] == 1
     assert body["data"]["imageCount"] == 1
+
+    listed = client.get(f"/api/batches/{body['data']['id']}/products")
+    assert listed.status_code == 200, listed.text
+    item = listed.json()["data"]["items"][0]
+    assert item["title"] == "Bag"
+    assert item["handle"] == "bag"
+    assert item["adminUrl"] == "https://test-shop.myshopify.com/admin/products/88"
+    assert item["storefrontUrl"] == "https://test-shop.myshopify.com/products/bag"
 
     blocked = Product(
         shop_id=shop.id,

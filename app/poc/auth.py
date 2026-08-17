@@ -39,6 +39,9 @@ def verify_shopify_jwt(request: Request) -> dict:
             algorithms=["HS256"],
             audience=audience,
             options=options,
+            # Shopify session JWTs last ~60s. A small leeway absorbs UAT/EC2 clock skew
+            # so "Signature has expired" does not flicker during Jobs polling.
+            leeway=15,
         )
     except jwt.PyJWTError as exc:  # pragma: no cover - framework-level auth failure
         if settings.app_env == "dev" and settings.poc_dev_skip_auth:
