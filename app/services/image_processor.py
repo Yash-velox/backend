@@ -26,6 +26,7 @@ from app.models import (
     Shop,
 )
 from app.poc.openai_client import OpenAIImageClient, OpenAIImageError
+from app.services.background_cutout import CutoutError, apply_background_cutout
 from app.services.image_versions import ImageVersionsService, build_generated_filename
 from app.services.output_storage import OutputStorage, checksum_sha256, get_output_storage
 from app.services.primary_batch import PrimaryBatchService
@@ -386,6 +387,35 @@ class ImageProcessor:
         except Exception:
             return False
 
+    def _prepare_output_png(self, image: BatchImage, path: Path) -> dict:
+        """Apply rembg cut-out (if enabled), then validate the PNG for Shopify."""
+        cutout_meta: dict = {"applied": False, "model": None, "skippedReason": None}
+        if settings.rembg_enabled:
+            original = path.read_bytes()
+            try:
+                result = apply_background_cutout(original)
+            except CutoutError as exc:
+                raise ProcessingError(str(exc), code=exc.code, retryable=exc.retryable) from exc
+            if result.applied:
+                path.write_bytes(result.png_bytes)
+                image.output_checksum = checksum_sha256(result.png_bytes)
+                cutout_meta = {
+                    "applied": True,
+                    "model": settings.rembg_model,
+                    "skippedReason": None,
+                }
+            else:
+                cutout_meta["skippedReason"] = result.skipped_reason
+        meta = validate_generated_png_for_shopify(path)
+        if settings.rembg_enabled and settings.rembg_require_alpha and not meta.get("has_alpha"):
+            raise ProcessingError(
+                "Cut-out did not produce a transparent PNG",
+                code="CUTOUT_NO_ALPHA",
+                retryable=False,
+            )
+        meta["cutout"] = cutout_meta
+        return meta
+
     def _upload_generated_output(
         self,
         *,
@@ -409,7 +439,7 @@ class ImageProcessor:
             )
 
         path = self.storage.resolve_path(image.output_storage_key)
-        meta = validate_generated_png_for_shopify(path)
+        meta = self._prepare_output_png(image, path)
 
         assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.UPLOADING)
         image.status = BatchImageStatus.UPLOADING
@@ -470,7 +500,11 @@ class ImageProcessor:
             batch_id=batch_product.batch_id,
             batch_image_id=image.id,
             attempt_id=attempt.id,
-            metadata_json={"validation_warnings": meta.get("warnings") or []},
+            metadata_json={
+                "validation_warnings": meta.get("warnings") or [],
+                "has_alpha": bool(meta.get("has_alpha")),
+                "cutout": meta.get("cutout") or {},
+            },
         )
 
         image.generated_shopify_file_gid = result["file_gid"]

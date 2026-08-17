@@ -106,6 +106,12 @@ class Settings(BaseSettings):
     image_storage_warn_avg_generated_mb: float = 8.0
     image_storage_warn_versions_per_product: int = 50
 
+    # Local rembg cut-out after OpenAI (not an extra OpenAI Batch step).
+    # u2netp is the small model (~4 MB) so UAT's ~1 GB box can load it.
+    rembg_enabled: bool = True
+    rembg_model: str = "u2netp"
+    rembg_require_alpha: bool = True
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
