@@ -11,7 +11,9 @@ from app.config import settings
 from app.models import (
     Product,
     ProductPublishOperation,
+    ProductRollbackOperation,
     PublishStatus,
+    RollbackStatus,
     SecondaryQueueItem,
     SecondaryQueueStatus,
     Shop,
@@ -22,6 +24,7 @@ from app.services.state_machine import SECONDARY_TRANSITIONS, assert_transition
 logger = logging.getLogger("app.services.secondary_queue")
 
 _ACTIVE_PUBLISH_STATUSES = (PublishStatus.QUEUED, PublishStatus.PUBLISHING)
+_ACTIVE_ROLLBACK_STATUSES = (RollbackStatus.QUEUED, RollbackStatus.ROLLING_BACK)
 
 
 class SecondaryQueueService:
@@ -89,6 +92,18 @@ class SecondaryQueueService:
         )
         return row is not None
 
+    def _has_active_rollback(self, product_gid: str) -> bool:
+        row = (
+            self.db.query(ProductRollbackOperation.id)
+            .filter(
+                ProductRollbackOperation.shop_id == self.shop.id,
+                ProductRollbackOperation.shopify_product_gid == product_gid,
+                ProductRollbackOperation.status.in_(_ACTIVE_ROLLBACK_STATUSES),
+            )
+            .first()
+        )
+        return row is not None
+
     def upsert_from_webhook(
         self,
         product_gid: str,
@@ -119,6 +134,15 @@ class SecondaryQueueService:
         if self._has_active_publish(product_gid):
             logger.info(
                 "Secondary queue skip during active publish | shop=%s product=%s webhook=%s",
+                self.shop.id,
+                product_gid,
+                webhook_id,
+            )
+            return None
+
+        if self._has_active_rollback(product_gid):
+            logger.info(
+                "Secondary queue skip during active rollback | shop=%s product=%s webhook=%s",
                 self.shop.id,
                 product_gid,
                 webhook_id,

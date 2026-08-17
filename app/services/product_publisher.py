@@ -12,7 +12,6 @@ from sqlalchemy.orm import Session
 from app.core.shop_resolver import create_shopify_graphql_client
 from app.models import (
     BatchProduct,
-    ProcessingBaseline,
     Product,
     ProductPublishOperation,
     PublishStatus,
@@ -33,7 +32,7 @@ from app.services.shopify_file_upload import (
     validate_png_file,
 )
 from app.services.shopify_graphql import ShopifyGraphQLClient, ShopifyGraphQLError
-from app.services.snapshot import media_snapshots_from_shopify
+from app.services.processing_baseline import advance_processing_baseline_to_live_media
 
 logger = logging.getLogger("app.services.product_publisher")
 
@@ -481,47 +480,19 @@ class ProductPublisher:
                 )
                 .one_or_none()
             )
-        if catalog_product is None:
-            logger.warning(
-                "Skip ProcessingBaseline advance after publish; catalog product missing | product=%s",
-                batch_product.shopify_product_gid,
-            )
-            return
-
-        media_rows = [
-            {**row, "is_visible": True}
-            for row in (final_snapshot.get("media") or [])
-            if isinstance(row, dict)
-        ]
-        media_snapshot = media_snapshots_from_shopify(media_rows, visible_only=False)
-        now = datetime.now(timezone.utc)
-
-        baseline = (
-            self.db.query(ProcessingBaseline)
-            .filter(
-                ProcessingBaseline.shop_id == self.shop.id,
-                ProcessingBaseline.product_id == catalog_product.id,
-            )
-            .one_or_none()
-        )
-        if baseline is None:
-            baseline = ProcessingBaseline(shop_id=self.shop.id, product_id=catalog_product.id)
-            self.db.add(baseline)
-
         product_snapshot = batch_product.product_snapshot_json or {}
         if isinstance(batch_product.baseline_snapshot_json, dict):
             nested = batch_product.baseline_snapshot_json.get("product")
             if isinstance(nested, dict) and nested:
                 product_snapshot = nested
-        baseline.product_snapshot_json = product_snapshot
-        baseline.media_snapshot_json = media_snapshot
-        baseline.successfully_processed_at = now
-        baseline.evaluated_at = now
-        self.db.flush()
-        logger.info(
-            "ProcessingBaseline advanced after publish | product=%s media=%s",
-            batch_product.shopify_product_gid,
-            len(media_snapshot),
+        advance_processing_baseline_to_live_media(
+            self.db,
+            shop_id=self.shop.id,
+            catalog_product=catalog_product,
+            shopify_product_gid=batch_product.shopify_product_gid,
+            product_snapshot=product_snapshot,
+            final_snapshot=final_snapshot,
+            reason="publish",
         )
 
     def _set_stage(

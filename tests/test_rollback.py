@@ -7,6 +7,7 @@ from uuid import UUID
 
 from app.models import (
     MediaVersionType,
+    ProcessingBaseline,
     Product,
     ProductMediaVersion,
     ProductPublishOperation,
@@ -61,6 +62,14 @@ def _seed_product_with_versions(db, shop):
     db.refresh(product)
     db.refresh(original)
     db.refresh(published)
+    db.add(
+        ProcessingBaseline(
+            shop_id=shop.id,
+            product_id=product.id,
+            media_snapshot_json=[_media("gid://shopify/MediaImage/999", 0)],
+        )
+    )
+    db.commit()
     return product, original, published
 
 
@@ -264,6 +273,15 @@ def test_successful_rollback_creates_audit_version(db_session, shop):
     assert remove_calls
     assert "gid://shopify/MediaImage/999" in remove_calls[0].kwargs["file_gids"]
     assert remove_calls[0].kwargs["product_gid"] == product.shopify_product_gid
+
+    baseline = (
+        db_session.query(ProcessingBaseline)
+        .filter(ProcessingBaseline.product_id == product.id)
+        .one()
+    )
+    gids = {m["media_gid"] for m in (baseline.media_snapshot_json or [])}
+    assert "gid://shopify/MediaImage/10" in gids
+    assert "gid://shopify/MediaImage/999" not in gids
 
 
 def test_compare_by_files_allows_rematerialized_media_gids():
@@ -681,4 +699,159 @@ def test_rollback_force_despite_conflict(db_session, shop):
     assert out.result_version_id == original.id
     # published remains the "from" version historically; target original is reactivated
     assert published.id != out.result_version_id
+
+
+def test_secondary_queue_skips_during_active_rollback(db_session, shop):
+    from app.core.shop_resolver import ensure_shop_settings
+    from app.services.secondary_queue import SecondaryQueueService
+
+    ensure_shop_settings(db_session, shop)
+    product, original, published = _seed_product_with_versions(db_session, shop)
+    db_session.add(
+        ProductRollbackOperation(
+            shop_id=shop.id,
+            product_id=product.id,
+            shopify_product_gid=product.shopify_product_gid,
+            from_version_id=published.id,
+            target_version_id=original.id,
+            status=RollbackStatus.ROLLING_BACK,
+            idempotency_key=f"rb-active-{product.id}",
+            current_stage="ATTACHING_TARGET_SET",
+        )
+    )
+    db_session.commit()
+
+    result = SecondaryQueueService(db_session, shop).upsert_from_webhook(
+        product_gid=product.shopify_product_gid,
+        product_snapshot={
+            "product_gid": product.shopify_product_gid,
+            "title": "Ring",
+            "status": "ACTIVE",
+        },
+        media_snapshot=[_media("gid://shopify/MediaImage/10", 0)],
+        webhook_id="wh-during-rollback",
+    )
+    assert result is None
+
+
+def test_secondary_queue_enqueues_after_rollback_completed(db_session, shop):
+    from app.core.shop_resolver import ensure_shop_settings
+    from app.services.secondary_queue import SecondaryQueueService
+
+    ensure_shop_settings(db_session, shop)
+    product, original, published = _seed_product_with_versions(db_session, shop)
+    db_session.add(
+        ProductRollbackOperation(
+            shop_id=shop.id,
+            product_id=product.id,
+            shopify_product_gid=product.shopify_product_gid,
+            from_version_id=published.id,
+            target_version_id=original.id,
+            status=RollbackStatus.ROLLED_BACK,
+            idempotency_key=f"rb-done-{product.id}",
+            current_stage="ROLLED_BACK",
+        )
+    )
+    db_session.commit()
+
+    result = SecondaryQueueService(db_session, shop).upsert_from_webhook(
+        product_gid=product.shopify_product_gid,
+        product_snapshot={
+            "product_gid": product.shopify_product_gid,
+            "title": "Ring",
+            "status": "ACTIVE",
+        },
+        media_snapshot=[_media("gid://shopify/MediaImage/10", 0)],
+        webhook_id="wh-after-rollback",
+    )
+    assert result is not None
+
+
+def test_advance_processing_baseline_after_rollback(db_session, shop):
+    product, _original, _published = _seed_product_with_versions(db_session, shop)
+    final = {
+        "media": [_media("gid://shopify/MediaImage/10", 0, alt="front", featured=True)],
+    }
+    ProductRollbackService(
+        db_session, shop, client=MagicMock()
+    )._advance_processing_baseline_after_rollback(product, final)
+    db_session.commit()
+
+    baseline = (
+        db_session.query(ProcessingBaseline)
+        .filter(ProcessingBaseline.product_id == product.id)
+        .one()
+    )
+    gids = {m["media_gid"] for m in (baseline.media_snapshot_json or [])}
+    assert gids == {"gid://shopify/MediaImage/10"}
+    assert "gid://shopify/MediaImage/999" not in gids
+
+
+def test_rollback_baseline_makes_matching_webhook_skip_conversion(db_session, shop):
+    from app.core.shop_resolver import ensure_shop_settings
+    from app.models import SecondaryQueueStatus
+    from app.services.primary_batch import PrimaryBatchService
+    from app.services.secondary_queue import SecondaryQueueService
+    from tests.test_week2 import _configure_central
+
+    ensure_shop_settings(db_session, shop)
+    _configure_central(db_session, shop)
+    product, _original, _published = _seed_product_with_versions(db_session, shop)
+    restored = [_media("gid://shopify/MediaImage/10", 0, alt="front", featured=True)]
+    ProductRollbackService(
+        db_session, shop, client=MagicMock()
+    )._advance_processing_baseline_after_rollback(product, {"media": restored})
+    db_session.commit()
+
+    item = SecondaryQueueService(db_session, shop).upsert_from_webhook(
+        product_gid=product.shopify_product_gid,
+        product_snapshot={
+            "product_gid": product.shopify_product_gid,
+            "title": "Ring",
+            "status": "ACTIVE",
+        },
+        media_snapshot=restored,
+        webhook_id="wh-rollback-echo",
+    )
+    assert item is not None
+
+    batch = PrimaryBatchService(db_session, shop).convert_secondary_items([item])
+    assert batch is None
+    db_session.refresh(item)
+    assert item.status == SecondaryQueueStatus.SKIPPED_NO_ELIGIBLE_IMAGE_DELTA
+    assert item.skip_reason
+
+
+def test_new_image_after_rollback_baseline_still_converts(db_session, shop):
+    from app.core.shop_resolver import ensure_shop_settings
+    from app.models import SecondaryQueueStatus
+    from app.services.primary_batch import PrimaryBatchService
+    from app.services.secondary_queue import SecondaryQueueService
+    from tests.test_week2 import _configure_central
+
+    ensure_shop_settings(db_session, shop)
+    _configure_central(db_session, shop)
+    product, _original, _published = _seed_product_with_versions(db_session, shop)
+    restored = [_media("gid://shopify/MediaImage/10", 0, alt="front", featured=True)]
+    ProductRollbackService(
+        db_session, shop, client=MagicMock()
+    )._advance_processing_baseline_after_rollback(product, {"media": restored})
+    db_session.commit()
+
+    item = SecondaryQueueService(db_session, shop).upsert_from_webhook(
+        product_gid=product.shopify_product_gid,
+        product_snapshot={
+            "product_gid": product.shopify_product_gid,
+            "title": "Ring",
+            "status": "ACTIVE",
+        },
+        media_snapshot=restored + [_media("gid://shopify/MediaImage/11", 1, alt="side")],
+        webhook_id="wh-real-edit-after-rollback",
+    )
+    assert item is not None
+
+    batch = PrimaryBatchService(db_session, shop).convert_secondary_items([item])
+    assert batch is not None
+    db_session.refresh(item)
+    assert item.status == SecondaryQueueStatus.CONVERTED
 

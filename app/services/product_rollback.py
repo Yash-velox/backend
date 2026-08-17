@@ -13,17 +13,20 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.shop_resolver import create_shopify_graphql_client
 from app.models import (
+    Product,
     ProductMediaVersion,
     ProductRollbackOperation,
     RollbackStatus,
     Shop,
 )
 from app.services.media_versions import MediaVersionsService, product_has_active_media_op
+from app.services.processing_baseline import advance_processing_baseline_to_live_media
 from app.services.publish_compensation import PublishCompensationError, PublishCompensationService
 from app.services.publish_conflict import compare_publish_snapshots
 from app.services.publish_snapshot import normalize_publish_snapshot
 from app.services.shopify_file_upload import poll_reorder_job
 from app.services.shopify_graphql import ShopifyGraphQLClient, ShopifyGraphQLError
+from app.services.snapshot import product_snapshot_from_model
 
 logger = logging.getLogger("app.services.product_rollback")
 
@@ -898,6 +901,17 @@ class ProductRollbackService:
                     op.id,
                     op.shopify_product_gid,
                 )
+            # Freeze ProcessingBaseline to the restored media before commit so
+            # Shopify products/update webhooks caused by this revert do not convert
+            # into a new automatic Primary batch (rollback → webhook feedback loop).
+            try:
+                self._advance_processing_baseline_after_rollback(product, done)
+            except Exception:
+                logger.exception(
+                    "Failed to advance ProcessingBaseline after rollback | op=%s product=%s",
+                    op.id,
+                    op.shopify_product_gid,
+                )
             now = datetime.now(timezone.utc)
             op.result_version_id = result.id
             op.status = RollbackStatus.ROLLED_BACK
@@ -968,6 +982,18 @@ class ProductRollbackService:
                 except Exception:
                     logger.exception(
                         "Failed to link image versions after activate recovery | op=%s",
+                        op.id,
+                    )
+                try:
+                    recovered_product = self.versions.get_product(op.product_id)
+                    recovered_snapshot = {"media": list((result.items_json or {}).get("media") or [])}
+                    self._advance_processing_baseline_after_rollback(
+                        recovered_product,
+                        recovered_snapshot,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to advance ProcessingBaseline after rollback recovery | op=%s",
                         op.id,
                     )
                 op.result_version_id = result.id
@@ -1071,6 +1097,22 @@ class ProductRollbackService:
         except (PublishCompensationError, ShopifyGraphQLError) as restore_exc:
             code = getattr(restore_exc, "code", "ROLLBACK_RESTORE_FAILED")
             return self._fail_restore(op, code, str(restore_exc))
+
+    def _advance_processing_baseline_after_rollback(
+        self,
+        product: Product,
+        final_snapshot: dict[str, Any],
+    ) -> None:
+        """Point ProcessingBaseline at the restored live media GIDs/CDN URLs."""
+        advance_processing_baseline_to_live_media(
+            self.db,
+            shop_id=self.shop.id,
+            catalog_product=product,
+            shopify_product_gid=product.shopify_product_gid,
+            product_snapshot=product_snapshot_from_model(product),
+            final_snapshot=final_snapshot,
+            reason="rollback",
+        )
 
     def _set_stage(self, op: ProductRollbackOperation, stage: str) -> None:
         op.status = RollbackStatus.ROLLING_BACK
