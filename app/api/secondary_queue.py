@@ -14,6 +14,7 @@ from app.schemas.week2 import (
     SecondaryQueueSummaryOut,
     SuccessEnvelope,
 )
+from app.services.product_links import catalog_by_id, product_link_fields
 from app.services.secondary_queue import SecondaryQueueService
 
 router = APIRouter(prefix="/api/secondary-queue", tags=["secondary-queue"])
@@ -23,11 +24,22 @@ def _request_id(request: Request) -> str:
     return request.headers.get("x-request-id") or f"req_{uuid.uuid4().hex[:12]}"
 
 
-def _item_out(item) -> SecondaryQueueItemOut:
+def _item_out(item, *, shop, catalog=None) -> SecondaryQueueItemOut:
+    snapshot = item.eligible_product_snapshot_json if isinstance(item.eligible_product_snapshot_json, dict) else {}
+    links = product_link_fields(
+        shop=shop,
+        shopify_product_gid=item.shopify_product_gid,
+        catalog=catalog,
+        snapshot=snapshot,
+    )
     return SecondaryQueueItemOut(
         id=item.id,
         shopifyProductGid=item.shopify_product_gid,
         productId=item.product_id,
+        title=links["title"],
+        handle=links["handle"],
+        adminUrl=links["adminUrl"],
+        storefrontUrl=links["storefrontUrl"],
         queueRevision=item.queue_revision,
         status=item.status.value,
         webhookCount=item.webhook_count,
@@ -77,13 +89,17 @@ def list_secondary_queue_items(
         page=page,
         page_size=pageSize,
     )
+    catalog = catalog_by_id(db, shop, [i.product_id for i in items])
     total_pages = max(1, math.ceil(total / pageSize)) if total else 0
     return SuccessEnvelope(
         success=True,
         message="Secondary queue items retrieved successfully.",
         requestId=_request_id(request),
         data={
-            "items": [_item_out(i).model_dump() for i in items],
+            "items": [
+                _item_out(i, shop=shop, catalog=catalog.get(i.product_id) if i.product_id else None).model_dump()
+                for i in items
+            ],
             "pagination": PaginationMeta(
                 page=page,
                 pageSize=pageSize,
@@ -105,9 +121,14 @@ def get_secondary_queue_item(
     if item is None:
         raise HTTPException(status_code=404, detail="Secondary queue item not found")
 
+    catalog = catalog_by_id(db, shop, [item.product_id])
     return SuccessEnvelope(
         success=True,
         message="Secondary queue item retrieved successfully.",
         requestId=_request_id(request),
-        data=_item_out(item).model_dump(),
+        data=_item_out(
+            item,
+            shop=shop,
+            catalog=catalog.get(item.product_id) if item.product_id else None,
+        ).model_dump(),
     )

@@ -1,16 +1,29 @@
 from __future__ import annotations
 
 import math
-import re
 import uuid
-from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, RedirectResponse
 
 from app.core.deps import CurrentShop, DbSession
-from app.models import BatchImage, BatchStatus, Product, Shop
+from app.models import BatchImage, BatchStatus, Shop
+from app.schemas.queue import AttemptOut
+from app.schemas.week2 import (
+    BatchImageOut,
+    BatchOut,
+    BatchProductOut,
+    ManualBatchCreateRequest,
+    PaginationMeta,
+    ReprocessRequest,
+    SuccessEnvelope,
+)
+from app.services.output_storage import get_output_storage
+from app.services.primary_batch import PrimaryBatchError, PrimaryBatchService
+from app.services.product_links import catalog_by_id, product_link_fields
+from app.services.reprocess_service import ReprocessError, ReprocessService
+from app.services.retry_service import RetryService
 from app.schemas.queue import AttemptOut
 from app.schemas.week2 import (
     BatchImageOut,
@@ -60,62 +73,23 @@ def _batch_out(batch) -> BatchOut:
     )
 
 
-_PRODUCT_GID_RE = re.compile(r"Product/(\d+)")
-
-
-def _shop_host(shop: Shop) -> str:
-    return (shop.shop_domain or "").replace("https://", "").replace("http://", "").split("/")[0].lower()
-
-
-def _snapshot_str(snapshot: dict[str, Any] | None, *keys: str) -> str | None:
-    if not isinstance(snapshot, dict):
-        return None
-    for key in keys:
-        value = snapshot.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _product_numeric_id(
-    gid: str,
-    catalog: Product | None,
-    snapshot: dict[str, Any] | None,
-) -> str | None:
-    if catalog and catalog.shopify_numeric_id:
-        return str(catalog.shopify_numeric_id).strip() or None
-    snap_id = _snapshot_str(snapshot, "numeric_id", "shopify_numeric_id")
-    if snap_id:
-        return snap_id
-    match = _PRODUCT_GID_RE.search(gid or "")
-    return match.group(1) if match else None
-
-
-def _catalog_by_id(db, shop: Shop, products: list) -> dict:
-    ids = [p.product_id for p in products if p.product_id]
-    if not ids:
-        return {}
-    rows = db.query(Product).filter(Product.shop_id == shop.id, Product.id.in_(ids)).all()
-    return {row.id: row for row in rows}
-
-
-def _product_out(product, *, shop: Shop, catalog: Product | None = None) -> BatchProductOut:
+def _product_out(product, *, shop: Shop, catalog=None) -> BatchProductOut:
     snapshot = product.product_snapshot_json if isinstance(product.product_snapshot_json, dict) else {}
-    title = (catalog.title.strip() if catalog and catalog.title else None) or _snapshot_str(snapshot, "title")
-    handle = (catalog.handle.strip() if catalog and catalog.handle else None) or _snapshot_str(snapshot, "handle")
-    numeric_id = _product_numeric_id(product.shopify_product_gid, catalog, snapshot)
-    host = _shop_host(shop)
-    admin_url = f"https://{host}/admin/products/{numeric_id}" if host and numeric_id else None
-    storefront_url = f"https://{host}/products/{handle}" if host and handle else None
+    links = product_link_fields(
+        shop=shop,
+        shopify_product_gid=product.shopify_product_gid,
+        catalog=catalog,
+        snapshot=snapshot,
+    )
     return BatchProductOut(
         id=product.id,
         batchId=product.batch_id,
         shopifyProductGid=product.shopify_product_gid,
         productId=product.product_id,
-        title=title,
-        handle=handle,
-        adminUrl=admin_url,
-        storefrontUrl=storefront_url,
+        title=links["title"],
+        handle=links["handle"],
+        adminUrl=links["adminUrl"],
+        storefrontUrl=links["storefrontUrl"],
         status=product.status.value,
         publishStatus=product.publish_status.value if product.publish_status else None,
         imageCount=product.image_count,
@@ -267,7 +241,7 @@ def get_batch_products(batch_id: UUID, request: Request, db: DbSession, shop: Cu
         raise HTTPException(status_code=404, detail="Batch not found")
 
     products = svc.get_batch_products(batch_id)
-    catalog = _catalog_by_id(db, shop, products)
+    catalog = catalog_by_id(db, shop, [p.product_id for p in products])
     return SuccessEnvelope(
         success=True,
         message="Batch products retrieved successfully.",
@@ -502,7 +476,7 @@ def retry_batch_product(
     if not products:
         raise HTTPException(status_code=404, detail="Failed batch product not found")
 
-    catalog = _catalog_by_id(db, shop, products)
+    catalog = catalog_by_id(db, shop, [p.product_id for p in products])
     first = products[0]
     return SuccessEnvelope(
         success=True,

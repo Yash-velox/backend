@@ -1182,10 +1182,20 @@ def test_settings_api(client, shop, db_session):
 
 def test_secondary_queue_api(client, shop, db_session):
     ensure_shop_settings(db_session, shop)
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/77",
+        title="Charm",
+        handle="charm",
+        status="ACTIVE",
+    )
+    db_session.add(product)
+    db_session.flush()
     db_session.add(
         SecondaryQueueItem(
             shop_id=shop.id,
             shopify_product_gid="gid://shopify/Product/77",
+            product_id=product.id,
             status=SecondaryQueueStatus.PENDING,
             queue_revision=1,
             webhook_count=1,
@@ -1197,7 +1207,11 @@ def test_secondary_queue_api(client, shop, db_session):
     assert summary.json()["data"]["pending"] >= 1
     listing = client.get("/api/secondary-queue?page=1&pageSize=10")
     assert listing.status_code == 200
-    assert listing.json()["data"]["items"]
+    item = listing.json()["data"]["items"][0]
+    assert item["title"] == "Charm"
+    assert item["handle"] == "charm"
+    assert item["adminUrl"] == "https://test-shop.myshopify.com/admin/products/77"
+    assert item["storefrontUrl"] == "https://test-shop.myshopify.com/products/charm"
 
 
 def test_secondary_queue_list_newest_first_page_size_seven(client, shop, db_session):

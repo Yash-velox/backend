@@ -84,6 +84,10 @@ class SecondaryQueueItemOut(BaseModel):
     id: UUID
     shopifyProductGid: str
     productId: UUID | None = None
+    title: str | None = None
+    handle: str | None = None
+    adminUrl: str | None = None
+    storefrontUrl: str | None = None
     queueRevision: int
     status: str
     webhookCount: int
