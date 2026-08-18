@@ -140,7 +140,7 @@ class PromptResolver:
                 code="PROMPT_NOT_CONFIGURED",
                 retryable=False,
             )
-        # System Prompt is a single prompt — never run sequential steps.
+        # System Prompt is a single prompt - never run sequential steps.
         return self._render_steps(
             enabled_steps[:1],
             product=product,
