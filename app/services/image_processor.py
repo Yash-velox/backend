@@ -31,7 +31,7 @@ from app.services.openai_image_compat import supports_transparent_background
 from app.services.output_storage import OutputStorage, checksum_sha256, get_output_storage
 from app.services.primary_batch import PrimaryBatchService
 from app.services.prompt_resolver import PromptResolver, PromptResolverError
-from app.services.retry_service import RetryService
+from app.services.retry_service import RetryService, complete_image_from_shopify_file, find_generated_version_for_batch_image, next_processing_attempt_number
 from app.services.shopify_file_upload import (
     PublishUploadError,
     ShopifyFileUploadService,
@@ -179,6 +179,14 @@ class ImageProcessor:
             )
             return
 
+        if self.retry_service.complete_unpublished_generated_work(batch_product):
+            batch_service = self._primary_batch_service(batch_product.shop_id)
+            batch = batch_service.get_batch(batch_product.batch_id)
+            if batch:
+                batch_service.refresh_batch_counters(batch)
+            self.db.commit()
+            return
+
         images = sorted(batch_product.images, key=lambda i: i.created_at)
         product_failed = False
         for image in images:
@@ -269,7 +277,22 @@ class ImageProcessor:
     def finalize_local_output(self, batch_image_id: UUID, *, worker_id: str) -> bool:
         """Upload an already-generated local output to Shopify Files (OpenAI Batch path)."""
         image = self.db.get(BatchImage, batch_image_id)
-        if not image or not image.output_storage_key:
+        if not image:
+            return False
+        version = find_generated_version_for_batch_image(self.db, image)
+        if version is not None and version.shopify_file_gid:
+            complete_image_from_shopify_file(
+                image,
+                file_gid=version.shopify_file_gid,
+                cdn_url=version.shopify_cdn_url,
+                version_id=version.id,
+            )
+            batch_product = self.db.get(BatchProduct, image.batch_product_id)
+            if batch_product is not None:
+                self.retry_service.complete_unpublished_generated_work(batch_product)
+            self.db.commit()
+            return True
+        if not image.output_storage_key:
             return False
         if image.generated_shopify_file_gid:
             return True
@@ -616,6 +639,21 @@ class ImageProcessor:
         worker_id: str,
     ) -> bool:
         now = datetime.now(timezone.utc)
+        version = find_generated_version_for_batch_image(self.db, image)
+        if version is not None and version.shopify_file_gid:
+            complete_image_from_shopify_file(
+                image,
+                file_gid=version.shopify_file_gid,
+                cdn_url=version.shopify_cdn_url,
+                version_id=version.id,
+            )
+            logger.info(
+                "Batch image reused existing generated version | image=%s version=%s",
+                image.id,
+                version.id,
+            )
+            return True
+
         if image.status not in (
             BatchImageStatus.QUEUED,
             BatchImageStatus.RETRYING,
@@ -628,7 +666,11 @@ class ImageProcessor:
             image
         )
 
-        image.attempt_count += 1
+        image.attempt_count = next_processing_attempt_number(
+            self.db,
+            image.id,
+            start_from=image.attempt_count + 1,
+        )
         image.started_at = image.started_at or now
         image.error_code = None
         image.error_message = None

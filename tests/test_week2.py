@@ -29,6 +29,8 @@ from app.models import (
     SecondaryQueueStatus,
     Shop,
     TriggerType,
+    ImageVersion,
+    ImageVersionType,
     WebhookEvent,
     WebhookProcessingResult,
 )
@@ -1809,4 +1811,111 @@ def test_stale_recovery_heals_product_when_all_images_completed(db_session, shop
     assert bp.status == BatchProductStatus.COMPLETED
     assert bp.locked_by is None
     assert bp.error_code is None
+
+
+def test_stale_recovery_reuses_existing_generated_version_instead_of_retry(
+    db_session, shop, monkeypatch
+):
+    monkeypatch.setattr("app.services.retry_service.settings.processing_stale_lock_seconds", 1)
+    catalog = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/reuse-1",
+        title="Charm",
+        handle="charm",
+        status="ACTIVE",
+    )
+    db_session.add(catalog)
+    db_session.flush()
+    batch, bp, image = _stale_locked_product(
+        db_session,
+        shop,
+        image_status=BatchImageStatus.QUEUED,
+        processing_phase="UPLOADING_TO_SHOPIFY_FILES",
+    )
+    bp.product_id = catalog.id
+    db_session.flush()
+    version = ImageVersion(
+        shop_id=shop.id,
+        product_id=catalog.id,
+        source_media_gid=image.shopify_media_gid,
+        version_number=3,
+        version_type=ImageVersionType.GENERATED,
+        shopify_file_gid="gid://shopify/MediaImage/already-uploaded",
+        shopify_cdn_url="https://cdn.shopify.com/generated.png",
+        is_current=True,
+        created_by_batch_id=batch.id,
+        created_by_batch_image_id=image.id,
+    )
+    db_session.add(version)
+    db_session.commit()
+
+    recovered = RetryService(db_session).recover_stale_batch_products(worker_id="worker_new")
+    assert recovered == 1
+    db_session.refresh(bp)
+    db_session.refresh(image)
+    db_session.refresh(version)
+    assert bp.status == BatchProductStatus.COMPLETED
+    assert bp.error_code is None
+    assert image.status == BatchImageStatus.COMPLETED
+    assert image.generated_shopify_file_gid == "gid://shopify/MediaImage/already-uploaded"
+    assert image.generated_image_version_id == version.id
+    count = (
+        db_session.query(ImageVersion)
+        .filter(ImageVersion.created_by_batch_image_id == image.id)
+        .count()
+    )
+    assert count == 1
+
+
+def test_complete_unpublished_work_heals_failed_product_without_new_version(db_session, shop):
+    catalog = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/reuse-failed",
+        title="Charm",
+        handle="charm-failed",
+        status="ACTIVE",
+    )
+    db_session.add(catalog)
+    db_session.flush()
+    batch, bp, image = _stale_locked_product(
+        db_session,
+        shop,
+        image_status=BatchImageStatus.QUEUED,
+        processing_phase="UPLOADING_TO_SHOPIFY_FILES",
+    )
+    bp.product_id = catalog.id
+    bp.status = BatchProductStatus.FAILED
+    bp.error_code = "STALE_LOCK"
+    bp.locked_by = None
+    bp.locked_at = None
+    db_session.flush()
+    version = ImageVersion(
+        shop_id=shop.id,
+        product_id=catalog.id,
+        source_media_gid=image.shopify_media_gid,
+        version_number=3,
+        version_type=ImageVersionType.GENERATED,
+        shopify_file_gid="gid://shopify/MediaImage/failed-reuse",
+        is_current=True,
+        created_by_batch_id=batch.id,
+        created_by_batch_image_id=image.id,
+    )
+    db_session.add(version)
+    db_session.commit()
+
+    healed = RetryService(db_session).complete_unpublished_generated_work(bp)
+    assert healed is True
+    assert bp.status == BatchProductStatus.COMPLETED
+    db_session.commit()
+    db_session.refresh(bp)
+    db_session.refresh(image)
+    assert bp.status == BatchProductStatus.COMPLETED
+    assert image.status == BatchImageStatus.COMPLETED
+    assert image.generated_shopify_file_gid == "gid://shopify/MediaImage/failed-reuse"
+    assert (
+        db_session.query(ImageVersion)
+        .filter(ImageVersion.created_by_batch_image_id == image.id)
+        .count()
+        == 1
+    )
 

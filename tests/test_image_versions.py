@@ -224,9 +224,7 @@ def test_upload_retry_idempotent_no_duplicate_version(db_session, shop, tmp_path
             "height": 1,
         }
 
-    with patch("app.services.image_processor.resolve_shop_access_token", return_value="tok"), patch(
-        "app.services.image_processor.ShopifyGraphQLClient"
-    ), patch(
+    with patch("app.services.image_processor.create_shopify_graphql_client"), patch(
         "app.services.image_processor.ShopifyFileUploadService.upload_png",
         side_effect=fake_upload,
     ):

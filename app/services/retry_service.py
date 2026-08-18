@@ -13,6 +13,8 @@ from app.models import (
     BatchImageStatus,
     BatchProduct,
     BatchProductStatus,
+    ImageVersion,
+    ImageVersionType,
     ProcessingAttempt,
     ProcessingBatch,
     Shop,
@@ -43,6 +45,96 @@ def _image_awaiting_shopify_upload(image: BatchImage) -> bool:
     return image.status not in {BatchImageStatus.FAILED, BatchImageStatus.COMPLETED}
 
 
+def next_processing_attempt_number(
+    db: Session,
+    batch_image_id: UUID,
+    *,
+    start_from: int = 1,
+) -> int:
+    """Return the next unused processing_attempts.attempt_number for this image."""
+    existing = {
+        row[0]
+        for row in db.query(ProcessingAttempt.attempt_number)
+        .filter(ProcessingAttempt.batch_image_id == batch_image_id)
+        .all()
+    }
+    number = max(int(start_from), 1)
+    while number in existing:
+        number += 1
+    return number
+
+
+def find_generated_version_for_batch_image(db: Session, image: BatchImage) -> ImageVersion | None:
+    """Latest GENERATED Shopify file created from this batch image, if any."""
+    return (
+        db.query(ImageVersion)
+        .filter(
+            ImageVersion.created_by_batch_image_id == image.id,
+            ImageVersion.version_type == ImageVersionType.GENERATED,
+            ImageVersion.shopify_file_gid.is_not(None),
+        )
+        .order_by(ImageVersion.version_number.desc())
+        .first()
+    )
+
+
+_COMPLETE_FROM_STATUS: dict[BatchImageStatus, tuple[BatchImageStatus, ...]] = {
+    BatchImageStatus.QUEUED: (BatchImageStatus.UPLOADING, BatchImageStatus.COMPLETED),
+    BatchImageStatus.RETRYING: (BatchImageStatus.UPLOADING, BatchImageStatus.COMPLETED),
+    BatchImageStatus.DOWNLOADING: (
+        BatchImageStatus.PROCESSING,
+        BatchImageStatus.UPLOADING,
+        BatchImageStatus.COMPLETED,
+    ),
+    BatchImageStatus.PROCESSING: (BatchImageStatus.UPLOADING, BatchImageStatus.COMPLETED),
+    BatchImageStatus.WAITING_FOR_PROVIDER: (BatchImageStatus.UPLOADING, BatchImageStatus.COMPLETED),
+    BatchImageStatus.UPLOADING: (BatchImageStatus.COMPLETED,),
+    BatchImageStatus.FAILED: (
+        BatchImageStatus.QUEUED,
+        BatchImageStatus.UPLOADING,
+        BatchImageStatus.COMPLETED,
+    ),
+}
+
+
+def complete_image_from_shopify_file(
+    image: BatchImage,
+    *,
+    file_gid: str,
+    cdn_url: str | None = None,
+    version_id: UUID | None = None,
+    prompt_step: int | None = None,
+) -> bool:
+    """Reattach a durable Shopify Files upload and mark the image completed.
+
+    Used when upload succeeded but the batch_image row was later reset (stale lock /
+    UniqueViolation retry). Returns True when status changed.
+    """
+    image.generated_shopify_file_gid = file_gid
+    if cdn_url:
+        image.generated_shopify_cdn_url = cdn_url
+    if version_id is not None:
+        image.generated_image_version_id = version_id
+    if prompt_step is not None:
+        image.current_prompt_step = max(image.current_prompt_step, prompt_step)
+    elif image.current_prompt_step < 1:
+        image.current_prompt_step = 1
+    image.error_code = None
+    image.error_message = None
+    if image.status == BatchImageStatus.COMPLETED:
+        if image.completed_at is None:
+            image.completed_at = datetime.now(timezone.utc)
+        return False
+    hops = _COMPLETE_FROM_STATUS.get(image.status)
+    if not hops:
+        return False
+    for target in hops:
+        assert_transition("batch_image", BATCH_IMAGE_TRANSITIONS, image.status, target)
+        image.status = target
+    image.completed_at = datetime.now(timezone.utc)
+    return True
+
+
 class RetryService:
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -70,11 +162,62 @@ class RetryService:
                 return True
         return False
 
+    def _complete_images_from_existing_versions(self, batch_product: BatchProduct) -> int:
+        """Reuse unpublished GENERATED Shopify files. Retry-before-publish is not a new version."""
+        completed = 0
+        for image in list(batch_product.images or []):
+            if image.status == BatchImageStatus.COMPLETED and image.generated_shopify_file_gid:
+                continue
+            version = find_generated_version_for_batch_image(self.db, image)
+            if version is None or not version.shopify_file_gid:
+                continue
+            if complete_image_from_shopify_file(
+                image,
+                file_gid=version.shopify_file_gid,
+                cdn_url=version.shopify_cdn_url,
+                version_id=version.id,
+            ) or image.status == BatchImageStatus.COMPLETED:
+                completed += 1
+                logger.info(
+                    "Reused existing generated version before publish | image=%s version=%s file=%s",
+                    image.id,
+                    version.id,
+                    version.shopify_file_gid,
+                )
+        return completed
+
+    def complete_unpublished_generated_work(
+        self,
+        batch_product: BatchProduct,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """If this batch already uploaded Shopify Files, complete without a new version."""
+        now = now or datetime.now(timezone.utc)
+        self._complete_images_from_existing_versions(batch_product)
+        return self._complete_product_if_images_done(batch_product, now=now)
+
     def _complete_product_if_images_done(self, batch_product: BatchProduct, *, now: datetime) -> bool:
         """Heal products whose images all finished while the product stayed locked/retrying."""
         images = list(batch_product.images or [])
         if not images or not all(img.status == BatchImageStatus.COMPLETED for img in images):
             return False
+        if batch_product.status == BatchProductStatus.FAILED:
+            assert_transition(
+                "batch_product",
+                BATCH_PRODUCT_TRANSITIONS,
+                batch_product.status,
+                BatchProductStatus.RETRYING,
+            )
+            batch_product.status = BatchProductStatus.RETRYING
+        if batch_product.status == BatchProductStatus.QUEUED:
+            assert_transition(
+                "batch_product",
+                BATCH_PRODUCT_TRANSITIONS,
+                batch_product.status,
+                BatchProductStatus.PROCESSING,
+            )
+            batch_product.status = BatchProductStatus.PROCESSING
         if batch_product.status not in {
             BatchProductStatus.PROCESSING,
             BatchProductStatus.RETRYING,
@@ -93,6 +236,9 @@ class RetryService:
         batch_product.next_retry_at = None
         batch_product.error_code = None
         batch_product.error_message = None
+        from app.services.image_processor import ImageProcessor
+
+        ImageProcessor(self.db)._advance_baseline_on_success(batch_product)
         logger.info(
             "Stale recovery healed completed product | product=%s batch=%s",
             batch_product.id,
@@ -220,6 +366,11 @@ class RetryService:
         for batch_product in stale:
             # OpenAI Platform wait / import / Shopify upload can exceed the lock TTL.
             # Interrupting those races leaves images COMPLETED and products RETRYING forever.
+            if self.complete_unpublished_generated_work(batch_product, now=now):
+                batch_ids.add(batch_product.batch_id)
+                recovered += 1
+                continue
+
             if self._product_has_healthy_async_work(batch_product):
                 logger.debug(
                     "Stale recovery skipped healthy async work | product=%s phase_or_images=in_flight",
@@ -258,15 +409,11 @@ class RetryService:
                     )
                     open_attempt.completed_at = now
                 else:
-                    next_number = max(image.attempt_count, 1)
-                    existing_numbers = {
-                        row[0]
-                        for row in self.db.query(ProcessingAttempt.attempt_number)
-                        .filter(ProcessingAttempt.batch_image_id == image.id)
-                        .all()
-                    }
-                    while next_number in existing_numbers:
-                        next_number += 1
+                    next_number = next_processing_attempt_number(
+                        self.db,
+                        image.id,
+                        start_from=max(image.attempt_count, 1),
+                    )
                     self.db.add(
                         ProcessingAttempt(
                             batch_image_id=image.id,
@@ -364,6 +511,15 @@ class RetryService:
                 .all()
             )
             for image in images:
+                version = find_generated_version_for_batch_image(self.db, image)
+                if version is not None and version.shopify_file_gid:
+                    complete_image_from_shopify_file(
+                        image,
+                        file_gid=version.shopify_file_gid,
+                        cdn_url=version.shopify_cdn_url,
+                        version_id=version.id,
+                    )
+                    continue
                 if image.status != BatchImageStatus.FAILED:
                     continue
                 # Preserve local output for Shopify upload-only retries when present.
@@ -392,6 +548,16 @@ class RetryService:
                 image.error_code = None
                 image.error_message = None
                 image.completed_at = None
+
+            if self._complete_product_if_images_done(batch_product, now=now):
+                batch_ids.add(batch_product.batch_id)
+                logger.info(
+                    "Manual product retry reused existing version | product=%s shop=%s batch=%s",
+                    batch_product.id,
+                    shop_id,
+                    batch_product.batch_id,
+                )
+                continue
 
             batch_ids.add(batch_product.batch_id)
             logger.info(

@@ -48,6 +48,12 @@ from app.services.openai_batch_client import (
 from app.services.output_storage import checksum_sha256, get_output_storage
 from app.services.primary_batch import PrimaryBatchService
 from app.services.prompt_resolver import PromptResolver, PromptResolverError, ResolvedPromptStep
+from app.services.retry_service import (
+    RetryService,
+    complete_image_from_shopify_file,
+    find_generated_version_for_batch_image,
+    next_processing_attempt_number,
+)
 from app.services.state_machine import (
     BATCH_IMAGE_TRANSITIONS,
     BATCH_PRODUCT_TRANSITIONS,
@@ -146,6 +152,7 @@ class OpenAIBatchOrchestrator:
             "polled": 0,
             "imported": 0,
             "submitted": 0,
+            "reused": 0,
             "finalized": 0,
             "cleaned": 0,
             "errors": 0,
@@ -159,6 +166,7 @@ class OpenAIBatchOrchestrator:
             return stats
 
         stats["polled"] = self.poll_inflight_batches()
+        stats["reused"] = self._reuse_existing_generated_outputs()
         stats["submitted"] = self.submit_ready_stages(worker_id=worker_id)
         stats["finalized"] = self.finalize_ready_images(worker_id=worker_id)
         stats["cleaned"] = self.cleanup_temporary_files()
@@ -566,6 +574,49 @@ class OpenAIBatchOrchestrator:
         self.db.flush()
         return child
 
+    def _reuse_existing_generated_outputs(self) -> int:
+        """Complete unpublished work that already has a Shopify Files version."""
+        products = (
+            self.db.query(BatchProduct)
+            .options(selectinload(BatchProduct.images))
+            .filter(
+                BatchProduct.status.in_(
+                    [
+                        BatchProductStatus.QUEUED,
+                        BatchProductStatus.PROCESSING,
+                        BatchProductStatus.RETRYING,
+                        BatchProductStatus.FAILED,
+                    ]
+                )
+            )
+            .order_by(BatchProduct.created_at.asc())
+            .limit(50)
+            .all()
+        )
+        retry = RetryService(self.db)
+        healed = 0
+        batch_ids: set[UUID] = set()
+        for product in products:
+            if not retry.complete_unpublished_generated_work(product):
+                continue
+            healed += 1
+            batch_ids.add(product.batch_id)
+        if not healed:
+            return 0
+        self.db.commit()
+        for batch_id in batch_ids:
+            batch = self.db.get(ProcessingBatch, batch_id)
+            if batch is None:
+                continue
+            shop = self.db.get(Shop, batch.shop_id)
+            if shop is None:
+                continue
+            PrimaryBatchService(self.db, shop).refresh_batch_counters(batch)
+            if batch.status in {BatchStatus.COMPLETED, BatchStatus.PARTIALLY_COMPLETED}:
+                batch.processing_phase = ProcessingPhase.READY_TO_PUBLISH.value
+            self.db.commit()
+        return healed
+
     # --------------------------------------------------------------- submit
     def submit_ready_stages(self, *, worker_id: str) -> int:
         batches = (
@@ -621,8 +672,19 @@ class OpenAIBatchOrchestrator:
         for product in products:
             if product.status in {BatchProductStatus.FAILED, BatchProductStatus.SKIPPED, BatchProductStatus.COMPLETED}:
                 continue
+            if RetryService(self.db).complete_unpublished_generated_work(product):
+                continue
             for image in product.images:
                 if image.status in {BatchImageStatus.COMPLETED, BatchImageStatus.FAILED, BatchImageStatus.UPLOADING}:
+                    continue
+                version = find_generated_version_for_batch_image(self.db, image)
+                if version is not None and version.shopify_file_gid:
+                    complete_image_from_shopify_file(
+                        image,
+                        file_gid=version.shopify_file_gid,
+                        cdn_url=version.shopify_cdn_url,
+                        version_id=version.id,
+                    )
                     continue
                 target = self._next_stage_for_image(shop, product, image)
                 if target is None:
@@ -681,7 +743,11 @@ class OpenAIBatchOrchestrator:
                 product.claimed_at = product.claimed_at or now
                 product.started_at = product.started_at or now
 
-            attempt = max(image.attempt_count, 0) + 1
+            attempt = next_processing_attempt_number(
+                self.db,
+                image.id,
+                start_from=max(image.attempt_count, 0) + 1,
+            )
             if image.status in {BatchImageStatus.QUEUED, BatchImageStatus.RETRYING, BatchImageStatus.PROCESSING}:
                 # Move through allowed transitions toward WAITING_FOR_PROVIDER
                 if image.status == BatchImageStatus.QUEUED:
