@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     openai_image_model: str = "gpt-image-2"
     # GPT Image quality tier: low | medium | high | auto
     openai_image_quality: str = "medium"
+    openai_transparent_background: bool = True
+    openai_require_output_alpha: bool = True
     # Hard cap so a hung OpenAI call cannot block the worker forever.
     openai_image_timeout_seconds: float = 180.0
     # Phase 1: OPEN_AI (current). Phase 2: external_llm → LLM microservice (not implemented yet).
@@ -73,6 +75,8 @@ class Settings(BaseSettings):
     webhook_claim_limit: int = 20
     webhook_claim_scan_limit: int = 200
     webhook_max_attempts: int = 3
+    webhook_queue_warn_depth: int = 100
+    webhook_lag_warn_seconds: int = 60
 
     # Week 2 Auto Sync (server-side bounds; per-shop interval lives in DB)
     batch_interval_minutes_cap: int = 1440

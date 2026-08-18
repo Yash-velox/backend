@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -231,6 +231,81 @@ class WebhookIntakeService:
             event.processing_result.value,
         )
         return event
+
+    def queue_metrics(self) -> dict[str, Any]:
+        """Counts and lag for ops dashboards. Does not scan historical ACCEPTED rows."""
+        now = datetime.now(timezone.utc)
+        rows = (
+            self.db.query(
+                WebhookEvent.processing_result,
+                func.count(WebhookEvent.id),
+                func.min(WebhookEvent.received_at),
+                func.coalesce(func.sum(WebhookEvent.attempt_count), 0),
+            )
+            .filter(
+                WebhookEvent.processing_result.in_(
+                    [
+                        WebhookProcessingResult.QUEUED,
+                        WebhookProcessingResult.PROCESSING,
+                        WebhookProcessingResult.FAILED,
+                    ]
+                )
+            )
+            .group_by(WebhookEvent.processing_result)
+            .all()
+        )
+        counts = {"queued": 0, "processing": 0, "failed": 0}
+        oldest_queued: datetime | None = None
+        retry_attempts = 0
+        for result, count, oldest, attempts in rows:
+            key = result.value if isinstance(result, WebhookProcessingResult) else str(result)
+            lowered = key.lower()
+            if lowered in counts:
+                counts[lowered] = int(count or 0)
+            retry_attempts += int(attempts or 0)
+            if lowered == "queued" and oldest is not None:
+                oldest_queued = oldest
+
+        retrying = (
+            self.db.query(func.count(WebhookEvent.id))
+            .filter(
+                WebhookEvent.processing_result == WebhookProcessingResult.QUEUED,
+                WebhookEvent.attempt_count > 0,
+            )
+            .scalar()
+            or 0
+        )
+
+        lag_seconds = 0
+        if oldest_queued is not None:
+            received = oldest_queued
+            if received.tzinfo is None:
+                received = received.replace(tzinfo=timezone.utc)
+            lag_seconds = max(0, int((now - received).total_seconds()))
+
+        depth = counts["queued"] + counts["processing"]
+        alerts: list[str] = []
+        warn_depth = max(1, int(settings.webhook_queue_warn_depth))
+        warn_lag = max(1, int(settings.webhook_lag_warn_seconds))
+        if depth >= warn_depth:
+            alerts.append(f"webhook_backlog={depth} (warn>={warn_depth})")
+        if lag_seconds >= warn_lag and counts["queued"] > 0:
+            alerts.append(f"webhook_lag_seconds={lag_seconds} (warn>={warn_lag})")
+        if counts["failed"] > 0:
+            alerts.append(f"webhook_failed={counts['failed']}")
+
+        if alerts:
+            logger.warning("Webhook queue alert | %s", "; ".join(alerts))
+
+        return {
+            "queued": counts["queued"],
+            "processing": counts["processing"],
+            "failed": counts["failed"],
+            "retrying": int(retrying),
+            "retryAttempts": retry_attempts,
+            "oldestQueuedLagSeconds": lag_seconds,
+            "alerts": alerts,
+        }
 
     def record_and_process_products_update(
         self,

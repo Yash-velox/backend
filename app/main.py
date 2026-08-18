@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from app.api.batches_v2 import router as batches_router
 from app.api.image_versions import router as image_versions_router
@@ -19,10 +20,11 @@ from app.api.settings import router as settings_router
 from app.api.sync import router as sync_router
 from app.api.versions import router as versions_router
 from app.config import settings
-from app.core.deps import CurrentShop
+from app.core.deps import CurrentShop, DbSession
 from app.logging_setup import setup_logging
 from app.poc.auth import require_shopify_jwt
 from app.poc.router import router as poc_router
+from app.services.webhook_intake import WebhookIntakeService
 from app.workers.processing_worker import processing_worker
 from app.workers.publish_worker import publish_worker
 
@@ -99,11 +101,42 @@ async def unhandled_exception_handler(request: Request, exc: Exception):  # prag
 
 
 @app.get("/health")
-def health():
+@app.get("/health/live")
+@app.get("/api/health/live")
+def health_live():
+    """Liveness: process is up. No DB, no workers."""
     return {
         "status": "ok",
         "service": "image-enhancement-api",
         "env": settings.app_env,
+        "processingEnabled": settings.auto_processing_enabled,
+    }
+
+
+@app.get("/health/ready")
+@app.get("/api/health/ready")
+def health_ready(db: DbSession):
+    """Readiness: database is reachable. Webhook backlog is reported, not a 503."""
+    db.execute(text("SELECT 1"))
+    webhooks = WebhookIntakeService(db).queue_metrics()
+    return {
+        "status": "ok",
+        "db": "ok",
+        "service": "image-enhancement-api",
+        "env": settings.app_env,
+        "processingEnabled": settings.auto_processing_enabled,
+        "webhooks": webhooks,
+    }
+
+
+@app.get("/health/webhooks")
+@app.get("/api/health/webhooks")
+def health_webhooks(db: DbSession):
+    """Webhook queue depth, lag, and retry counts for alerts."""
+    metrics = WebhookIntakeService(db).queue_metrics()
+    return {
+        "status": "ok" if not metrics["alerts"] else "alert",
+        "webhooks": metrics,
     }
 
 

@@ -202,3 +202,55 @@ def test_unknown_shop_is_ignored_without_queueing_work(db_session):
     assert event.processing_result == WebhookProcessingResult.IGNORED
     assert event.payload_json is None
     assert event.error_summary == "Shop not found"
+
+
+def test_queue_metrics_reports_depth_lag_and_retries(db_session, shop, monkeypatch):
+    monkeypatch.setattr("app.config.settings.webhook_queue_warn_depth", 1)
+    monkeypatch.setattr("app.config.settings.webhook_lag_warn_seconds", 5)
+    svc = WebhookIntakeService(db_session)
+    queued = svc.enqueue_products_update(
+        shop.shop_domain, "wh-metrics-q", "products/update", _payload(11), "h-q"
+    )
+    queued.received_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+    queued.attempt_count = 2
+    failed = WebhookEvent(
+        shop_id=shop.id,
+        shopify_webhook_id="wh-metrics-f",
+        topic="products/update",
+        shopify_product_gid="gid://shopify/Product/12",
+        payload_json=_payload(12),
+        processing_result=WebhookProcessingResult.FAILED,
+        attempt_count=3,
+    )
+    db_session.add(failed)
+    db_session.commit()
+
+    metrics = svc.queue_metrics()
+    assert metrics["queued"] == 1
+    assert metrics["failed"] == 1
+    assert metrics["retrying"] == 1
+    assert metrics["retryAttempts"] >= 5
+    assert metrics["oldestQueuedLagSeconds"] >= 25
+    assert any("webhook_backlog" in item for item in metrics["alerts"])
+    assert any("webhook_lag_seconds" in item for item in metrics["alerts"])
+
+
+def test_health_live_ready_and_webhooks(client, shop, db_session):
+    live = client.get("/health")
+    assert live.status_code == 200
+    assert live.json()["status"] == "ok"
+    assert client.get("/health/live").status_code == 200
+    assert client.get("/api/health/live").status_code == 200
+
+    WebhookIntakeService(db_session).enqueue_products_update(
+        shop.shop_domain, "wh-health-q", "products/update", _payload(99), "h-health"
+    )
+    ready = client.get("/health/ready")
+    assert ready.status_code == 200
+    body = ready.json()
+    assert body["db"] == "ok"
+    assert body["webhooks"]["queued"] >= 1
+
+    hooks = client.get("/health/webhooks")
+    assert hooks.status_code == 200
+    assert "queued" in hooks.json()["webhooks"]
