@@ -291,6 +291,13 @@ class WebhookEvent(Base):
     __table_args__ = (
         UniqueConstraint("shopify_webhook_id", name="uq_webhook_events_shopify_id"),
         Index("ix_webhook_events_shop_topic", "shop_id", "topic"),
+        Index("ix_webhook_events_result_received", "processing_result", "received_at"),
+        Index(
+            "ix_webhook_events_shop_product_result",
+            "shop_id",
+            "shopify_product_gid",
+            "processing_result",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -301,12 +308,16 @@ class WebhookEvent(Base):
     topic: Mapped[str] = mapped_column(String(128), nullable=False)
     shopify_product_gid: Mapped[str | None] = mapped_column(String(128), nullable=True)
     payload_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    payload_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     processing_result: Mapped[WebhookProcessingResult] = mapped_column(
         Enum(WebhookProcessingResult, name="webhook_processing_result", native_enum=False),
         nullable=False,
-        default=WebhookProcessingResult.ACCEPTED,
+        default=WebhookProcessingResult.QUEUED,
     )
     error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

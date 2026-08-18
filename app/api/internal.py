@@ -174,7 +174,7 @@ async def products_update_webhook(request: Request, db: DbSession):
     shop_domain, topic, webhook_id, payload = _parse_webhook_payload(request, body, data)
     raw_hash = hashlib.sha256(body).hexdigest()
 
-    event = WebhookIntakeService(db).record_and_process_products_update(
+    event = WebhookIntakeService(db).enqueue_products_update(
         shop_domain,
         webhook_id,
         topic,
@@ -183,7 +183,7 @@ async def products_update_webhook(request: Request, db: DbSession):
     )
     return SuccessEnvelope(
         success=True,
-        message="Webhook processed.",
+        message="Webhook accepted.",
         requestId=_request_id(request),
         data={
             "webhookId": webhook_id,

@@ -139,6 +139,8 @@ class OpenAITempFileCleanupStatus(str, enum.Enum):
 
 
 class WebhookProcessingResult(str, enum.Enum):
+    QUEUED = "QUEUED"
+    PROCESSING = "PROCESSING"
     ACCEPTED = "ACCEPTED"
     DUPLICATE = "DUPLICATE"
     IGNORED = "IGNORED"

@@ -65,6 +65,15 @@ class Settings(BaseSettings):
     processing_worker_id: str = ""
     processing_output_directory: str = "storage/processed"
 
+    # products/update intake: enqueue immediately, process GraphQL/DB in the worker.
+    webhook_process_concurrency: int = 2
+    webhook_process_concurrency_per_shop: int = 1
+    webhook_poll_interval_seconds: float = 1.0
+    webhook_stale_lock_seconds: int = 120
+    webhook_claim_limit: int = 20
+    webhook_claim_scan_limit: int = 200
+    webhook_max_attempts: int = 3
+
     # Week 2 Auto Sync (server-side bounds; per-shop interval lives in DB)
     batch_interval_minutes_cap: int = 1440
     default_batch_interval_minutes: int = 15

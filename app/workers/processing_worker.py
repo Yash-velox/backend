@@ -33,6 +33,7 @@ class ProcessingWorker:
         self._task: asyncio.Task | None = None
         self._recover_task: asyncio.Task | None = None
         self._token_task: asyncio.Task | None = None
+        self._webhook_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
     async def start(self) -> None:
@@ -60,19 +61,25 @@ class ProcessingWorker:
             self._token_refresh_loop(),
             name=f"processing-token-refresh-{self.worker_id}",
         )
+        self._webhook_task = asyncio.create_task(
+            self._webhook_loop(),
+            name=f"processing-webhooks-{self.worker_id}",
+        )
         logger.info(
-            "Processing worker started | worker_id=%s auto=%s poll=%ss concurrency=%s stale=%ss token_check=%ss",
+            "Processing worker started | worker_id=%s auto=%s poll=%ss concurrency=%s stale=%ss token_check=%ss webhook_concurrency=%s webhook_poll=%ss",
             self.worker_id,
             settings.auto_processing_enabled,
             settings.processing_poll_interval_seconds,
             settings.processing_batch_concurrency,
             settings.processing_stale_lock_seconds,
             settings.shopify_token_refresh_check_seconds,
+            settings.webhook_process_concurrency,
+            settings.webhook_poll_interval_seconds,
         )
 
     async def stop(self) -> None:
         self._stop.set()
-        for task in (self._task, self._recover_task, self._token_task):
+        for task in (self._task, self._recover_task, self._token_task, self._webhook_task):
             if not task:
                 continue
             try:
@@ -86,6 +93,7 @@ class ProcessingWorker:
         self._task = None
         self._recover_task = None
         self._token_task = None
+        self._webhook_task = None
         logger.info("Processing worker stopped | worker_id=%s", self.worker_id)
 
     async def _recover_loop(self) -> None:
@@ -124,6 +132,56 @@ class ProcessingWorker:
                 await asyncio.to_thread(self._refresh_due_tokens)
             except Exception:
                 logger.exception("Shopify token refresh loop error | worker_id=%s", self.worker_id)
+
+    async def _webhook_loop(self) -> None:
+        """Drain queued products/update events without blocking OpenAI processing."""
+        while not self._stop.is_set():
+            try:
+                claimed = await asyncio.to_thread(self._claim_webhooks)
+                if claimed:
+                    sem = asyncio.Semaphore(max(1, int(settings.webhook_process_concurrency)))
+
+                    async def _one(event_id: UUID) -> None:
+                        async with sem:
+                            await asyncio.to_thread(self._process_webhook, event_id)
+
+                    await asyncio.gather(*[_one(event_id) for event_id in claimed], return_exceptions=True)
+            except Exception:
+                logger.exception("Webhook loop error | worker_id=%s", self.worker_id)
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(),
+                    timeout=max(0.5, float(settings.webhook_poll_interval_seconds)),
+                )
+            except asyncio.TimeoutError:
+                continue
+
+    def _claim_webhooks(self) -> list[UUID]:
+        from app.services.webhook_intake import WebhookIntakeService
+
+        db = SessionLocal()
+        try:
+            return WebhookIntakeService(db).claim_queued(worker_id=self.worker_id)
+        finally:
+            db.close()
+
+    def _process_webhook(self, event_id: UUID) -> None:
+        from app.services.webhook_intake import WebhookIntakeService
+
+        db = SessionLocal()
+        try:
+            event = WebhookIntakeService(db).process_event(event_id)
+            logger.info(
+                "Webhook processed | webhook_id=%s product=%s result=%s worker=%s",
+                event.shopify_webhook_id,
+                event.shopify_product_gid,
+                event.processing_result.value,
+                self.worker_id,
+            )
+        except Exception:
+            logger.exception("Webhook event processing failed | event_id=%s worker=%s", event_id, self.worker_id)
+        finally:
+            db.close()
 
     def _refresh_due_tokens(self) -> None:
         from app.services.shopify_token_refresh import refresh_due_shop_tokens

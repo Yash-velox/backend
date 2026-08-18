@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import UUID
 
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from app.config import settings
 from app.core.shop_resolver import create_shopify_graphql_client, get_shop_by_domain
-from app.models import Product, WebhookEvent, WebhookProcessingResult
+from app.models import Product, Shop, WebhookEvent, WebhookProcessingResult
 from app.services.catalog_sync import CatalogSyncService
 from app.services.primary_batch import PrimaryBatchService
 from app.services.secondary_queue import SecondaryQueueService
@@ -163,6 +169,69 @@ class WebhookIntakeService:
     def __init__(self, db: Session) -> None:
         self.db = db
 
+    def enqueue_products_update(
+        self,
+        shop_domain: str,
+        webhook_id: str,
+        topic: str,
+        payload: dict[str, Any],
+        raw_hash: str,
+    ) -> WebhookEvent:
+        """Persist and dedupe the webhook, then return. No Shopify/GraphQL work."""
+        existing = self._get_by_webhook_id(webhook_id)
+        if existing:
+            logger.info("Duplicate webhook ignored | webhook_id=%s shop=%s", webhook_id, shop_domain)
+            return existing
+
+        shop = get_shop_by_domain(self.db, shop_domain)
+        product_gid = product_gid_from_webhook_payload(payload)
+        result = WebhookProcessingResult.QUEUED
+        error_summary = None
+        stored_payload: dict[str, Any] | None = payload if isinstance(payload, dict) else None
+
+        if shop is None:
+            result = WebhookProcessingResult.IGNORED
+            error_summary = "Shop not found"
+            stored_payload = None
+        elif not product_gid or not _GID_PRODUCT_RE.match(product_gid):
+            result = WebhookProcessingResult.FAILED
+            error_summary = "Missing or invalid product GID in webhook payload"
+            stored_payload = None
+
+        event = WebhookEvent(
+            shop_id=shop.id if shop else None,
+            shopify_webhook_id=webhook_id,
+            topic=topic,
+            shopify_product_gid=product_gid,
+            payload_hash=raw_hash,
+            payload_json=stored_payload,
+            processing_result=result,
+            error_summary=error_summary,
+        )
+        self.db.add(event)
+        try:
+            self.db.commit()
+        except IntegrityError:
+            self.db.rollback()
+            duplicate = self._get_by_webhook_id(webhook_id)
+            if duplicate:
+                logger.info(
+                    "Duplicate webhook ignored after constraint | webhook_id=%s shop=%s",
+                    webhook_id,
+                    shop_domain,
+                )
+                return duplicate
+            raise
+        self.db.refresh(event)
+        logger.info(
+            "Webhook enqueued | webhook_id=%s shop=%s product=%s result=%s",
+            webhook_id,
+            shop_domain,
+            product_gid,
+            event.processing_result.value,
+        )
+        return event
+
     def record_and_process_products_update(
         self,
         shop_domain: str,
@@ -171,79 +240,227 @@ class WebhookIntakeService:
         payload: dict[str, Any],
         raw_hash: str,
     ) -> WebhookEvent:
-        existing = (
+        """Enqueue then process inline. Tests and one-off scripts use this path."""
+        event = self.enqueue_products_update(shop_domain, webhook_id, topic, payload, raw_hash)
+        if event.processing_result != WebhookProcessingResult.QUEUED:
+            return event
+        return self.process_event(event.id)
+
+    def recover_stale_processing(self, *, worker_id: str) -> int:
+        stale_seconds = max(30, int(settings.webhook_stale_lock_seconds))
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
+        rows = (
             self.db.query(WebhookEvent)
-            .filter(WebhookEvent.shopify_webhook_id == webhook_id)
-            .one_or_none()
+            .filter(
+                WebhookEvent.processing_result == WebhookProcessingResult.PROCESSING,
+                WebhookEvent.claimed_at.is_not(None),
+                WebhookEvent.claimed_at < cutoff,
+            )
+            .all()
         )
-        if existing:
-            logger.info("Duplicate webhook ignored | webhook_id=%s shop=%s", webhook_id, shop_domain)
-            return existing
+        for event in rows:
+            event.processing_result = WebhookProcessingResult.QUEUED
+            event.claimed_by = None
+            event.claimed_at = None
+            event.error_summary = f"Stale PROCESSING lock recovered by {worker_id}"
+            logger.warning(
+                "Stale webhook lock recovered | webhook_id=%s product=%s worker=%s",
+                event.shopify_webhook_id,
+                event.shopify_product_gid,
+                worker_id,
+            )
+        if rows:
+            self.db.commit()
+        return len(rows)
 
-        shop = get_shop_by_domain(self.db, shop_domain)
-        product_gid = product_gid_from_webhook_payload(payload)
+    def claim_queued(self, *, worker_id: str) -> list[UUID]:
+        """Claim a bounded set of QUEUED product updates. Remaining rows wait in the table."""
+        self.recover_stale_processing(worker_id=worker_id)
 
-        event = WebhookEvent(
-            shop_id=shop.id if shop else None,
-            shopify_webhook_id=webhook_id,
-            topic=topic,
-            shopify_product_gid=product_gid,
-            payload_hash=raw_hash,
-            processing_result=WebhookProcessingResult.ACCEPTED,
+        global_cap = max(1, int(settings.webhook_process_concurrency))
+        per_shop_cap = max(1, int(settings.webhook_process_concurrency_per_shop))
+        claim_limit = max(1, int(settings.webhook_claim_limit))
+        scan_limit = max(claim_limit, int(settings.webhook_claim_scan_limit))
+
+        processing_rows = (
+            self.db.query(WebhookEvent)
+            .filter(WebhookEvent.processing_result == WebhookProcessingResult.PROCESSING)
+            .all()
         )
-        self.db.add(event)
+        processing_by_shop: dict[UUID, int] = defaultdict(int)
+        busy_products: set[tuple[UUID | None, str | None]] = set()
+        for row in processing_rows:
+            if row.shop_id is not None:
+                processing_by_shop[row.shop_id] += 1
+            busy_products.add((row.shop_id, row.shopify_product_gid))
 
+        slots = max(0, min(claim_limit, global_cap - len(processing_rows)))
+        if slots <= 0:
+            return []
+
+        dialect = self.db.bind.dialect.name if self.db.bind is not None else ""
+        stmt = (
+            select(WebhookEvent)
+            .where(WebhookEvent.processing_result == WebhookProcessingResult.QUEUED)
+            .order_by(WebhookEvent.received_at.asc())
+            .limit(scan_limit)
+        )
+        if dialect == "postgresql":
+            stmt = stmt.with_for_update(skip_locked=True)
+        else:
+            stmt = stmt.with_for_update()
+
+        queued = list(self.db.execute(stmt).scalars().all())
+        if not queued:
+            return []
+
+        groups: dict[tuple[UUID | None, str | None], list[WebhookEvent]] = {}
+        group_order: list[tuple[UUID | None, str | None]] = []
+        for event in queued:
+            key = (event.shop_id, event.shopify_product_gid)
+            if key not in groups:
+                groups[key] = []
+                group_order.append(key)
+            groups[key].append(event)
+
+        now = datetime.now(timezone.utc)
+        claimed_ids: list[UUID] = []
+        superseded = 0
+        for key in group_order:
+            if len(claimed_ids) >= slots:
+                break
+            shop_id, _product_gid = key
+            if shop_id is not None and processing_by_shop[shop_id] >= per_shop_cap:
+                continue
+            if key in busy_products:
+                continue
+            group = groups[key]
+            newest = max(group, key=lambda row: (row.received_at or now, str(row.id)))
+            for older in group:
+                if older.id == newest.id:
+                    continue
+                older.processing_result = WebhookProcessingResult.IGNORED
+                older.error_summary = f"Superseded by later webhook {newest.shopify_webhook_id}"
+                older.claimed_by = None
+                older.claimed_at = None
+                superseded += 1
+            newest.processing_result = WebhookProcessingResult.PROCESSING
+            newest.claimed_by = worker_id
+            newest.claimed_at = now
+            newest.attempt_count = int(newest.attempt_count or 0) + 1
+            newest.error_summary = None
+            claimed_ids.append(newest.id)
+            busy_products.add(key)
+            if shop_id is not None:
+                processing_by_shop[shop_id] += 1
+
+        if claimed_ids or superseded:
+            self.db.commit()
+            logger.info(
+                "Webhook claim finished | claimed=%s superseded=%s worker=%s in_flight=%s",
+                len(claimed_ids),
+                superseded,
+                worker_id,
+                len(processing_rows) + len(claimed_ids),
+            )
+        return claimed_ids
+
+    def process_event(self, event_id: UUID) -> WebhookEvent:
+        event = self.db.get(WebhookEvent, event_id)
+        if event is None:
+            raise ValueError(f"Webhook event not found: {event_id}")
+        if event.processing_result in {
+            WebhookProcessingResult.ACCEPTED,
+            WebhookProcessingResult.DUPLICATE,
+            WebhookProcessingResult.IGNORED,
+        }:
+            return event
+
+        payload = event.payload_json if isinstance(event.payload_json, dict) else None
+        if payload is None:
+            return self._finish_event(
+                event,
+                WebhookProcessingResult.FAILED,
+                "Missing webhook payload for async processing",
+            )
+
+        shop = self.db.get(Shop, event.shop_id) if event.shop_id else None
+        product_gid = event.shopify_product_gid
         if shop is None:
-            event.processing_result = WebhookProcessingResult.IGNORED
-            event.error_summary = "Shop not found"
-            self.db.commit()
-            self.db.refresh(event)
-            return event
-
+            return self._finish_event(event, WebhookProcessingResult.IGNORED, "Shop not found")
         if not product_gid or not _GID_PRODUCT_RE.match(product_gid):
-            event.processing_result = WebhookProcessingResult.FAILED
-            event.error_summary = "Missing or invalid product GID in webhook payload"
-            self.db.commit()
-            self.db.refresh(event)
-            return event
+            return self._finish_event(
+                event,
+                WebhookProcessingResult.FAILED,
+                "Missing or invalid product GID in webhook payload",
+            )
 
         try:
-            self._process_product_update(shop, product_gid, payload, webhook_id, event)
+            self._process_product_update(shop, product_gid, payload, event.shopify_webhook_id, event)
         except Exception as exc:
             logger.exception(
                 "Webhook processing failed | shop=%s webhook=%s product=%s",
                 shop.shop_domain,
-                webhook_id,
+                event.shopify_webhook_id,
                 product_gid,
             )
-            # Catalog/image-version flushes can leave the session aborted; reset before
-            # persisting the FAILED webhook row so Shopify does not keep retrying a 500.
             self.db.rollback()
-            event = WebhookEvent(
-                shop_id=shop.id,
-                shopify_webhook_id=webhook_id,
-                topic=topic,
-                shopify_product_gid=product_gid,
-                payload_hash=raw_hash,
-                processing_result=WebhookProcessingResult.FAILED,
-                error_summary=str(exc)[:2000],
-            )
-            self.db.add(event)
-            try:
-                self.db.commit()
-                self.db.refresh(event)
-            except Exception:
-                self.db.rollback()
-                logger.exception(
-                    "Failed to persist webhook failure row | shop=%s webhook=%s",
-                    shop.shop_domain,
-                    webhook_id,
-                )
-            return event
+            event = self.db.get(WebhookEvent, event_id)
+            if event is None:
+                raise
+            return self._finish_failed_or_retry(event, str(exc)[:2000])
 
+        if event.processing_result == WebhookProcessingResult.FAILED:
+            return self._finish_failed_or_retry(event, event.error_summary or "Webhook processing failed")
+
+        event.processing_result = WebhookProcessingResult.ACCEPTED
+        event.error_summary = None
+        event.claimed_by = None
+        event.claimed_at = None
         self.db.commit()
         self.db.refresh(event)
         return event
+
+    def _get_by_webhook_id(self, webhook_id: str) -> WebhookEvent | None:
+        return (
+            self.db.query(WebhookEvent)
+            .filter(WebhookEvent.shopify_webhook_id == webhook_id)
+            .one_or_none()
+        )
+
+    def _finish_event(
+        self,
+        event: WebhookEvent,
+        result: WebhookProcessingResult,
+        error_summary: str | None,
+    ) -> WebhookEvent:
+        event.processing_result = result
+        event.error_summary = error_summary
+        event.claimed_by = None
+        event.claimed_at = None
+        self.db.commit()
+        self.db.refresh(event)
+        return event
+
+    def _finish_failed_or_retry(self, event: WebhookEvent, error_summary: str) -> WebhookEvent:
+        max_attempts = max(1, int(settings.webhook_max_attempts))
+        # Inline record_and_process leaves attempt_count at 0; fail immediately.
+        # Worker claims increment attempt_count, so those may requeue until the cap.
+        if 0 < int(event.attempt_count or 0) < max_attempts:
+            event.processing_result = WebhookProcessingResult.QUEUED
+            event.claimed_by = None
+            event.claimed_at = None
+            event.error_summary = error_summary
+            self.db.commit()
+            self.db.refresh(event)
+            logger.warning(
+                "Webhook requeued after failure | webhook_id=%s attempt=%s/%s",
+                event.shopify_webhook_id,
+                event.attempt_count,
+                max_attempts,
+            )
+            return event
+        return self._finish_event(event, WebhookProcessingResult.FAILED, error_summary)
 
     def _process_product_update(
         self,
