@@ -734,7 +734,9 @@ def test_secondary_queue_skips_during_active_rollback(db_session, shop):
     assert result is None
 
 
-def test_secondary_queue_enqueues_after_rollback_completed(db_session, shop):
+def test_secondary_queue_skips_rollback_echo_after_completed(db_session, shop):
+    from datetime import datetime, timezone
+
     from app.core.shop_resolver import ensure_shop_settings
     from app.services.secondary_queue import SecondaryQueueService
 
@@ -750,6 +752,65 @@ def test_secondary_queue_enqueues_after_rollback_completed(db_session, shop):
             status=RollbackStatus.ROLLED_BACK,
             idempotency_key=f"rb-done-{product.id}",
             current_stage="ROLLED_BACK",
+            completed_at=datetime.now(timezone.utc),
+            pre_rollback_snapshot_json={
+                "media": [_media("gid://shopify/MediaImage/999", 0, alt="front", featured=True)]
+            },
+        )
+    )
+    db_session.commit()
+
+    svc = SecondaryQueueService(db_session, shop)
+    restored = svc.upsert_from_webhook(
+        product_gid=product.shopify_product_gid,
+        product_snapshot={
+            "product_gid": product.shopify_product_gid,
+            "title": "Ring",
+            "status": "ACTIVE",
+        },
+        media_snapshot=[_media("gid://shopify/MediaImage/10", 0)],
+        webhook_id="wh-after-rollback-restored",
+    )
+    assert restored is None
+
+    mixed = svc.upsert_from_webhook(
+        product_gid=product.shopify_product_gid,
+        product_snapshot={
+            "product_gid": product.shopify_product_gid,
+            "title": "Ring",
+            "status": "ACTIVE",
+        },
+        media_snapshot=[
+            _media("gid://shopify/MediaImage/10", 0),
+            _media("gid://shopify/MediaImage/999", 1),
+        ],
+        webhook_id="wh-after-rollback-mixed",
+    )
+    assert mixed is None
+
+
+def test_secondary_queue_enqueues_new_image_after_rollback(db_session, shop):
+    from datetime import datetime, timezone
+
+    from app.core.shop_resolver import ensure_shop_settings
+    from app.services.secondary_queue import SecondaryQueueService
+
+    ensure_shop_settings(db_session, shop)
+    product, original, published = _seed_product_with_versions(db_session, shop)
+    db_session.add(
+        ProductRollbackOperation(
+            shop_id=shop.id,
+            product_id=product.id,
+            shopify_product_gid=product.shopify_product_gid,
+            from_version_id=published.id,
+            target_version_id=original.id,
+            status=RollbackStatus.ROLLED_BACK,
+            idempotency_key=f"rb-done-new-{product.id}",
+            current_stage="ROLLED_BACK",
+            completed_at=datetime.now(timezone.utc),
+            pre_rollback_snapshot_json={
+                "media": [_media("gid://shopify/MediaImage/999", 0, alt="front", featured=True)]
+            },
         )
     )
     db_session.commit()
@@ -761,8 +822,8 @@ def test_secondary_queue_enqueues_after_rollback_completed(db_session, shop):
             "title": "Ring",
             "status": "ACTIVE",
         },
-        media_snapshot=[_media("gid://shopify/MediaImage/10", 0)],
-        webhook_id="wh-after-rollback",
+        media_snapshot=[_media("gid://shopify/MediaImage/11", 0, alt="side")],
+        webhook_id="wh-after-rollback-real-edit",
     )
     assert result is not None
 

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -9,7 +10,9 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import (
+    ProcessingBaseline,
     Product,
+    ProductMediaVersion,
     ProductPublishOperation,
     ProductRollbackOperation,
     PublishStatus,
@@ -18,6 +21,7 @@ from app.models import (
     SecondaryQueueStatus,
     Shop,
 )
+from app.services.delta import cdn_path_identity
 from app.services.prompt_resolver import PromptResolverError, assert_product_prompts_ready
 from app.services.state_machine import SECONDARY_TRANSITIONS, assert_transition
 
@@ -25,6 +29,23 @@ logger = logging.getLogger("app.services.secondary_queue")
 
 _ACTIVE_PUBLISH_STATUSES = (PublishStatus.QUEUED, PublishStatus.PUBLISHING)
 _ACTIVE_ROLLBACK_STATUSES = (RollbackStatus.QUEUED, RollbackStatus.ROLLING_BACK)
+# Shopify often delivers products/update after rollback status is already ROLLED_BACK.
+_ROLLBACK_ECHO_WINDOW = timedelta(minutes=15)
+
+
+def _media_identity_keys(media_rows: list[Any] | None) -> set[str]:
+    keys: set[str] = set()
+    for row in media_rows or []:
+        if not isinstance(row, dict):
+            continue
+        for field in ("media_gid", "file_gid", "shopify_media_gid", "shopify_file_gid"):
+            value = row.get(field)
+            if value:
+                keys.add(str(value))
+        path = cdn_path_identity(row.get("cdn_url"))
+        if path:
+            keys.add(path)
+    return keys
 
 
 class SecondaryQueueService:
@@ -104,6 +125,86 @@ class SecondaryQueueService:
         )
         return row is not None
 
+    def _recent_completed_rollback(self, product_gid: str) -> ProductRollbackOperation | None:
+        cutoff = datetime.now(timezone.utc) - _ROLLBACK_ECHO_WINDOW
+        return (
+            self.db.query(ProductRollbackOperation)
+            .filter(
+                ProductRollbackOperation.shop_id == self.shop.id,
+                ProductRollbackOperation.shopify_product_gid == product_gid,
+                ProductRollbackOperation.status == RollbackStatus.ROLLED_BACK,
+                ProductRollbackOperation.completed_at.isnot(None),
+                ProductRollbackOperation.completed_at >= cutoff,
+            )
+            .order_by(ProductRollbackOperation.completed_at.desc())
+            .first()
+        )
+
+    def _is_rollback_webhook_echo(self, product_gid: str, media_snapshot: list[dict]) -> bool:
+        """True when this webhook is Shopify catching up after our own Revert.
+
+        Late products/update can arrive after status is ROLLED_BACK, sometimes still
+        showing a mix of pre-revert and restored media. Those must not enter the
+        Secondary Queue. A media row whose GID/CDN is not in the revert set is treated
+        as a real merchant edit and still enqueues.
+        """
+        op = self._recent_completed_rollback(product_gid)
+        if op is None:
+            return False
+
+        known = set()
+        pre = op.pre_rollback_snapshot_json if isinstance(op.pre_rollback_snapshot_json, dict) else {}
+        known |= _media_identity_keys(pre.get("media") if isinstance(pre.get("media"), list) else None)
+
+        target = (
+            self.db.query(ProductMediaVersion)
+            .filter(
+                ProductMediaVersion.id == op.target_version_id,
+                ProductMediaVersion.shop_id == self.shop.id,
+            )
+            .one_or_none()
+        )
+        if target and isinstance(target.items_json, dict):
+            known |= _media_identity_keys(
+                target.items_json.get("media") if isinstance(target.items_json.get("media"), list) else None
+            )
+
+        product = (
+            self.db.query(Product)
+            .filter(
+                Product.shop_id == self.shop.id,
+                Product.shopify_product_gid == product_gid,
+            )
+            .one_or_none()
+        )
+        if product is not None:
+            baseline = (
+                self.db.query(ProcessingBaseline)
+                .filter(
+                    ProcessingBaseline.shop_id == self.shop.id,
+                    ProcessingBaseline.product_id == product.id,
+                )
+                .one_or_none()
+            )
+            if baseline is not None:
+                known |= _media_identity_keys(
+                    baseline.media_snapshot_json if isinstance(baseline.media_snapshot_json, list) else None
+                )
+
+        if not media_snapshot:
+            return True
+        if not known:
+            return True
+        for row in media_snapshot:
+            if not isinstance(row, dict):
+                continue
+            row_keys = _media_identity_keys([row])
+            if not row_keys:
+                continue
+            if row_keys.isdisjoint(known):
+                return False
+        return True
+
     def upsert_from_webhook(
         self,
         product_gid: str,
@@ -143,6 +244,15 @@ class SecondaryQueueService:
         if self._has_active_rollback(product_gid):
             logger.info(
                 "Secondary queue skip during active rollback | shop=%s product=%s webhook=%s",
+                self.shop.id,
+                product_gid,
+                webhook_id,
+            )
+            return None
+
+        if self._is_rollback_webhook_echo(product_gid, media_snapshot):
+            logger.info(
+                "Secondary queue skip rollback echo | shop=%s product=%s webhook=%s",
                 self.shop.id,
                 product_gid,
                 webhook_id,
