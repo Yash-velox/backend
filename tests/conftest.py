@@ -17,8 +17,8 @@ from app.core.crypto import encrypt_token
 from app.models import Shop
 from app.poc.auth import require_shopify_jwt
 
-# Existing upload tests use opaque 1x1 PNGs. Cut-out is covered in dedicated tests.
-settings.rembg_enabled = False
+# Existing upload tests use opaque 1x1 PNGs. Alpha rejection is covered in dedicated tests.
+settings.openai_require_output_alpha = False
 
 
 @pytest.fixture()
@@ -27,7 +27,7 @@ def db_engine():
     settings.ai_execution_mode = "SYNC"
     settings.openai_batch_enabled = False
     settings.openai_allow_sync_fallback = True
-    settings.rembg_enabled = False
+    settings.openai_require_output_alpha = False
 
     engine = create_engine(
         "sqlite+pysqlite://",

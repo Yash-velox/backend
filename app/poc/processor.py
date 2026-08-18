@@ -4,6 +4,7 @@ import logging
 import time
 from pathlib import Path
 
+from app.config import settings
 from app.poc.job_store import JobRecord, StepRecord, poc_job_store
 from app.poc.openai_client import OpenAIImageClient, OpenAIImageError
 from app.poc.schemas import JobStatus, StepStatus
@@ -83,6 +84,7 @@ def _run_step(
             prompt=step.prompt,
             job_id=job.job_id,
             step=step.step,
+            transparent_background=settings.openai_transparent_background,
         )
         if not output:
             raise OpenAIImageError("OpenAI returned empty image output")

@@ -961,7 +961,7 @@ class OpenAIBatchOrchestrator:
                 prompt=prompt,
                 image_url=image_url,
                 file_id=file_id,
-                transparent_background=False,
+                transparent_background=settings.openai_transparent_background,
             )
         else:
             body = build_description_body(

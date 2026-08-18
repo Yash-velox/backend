@@ -29,7 +29,8 @@ class Settings(BaseSettings):
     poc_storage_dir: str = "storage/poc-jobs"
     poc_job_ttl_hours: int = 24
     openai_api_key: str = ""
-    openai_image_model: str = "gpt-image-2"
+    # gpt-image-1.5 supports background=transparent. gpt-image-2 rejects it.
+    openai_image_model: str = "gpt-image-1.5"
     # GPT Image quality tier: low | medium | high | auto
     openai_image_quality: str = "medium"
     openai_transparent_background: bool = True
@@ -118,12 +119,6 @@ class Settings(BaseSettings):
     image_storage_warn_total_versions: int = 5000
     image_storage_warn_avg_generated_mb: float = 8.0
     image_storage_warn_versions_per_product: int = 50
-
-    # Local rembg cut-out after OpenAI (not an extra OpenAI Batch step).
-    # u2netp is the small model (~4 MB) so UAT's ~1 GB box can load it.
-    rembg_enabled: bool = True
-    rembg_model: str = "u2netp"
-    rembg_require_alpha: bool = True
 
     @property
     def cors_origin_list(self) -> list[str]:

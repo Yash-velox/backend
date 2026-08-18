@@ -26,8 +26,8 @@ from app.models import (
     Shop,
 )
 from app.poc.openai_client import OpenAIImageClient, OpenAIImageError
-from app.services.background_cutout import CutoutError, apply_background_cutout
 from app.services.image_versions import ImageVersionsService, build_generated_filename
+from app.services.openai_image_compat import supports_transparent_background
 from app.services.output_storage import OutputStorage, checksum_sha256, get_output_storage
 from app.services.primary_batch import PrimaryBatchService
 from app.services.prompt_resolver import PromptResolver, PromptResolverError
@@ -388,32 +388,19 @@ class ImageProcessor:
             return False
 
     def _prepare_output_png(self, image: BatchImage, path: Path) -> dict:
-        """Apply rembg cut-out (if enabled), then validate the PNG for Shopify."""
-        cutout_meta: dict = {"applied": False, "model": None, "skippedReason": None}
-        if settings.rembg_enabled:
-            original = path.read_bytes()
-            try:
-                result = apply_background_cutout(original)
-            except CutoutError as exc:
-                raise ProcessingError(str(exc), code=exc.code, retryable=exc.retryable) from exc
-            if result.applied:
-                path.write_bytes(result.png_bytes)
-                image.output_checksum = checksum_sha256(result.png_bytes)
-                cutout_meta = {
-                    "applied": True,
-                    "model": settings.rembg_model,
-                    "skippedReason": None,
-                }
-            else:
-                cutout_meta["skippedReason"] = result.skipped_reason
+        """Validate the generated PNG before Shopify upload."""
         meta = validate_generated_png_for_shopify(path)
-        if settings.rembg_enabled and settings.rembg_require_alpha and not meta.get("has_alpha"):
+        require_alpha = (
+            settings.openai_require_output_alpha
+            and settings.openai_transparent_background
+            and supports_transparent_background(settings.openai_image_model)
+        )
+        if require_alpha and not meta.get("has_alpha"):
             raise ProcessingError(
-                "Cut-out did not produce a transparent PNG",
-                code="CUTOUT_NO_ALPHA",
+                "Generated image is not a transparent PNG",
+                code="OUTPUT_NO_ALPHA",
                 retryable=False,
             )
-        meta["cutout"] = cutout_meta
         return meta
 
     def _upload_generated_output(
@@ -503,7 +490,8 @@ class ImageProcessor:
             metadata_json={
                 "validation_warnings": meta.get("warnings") or [],
                 "has_alpha": bool(meta.get("has_alpha")),
-                "cutout": meta.get("cutout") or {},
+                "model": settings.openai_image_model,
+                "transparentBackground": bool(settings.openai_transparent_background),
             },
         )
 
@@ -759,7 +747,7 @@ class ImageProcessor:
                     prompt=step.rendered_prompt,
                     job_id=str(image.id),
                     step=index,
-                    transparent_background=False,
+                    transparent_background=settings.openai_transparent_background,
                 )
                 if not current:
                     raise ProcessingError("AI provider returned empty output", code="EMPTY_OUTPUT", retryable=True)

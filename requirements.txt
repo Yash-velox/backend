@@ -12,6 +12,3 @@ psycopg[binary]>=3.2.0
 pytest>=8.3.0
 pytest-asyncio>=0.24.0
 cryptography>=43.0.0
-# Local background cut-out after OpenAI (CPU). Model files download on first use.
-rembg>=2.0.57
-onnxruntime>=1.17.0

@@ -59,8 +59,8 @@ class OpenAIImageClient:
         )
         started = time.perf_counter()
         try:
-            # Opaque PNG by default. Only set background=transparent when explicitly
-            # requested and the model supports it (gpt-image-2 rejects that flag).
+            # background=transparent when requested and the model supports it
+            # (gpt-image-1.5 yes; gpt-image-2 rejects the flag).
             edit_kwargs: dict = {
                 "model": model,
                 "image": ("input.png", image_bytes, "image/png"),

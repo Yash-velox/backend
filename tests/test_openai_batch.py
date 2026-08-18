@@ -76,6 +76,17 @@ def test_image_edit_body_sets_transparent_when_supported():
     assert body.get("background") == "transparent"
 
 
+def test_image_edit_body_sets_transparent_for_gpt_image_1_5():
+    body = build_image_edit_body(
+        model="gpt-image-1.5",
+        prompt="enhance",
+        image_url="https://cdn.shopify.com/x.png",
+        transparent_background=True,
+    )
+    assert body.get("background") == "transparent"
+    assert body["model"] == "gpt-image-1.5"
+
+
 def test_image_edit_body_honors_transparent_false():
     body = build_image_edit_body(
         model="gpt-image-1",
