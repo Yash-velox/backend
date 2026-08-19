@@ -152,7 +152,41 @@ class PrimaryBatchService:
         baseline.media_snapshot_json = media_snapshot
         baseline.evaluated_at = datetime.now(timezone.utc)
 
-    def _load_or_refresh_product(self, product_gid: str) -> Product | None:
+    def _refresh_product_from_shopify(self, product_gid: str) -> Product | None:
+        """Fetch the latest product and media from Shopify and upsert into the catalog."""
+        try:
+            client = create_shopify_graphql_client(self.db, self.shop)
+            node = client.fetch_product_by_gid(product_gid)
+            if not node:
+                return None
+            return self.catalog_sync.upsert_product_from_shopify_node(node)
+        except ShopifyGraphQLError as exc:
+            logger.error(
+                "Product refresh failed | shop=%s gid=%s error=%s",
+                self.shop.id,
+                product_gid,
+                exc,
+            )
+            return None
+
+    def refresh_catalog_product(self, product_id: UUID) -> Product | None:
+        product = (
+            self.db.query(Product)
+            .filter(Product.id == product_id, Product.shop_id == self.shop.id)
+            .one_or_none()
+        )
+        if product is None:
+            return None
+        refreshed = self._refresh_product_from_shopify(product.shopify_product_gid)
+        return refreshed or product
+
+    def _load_or_refresh_product(
+        self, product_gid: str, *, force_refresh: bool = False
+    ) -> Product | None:
+        if force_refresh:
+            refreshed = self._refresh_product_from_shopify(product_gid)
+            if refreshed is not None:
+                return refreshed
         product = (
             self.db.query(Product)
             .options(selectinload(Product.media))
@@ -164,15 +198,7 @@ class PrimaryBatchService:
         )
         if product is not None:
             return product
-        try:
-            client = create_shopify_graphql_client(self.db, self.shop)
-            node = client.fetch_product_by_gid(product_gid)
-            if not node:
-                return None
-            return self.catalog_sync.upsert_product_from_shopify_node(node)
-        except ShopifyGraphQLError as exc:
-            logger.error("Product refresh failed | shop=%s gid=%s error=%s", self.shop.id, product_gid, exc)
-            return None
+        return self._refresh_product_from_shopify(product_gid)
 
     def _require_prompts_ready(
         self,
@@ -298,7 +324,7 @@ class PrimaryBatchService:
 
         Returns the batch and any warnings (e.g. selected media no longer on the product).
         """
-        product = self._load_or_refresh_product(product_gid)
+        product = self._load_or_refresh_product(product_gid, force_refresh=True)
         if product is None:
             raise PrimaryBatchError(f"Product not found: {product_gid}")
         self._require_prompts_ready(product)
@@ -314,8 +340,6 @@ class PrimaryBatchService:
             raise PrimaryBatchError("Select at least one live image to reprocess.")
 
         visible = [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
-        if not visible:
-            raise PrimaryBatchError(f"Product has no visible media: {product_gid}")
         by_media = {m.shopify_media_gid: m for m in visible}
         by_file = {m.shopify_file_gid: m for m in visible if m.shopify_file_gid}
         selected = []
@@ -330,7 +354,8 @@ class PrimaryBatchService:
         if missing:
             if not selected:
                 raise PrimaryBatchError(
-                    "None of the selected images are on the live product."
+                    "None of the selected images are on the live product. "
+                    "Refresh the page and pick images currently attached in Shopify."
                 )
             skipped = len(missing)
             warnings.append(

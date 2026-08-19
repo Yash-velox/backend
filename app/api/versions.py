@@ -12,6 +12,7 @@ from app.core.deps import CurrentShop, DbSession
 from app.models import ProductMediaVersion, ProductRollbackOperation
 from app.schemas.week2 import ReprocessPromptStepIn, SuccessEnvelope
 from app.services.media_versions import MediaVersionError, MediaVersionsService
+from app.services.primary_batch import PrimaryBatchService
 from app.services.product_rollback import RollbackError, ProductRollbackService
 from app.services.reprocess_service import ReprocessError, ReprocessService
 
@@ -183,6 +184,7 @@ def search_products_with_versions(
 @router.get("/api/products/{product_id}/media-versions")
 def list_media_versions(product_id: UUID, request: Request, db: DbSession, shop: CurrentShop):
     try:
+        PrimaryBatchService(db, shop).refresh_catalog_product(product_id)
         versions = MediaVersionsService(db, shop).list_versions(product_id)
         live_media = MediaVersionsService(db, shop).live_media(product_id)
     except MediaVersionError as exc:

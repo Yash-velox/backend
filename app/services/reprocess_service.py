@@ -297,7 +297,7 @@ class ReprocessService:
         }
 
     def preview_live(self, catalog_product_id: UUID) -> dict[str, Any]:
-        product = self._get_catalog_product(catalog_product_id)
+        product = self._get_catalog_product(catalog_product_id, refresh_live=True)
         self._assert_live_reprocessable(product)
         images = self._live_media_out(product)
         if not images:
@@ -339,7 +339,7 @@ class ReprocessService:
         media_gids: list[str],
         steps: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        product = self._get_catalog_product(catalog_product_id)
+        product = self._get_catalog_product(catalog_product_id, refresh_live=True)
         self._assert_live_reprocessable(product)
         override = normalize_override_steps(steps)
         try:
@@ -370,7 +370,7 @@ class ReprocessService:
             result["warnings"] = warnings
         return result
 
-    def _get_catalog_product(self, product_id: UUID) -> Product:
+    def _get_catalog_product(self, product_id: UUID, *, refresh_live: bool = False) -> Product:
         product = (
             self.db.query(Product)
             .options(selectinload(Product.media))
@@ -379,6 +379,10 @@ class ReprocessService:
         )
         if product is None:
             raise ReprocessError("Product not found", code="PRODUCT_NOT_FOUND", status_code=404)
+        if refresh_live:
+            refreshed = self.primary.refresh_catalog_product(product_id)
+            if refreshed is not None:
+                product = refreshed
         return product
 
     def _assert_live_reprocessable(self, product: Product) -> None:
