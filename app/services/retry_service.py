@@ -65,7 +65,12 @@ def next_processing_attempt_number(
 
 
 def find_generated_version_for_batch_image(db: Session, image: BatchImage) -> ImageVersion | None:
-    """Latest GENERATED Shopify file created from this batch image, if any."""
+    """Latest GENERATED Shopify file created from this batch image, if any.
+
+    Retry may reuse that file. Merchant Reprocess must not — it asked for new AI work.
+    """
+    if image.manual_reprocess:
+        return None
     return (
         db.query(ImageVersion)
         .filter(

@@ -521,6 +521,7 @@ class ImageProcessor:
         image.generated_shopify_file_gid = result["file_gid"]
         image.generated_shopify_cdn_url = result.get("cdn_url")
         image.generated_image_version_id = version.id
+        image.manual_reprocess = False
         image.output_checksum = meta.get("checksum") or image.output_checksum
         image.output_mime_type = "image/png"
 

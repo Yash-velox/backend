@@ -14,15 +14,21 @@ from app.models import (
     BatchProductStatus,
     BatchStatus,
     DeltaType,
+    ImageVersion,
+    ImageVersionType,
+    MediaVersionType,
     ProcessingBatch,
     Product,
     ProductMedia,
+    ProductMediaVersion,
+    PublishStatus,
     TriggerType,
 )
 from app.services.prompt_configuration import PromptConfigurationService
 from app.services.prompt_product_types import PromptProductTypeService
 from app.services.prompt_resolver import PromptResolver
 from app.services.reprocess_service import ReprocessError, ReprocessService
+from app.services.retry_service import find_generated_version_for_batch_image
 from app.services.state_machine import assert_transition, BATCH_PRODUCT_TRANSITIONS, BATCH_IMAGE_TRANSITIONS
 from app.models import BatchProductStatus as BPS, BatchImageStatus as BIS
 
@@ -125,6 +131,7 @@ def test_preview_and_reprocess_product_with_override(db_session, shop):
     assert bp.prompt_override_json is not None
     assert bp.prompt_override_json[0]["promptTemplate"].startswith("Only remove")
     assert image.output_storage_key is None
+    assert image.manual_reprocess is True
 
     db_session.refresh(batch)
     assert batch.status == BatchStatus.PROCESSING
@@ -282,3 +289,216 @@ def test_live_reprocess_preview_and_apply_api(client, db_session, shop):
     data = applied.json()["data"]
     assert data["imageCount"] == 1
     assert data["autoPublish"] is True
+
+
+def _generated_version(db_session, shop, product: Product, batch, image: BatchImage, *, file_gid: str) -> ImageVersion:
+    version = ImageVersion(
+        shop_id=shop.id,
+        product_id=product.id,
+        source_media_gid=image.shopify_media_gid,
+        version_number=1,
+        version_type=ImageVersionType.GENERATED,
+        shopify_file_gid=file_gid,
+        shopify_cdn_url="https://cdn.shopify.com/generated-v1.png",
+        is_current=True,
+        created_by_batch_id=batch.id,
+        created_by_batch_image_id=image.id,
+    )
+    db_session.add(version)
+    db_session.commit()
+    db_session.refresh(version)
+    return version
+
+
+def test_reprocess_does_not_reuse_existing_generated_version(db_session, shop):
+    product = _product(db_session, shop)
+    _configure_rings(db_session, shop)
+    batch, bp, image = _batch_with_product(db_session, shop, product)
+    bp.publish_status = PublishStatus.READY_TO_PUBLISH
+    db_session.commit()
+    version = _generated_version(
+        db_session, shop, product, batch, image, file_gid="gid://shopify/MediaImage/v1"
+    )
+
+    assert find_generated_version_for_batch_image(db_session, image) is not None
+
+    ReprocessService(db_session, shop).reprocess_product(
+        bp.id,
+        steps=[{"name": "Custom", "promptTemplate": "Make {{product_title}} brighter"}],
+    )
+    db_session.refresh(image)
+    db_session.refresh(bp)
+
+    assert image.manual_reprocess is True
+    assert image.status == BatchImageStatus.QUEUED
+    assert image.generated_shopify_file_gid is None
+    assert find_generated_version_for_batch_image(db_session, image) is None
+    assert bp.publish_status is None
+    still = (
+        db_session.query(ImageVersion)
+        .filter(ImageVersion.created_by_batch_image_id == image.id)
+        .count()
+    )
+    assert still == 1
+    db_session.refresh(version)
+    assert version.shopify_file_gid == "gid://shopify/MediaImage/v1"
+
+
+def test_reprocess_unpublished_does_not_create_published_snapshot(db_session, shop):
+    product = _product(db_session, shop)
+    _configure_rings(db_session, shop)
+    _batch, bp, _image = _batch_with_product(db_session, shop, product)
+    bp.publish_status = PublishStatus.READY_TO_PUBLISH
+    db_session.commit()
+
+    ReprocessService(db_session, shop).reprocess_product(bp.id)
+    count = (
+        db_session.query(ProductMediaVersion)
+        .filter(ProductMediaVersion.product_id == product.id)
+        .count()
+    )
+    assert count == 0
+
+
+def test_reprocess_published_preserves_existing_history(db_session, shop):
+    product = _product(db_session, shop)
+    _configure_rings(db_session, shop)
+    media = _add_live_media(db_session, shop, product, count=1)
+    batch, bp, image = _batch_with_product(db_session, shop, product)
+    bp.publish_status = PublishStatus.PUBLISHED
+    db_session.commit()
+    existing = ProductMediaVersion(
+        shop_id=shop.id,
+        product_id=product.id,
+        shopify_product_gid=product.shopify_product_gid,
+        version_number=1,
+        version_type=MediaVersionType.PUBLISHED,
+        is_active=True,
+        rollback_eligible=True,
+        snapshot_hash="published-existing",
+        items_json={
+            "product_gid": product.shopify_product_gid,
+            "media": [
+                {
+                    "media_gid": media[0].shopify_media_gid,
+                    "file_gid": media[0].shopify_file_gid,
+                    "position": 0,
+                }
+            ],
+        },
+        created_by="publish",
+    )
+    db_session.add(existing)
+    db_session.commit()
+
+    ReprocessService(db_session, shop).reprocess_product(bp.id)
+    rows = (
+        db_session.query(ProductMediaVersion)
+        .filter(ProductMediaVersion.product_id == product.id)
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].id == existing.id
+    assert rows[0].version_type == MediaVersionType.PUBLISHED
+    db_session.refresh(image)
+    assert image.manual_reprocess is True
+    db_session.refresh(bp)
+    assert bp.publish_status is None
+
+
+def test_reprocess_published_creates_history_when_missing(db_session, shop):
+    product = _product(db_session, shop)
+    _configure_rings(db_session, shop)
+    media = _add_live_media(db_session, shop, product, count=1)
+    _batch, bp, image = _batch_with_product(db_session, shop, product)
+    bp.publish_status = PublishStatus.PUBLISHED
+    db_session.commit()
+
+    ReprocessService(db_session, shop).reprocess_product(bp.id)
+    rows = (
+        db_session.query(ProductMediaVersion)
+        .filter(
+            ProductMediaVersion.product_id == product.id,
+            ProductMediaVersion.version_type == MediaVersionType.PUBLISHED,
+        )
+        .all()
+    )
+    assert len(rows) == 1
+    items = rows[0].items_json or {}
+    assert any(
+        (m.get("media_gid") == media[0].shopify_media_gid)
+        for m in (items.get("media") or [])
+    )
+    db_session.refresh(image)
+    assert image.manual_reprocess is True
+
+
+def test_retry_still_reuses_generated_version_without_reprocess_flag(db_session, shop):
+    product = _product(db_session, shop)
+    _configure_rings(db_session, shop)
+    batch, _bp, image = _batch_with_product(db_session, shop, product)
+    _generated_version(db_session, shop, product, batch, image, file_gid="gid://shopify/MediaImage/retry-v1")
+    image.status = BatchImageStatus.QUEUED
+    image.generated_shopify_file_gid = None
+    image.manual_reprocess = False
+    db_session.commit()
+    db_session.refresh(image)
+
+    found = find_generated_version_for_batch_image(db_session, image)
+    assert found is not None
+    assert found.shopify_file_gid == "gid://shopify/MediaImage/retry-v1"
+
+
+def test_reprocess_batch_handles_published_and_unpublished_products(db_session, shop):
+    published = _product(db_session, shop, title="Published Ring")
+    unpublished = _product(db_session, shop, title="Draft Ring", product_type="Rings")
+    _configure_rings(db_session, shop)
+    batch, bp_pub, img_pub = _batch_with_product(db_session, shop, published)
+    bp_unpub = BatchProduct(
+        batch_id=batch.id,
+        shop_id=shop.id,
+        shopify_product_gid=unpublished.shopify_product_gid,
+        product_id=unpublished.id,
+        product_snapshot_json={"product_type": unpublished.product_type, "title": unpublished.title},
+        status=BatchProductStatus.COMPLETED,
+        image_count=1,
+        publish_status=PublishStatus.READY_TO_PUBLISH,
+        completed_at=datetime.now(timezone.utc),
+    )
+    db_session.add(bp_unpub)
+    db_session.flush()
+    img_unpub = BatchImage(
+        batch_product_id=bp_unpub.id,
+        shop_id=shop.id,
+        shopify_media_gid=f"gid://shopify/MediaImage/{uuid4().hex[:8]}",
+        cdn_url="https://cdn.shopify.com/s/files/1/draft.png",
+        original_filename="draft.png",
+        delta_type=DeltaType.NEW,
+        status=BatchImageStatus.COMPLETED,
+        attempt_count=1,
+        completed_at=datetime.now(timezone.utc),
+    )
+    db_session.add(img_unpub)
+    bp_pub.publish_status = PublishStatus.PUBLISHED
+    _add_live_media(db_session, shop, published, count=1)
+    db_session.commit()
+
+    result = ReprocessService(db_session, shop).reprocess_batch(batch.id)
+    assert result["retriedCount"] == 2
+    db_session.refresh(img_pub)
+    db_session.refresh(img_unpub)
+    assert img_pub.manual_reprocess is True
+    assert img_unpub.manual_reprocess is True
+    published_history = (
+        db_session.query(ProductMediaVersion)
+        .filter(ProductMediaVersion.product_id == published.id)
+        .count()
+    )
+    unpublished_history = (
+        db_session.query(ProductMediaVersion)
+        .filter(ProductMediaVersion.product_id == unpublished.id)
+        .count()
+    )
+    assert published_history == 1
+    assert unpublished_history == 0
+

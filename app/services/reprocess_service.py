@@ -14,15 +14,20 @@ from app.models import (
     BatchImageStatus,
     BatchProduct,
     BatchProductStatus,
+    MediaVersionType,
     ProcessingBatch,
     Product,
+    ProductMedia,
+    ProductMediaVersion,
     PublishStatus,
     Shop,
 )
-from app.services.media_versions import product_has_active_media_op
+from app.services.image_versions import ImageVersionsService
+from app.services.media_versions import MediaVersionsService, product_has_active_media_op
 from app.services.primary_batch import PrimaryBatchError, PrimaryBatchService
 from app.services.prompt_resolver import PromptResolver, PromptResolverError
 from app.services.prompt_variables import PromptVariableError, validate_prompt_variables
+from app.services.publish_snapshot import snapshot_from_baseline
 from app.services.state_machine import BATCH_IMAGE_TRANSITIONS, BATCH_PRODUCT_TRANSITIONS, assert_transition
 
 logger = logging.getLogger("app.services.reprocess")
@@ -445,6 +450,7 @@ class ReprocessService:
         *,
         images_to_process: list[BatchImage],
     ) -> None:
+        self._preserve_published_history_if_needed(product)
         now = datetime.now(timezone.utc)
         if product.status != BatchProductStatus.QUEUED:
             assert_transition(
@@ -507,6 +513,108 @@ class ReprocessService:
         image.error_message = None
         image.completed_at = None
         image.started_at = None
+        image.manual_reprocess = True
+
+    def _preserve_published_history_if_needed(self, product: BatchProduct) -> None:
+        """If this product is already live, keep a revertible published snapshot first."""
+        if product.publish_status != PublishStatus.PUBLISHED:
+            return
+        catalog = self._catalog_product(product)
+        if catalog is None:
+            return
+        existing = (
+            self.db.query(ProductMediaVersion)
+            .filter(
+                ProductMediaVersion.shop_id == self.shop.id,
+                ProductMediaVersion.product_id == catalog.id,
+                ProductMediaVersion.version_type == MediaVersionType.PUBLISHED,
+            )
+            .order_by(ProductMediaVersion.version_number.desc())
+            .first()
+        )
+        if existing:
+            logger.info(
+                "Reprocess keeping published history | product=%s version=%s",
+                product.id,
+                existing.id,
+            )
+            return
+
+        snapshot = self._published_snapshot_for_reprocess(catalog, product)
+        if not (snapshot.get("media") or []):
+            logger.warning(
+                "Published product has no snapshot media to preserve | product=%s",
+                product.id,
+            )
+            return
+
+        published = MediaVersionsService(self.db, self.shop).create_version(
+            product=catalog,
+            snapshot=snapshot,
+            version_type=MediaVersionType.PUBLISHED,
+            activate=True,
+            processing_batch_id=product.batch_id,
+            created_by="reprocess",
+            skip_duplicate_hash=True,
+        )
+        ImageVersionsService(self.db, self.shop).mark_published_for_product_version(
+            product_id=catalog.id,
+            product_media_version_id=published.id,
+            media_items=list((published.items_json or {}).get("media") or []),
+            actor_type="reprocess",
+        )
+        logger.info(
+            "Preserved published history before reprocess | product=%s version=%s",
+            product.id,
+            published.id,
+        )
+
+    def _published_snapshot_for_reprocess(
+        self,
+        catalog: Product,
+        batch_product: BatchProduct,
+    ) -> dict[str, Any]:
+        media_rows = [
+            m
+            for m in (
+                self.db.query(ProductMedia)
+                .filter(
+                    ProductMedia.shop_id == self.shop.id,
+                    ProductMedia.product_id == catalog.id,
+                    ProductMedia.is_visible.is_(True),
+                    ProductMedia.is_active.is_(True),
+                )
+                .all()
+            )
+        ]
+        media_rows.sort(key=lambda m: (m.position is None, m.position or 0, str(m.shopify_media_gid)))
+        if media_rows:
+            rows: list[dict[str, Any]] = []
+            for idx, media in enumerate(media_rows):
+                position = media.position if media.position is not None else idx
+                rows.append(
+                    {
+                        "media_gid": media.shopify_media_gid,
+                        "file_gid": media.shopify_file_gid or media.shopify_media_gid,
+                        "position": position,
+                        "alt_text": media.alt_text,
+                        "cdn_url": media.cdn_url,
+                        "filename": media.original_filename,
+                        "width": media.width,
+                        "height": media.height,
+                        "mime_type": media.mime_type,
+                        "is_primary": bool(media.is_primary) or idx == 0,
+                    }
+                )
+            featured = next((r["media_gid"] for r in rows if r.get("is_primary")), None)
+            return {
+                "product_gid": catalog.shopify_product_gid,
+                "updated_at": None,
+                "featured_media_gid": featured or (rows[0]["media_gid"] if rows else None),
+                "media": rows,
+                "variants": [],
+            }
+        return snapshot_from_baseline(batch_product.baseline_snapshot_json)
 
     def _resolve_preview_steps(
         self,

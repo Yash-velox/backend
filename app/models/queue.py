@@ -541,6 +541,7 @@ class BatchImage(Base):
     generated_shopify_file_gid: Mapped[str | None] = mapped_column(String(128), nullable=True)
     generated_shopify_cdn_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     generated_image_version_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    manual_reprocess: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
