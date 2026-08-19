@@ -262,6 +262,23 @@ def test_live_reprocess_rejects_unknown_media(db_session, shop):
     assert exc.value.code == "REPROCESS_NOT_ELIGIBLE"
 
 
+def test_live_reprocess_skips_unknown_media_and_continues(db_session, shop):
+    product = _product(db_session, shop)
+    _configure_rings(db_session, shop)
+    media = _add_live_media(db_session, shop, product, count=2)
+
+    result = ReprocessService(db_session, shop).reprocess_live(
+        product.id,
+        media_gids=[
+            media[0].shopify_media_gid,
+            "gid://shopify/MediaImage/missing",
+        ],
+    )
+    assert result["imageCount"] == 1
+    assert result["warnings"]
+    assert "skipped" in result["warnings"][0].lower()
+
+
 def test_live_reprocess_preview_and_apply_api(client, db_session, shop):
     product = _product(db_session, shop)
     _configure_rings(db_session, shop)

@@ -343,7 +343,7 @@ class ReprocessService:
         self._assert_live_reprocessable(product)
         override = normalize_override_steps(steps)
         try:
-            batch = self.primary.create_selective_manual_batch(
+            batch, warnings = self.primary.create_selective_manual_batch(
                 product.shopify_product_gid,
                 media_gids,
                 prompt_override=override,
@@ -356,7 +356,7 @@ class ReprocessService:
             .filter(BatchProduct.batch_id == batch.id, BatchProduct.shop_id == self.shop.id)
             .one()
         )
-        return {
+        result: dict[str, Any] = {
             "scope": "live",
             "batchId": str(batch.id),
             "productId": str(product.id),
@@ -366,6 +366,9 @@ class ReprocessService:
             "usedPromptOverride": override is not None,
             "autoPublish": True,
         }
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
     def _get_catalog_product(self, product_id: UUID) -> Product:
         product = (

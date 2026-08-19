@@ -290,11 +290,13 @@ class PrimaryBatchService:
         *,
         prompt_override: list[dict] | None = None,
         settings_extra: dict | None = None,
-    ) -> ProcessingBatch:
+    ) -> tuple[ProcessingBatch, list[str]]:
         """Create a one-product manual batch for selected live images only.
 
         Baseline snapshot is the full live gallery so publish conflict checks stay
         accurate. Only the selected images are queued for AI work.
+
+        Returns the batch and any warnings (e.g. selected media no longer on the product).
         """
         product = self._load_or_refresh_product(product_gid)
         if product is None:
@@ -324,9 +326,25 @@ class PrimaryBatchService:
                 missing.append(gid)
             else:
                 selected.append(media)
+        warnings: list[str] = []
         if missing:
-            raise PrimaryBatchError(
-                "One or more selected images are not on the live product."
+            if not selected:
+                raise PrimaryBatchError(
+                    "None of the selected images are on the live product."
+                )
+            skipped = len(missing)
+            warnings.append(
+                f"{skipped} selected image{'s' if skipped != 1 else ''} "
+                "not on the live product and skipped. "
+                f"Enhancement continues with {len(selected)} remaining image"
+                f"{'s' if len(selected) != 1 else ''}."
+            )
+            logger.warning(
+                "Live reprocess skipped missing media | shop=%s product=%s skipped=%s remaining=%s",
+                self.shop.id,
+                product_gid,
+                skipped,
+                len(selected),
             )
 
         inflight = (
@@ -413,13 +431,14 @@ class PrimaryBatchService:
         self.db.commit()
         self.db.refresh(batch)
         logger.info(
-            "Live reprocess batch created | shop=%s batch=%s product=%s images=%s",
+            "Live reprocess batch created | shop=%s batch=%s product=%s images=%s skipped=%s",
             self.shop.id,
             batch.id,
             product.shopify_product_gid,
             batch.image_count,
+            len(missing),
         )
-        return batch
+        return batch, warnings
 
     def _resolve_product_for_secondary(self, item: SecondaryQueueItem) -> Product | None:
         product = None
