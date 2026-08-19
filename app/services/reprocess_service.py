@@ -523,58 +523,69 @@ class ReprocessService:
         image.manual_reprocess = True
 
     def _preserve_published_history_if_needed(self, product: BatchProduct) -> None:
-        """If this product is already live, keep a revertible published snapshot first."""
-        if product.publish_status != PublishStatus.PUBLISHED:
-            return
+        """If this product is already live, keep a revertible published snapshot first.
+
+        Also refreshes baseline_snapshot_json to current live media so the
+        publish conflict checker compares "live vs live" instead of
+        "old original vs live" after reprocess.
+
+        Checks both:
+        - this batch_product's own publish_status == PUBLISHED, AND
+        - whether ANY published ProductMediaVersion exists (product may have
+          been published from a different batch or from the Versions page).
+        """
         catalog = self._catalog_product(product)
         if catalog is None:
             return
-        existing = (
-            self.db.query(ProductMediaVersion)
+
+        is_published_here = product.publish_status == PublishStatus.PUBLISHED
+        has_published_version = (
+            self.db.query(ProductMediaVersion.id)
             .filter(
                 ProductMediaVersion.shop_id == self.shop.id,
                 ProductMediaVersion.product_id == catalog.id,
                 ProductMediaVersion.version_type == MediaVersionType.PUBLISHED,
             )
-            .order_by(ProductMediaVersion.version_number.desc())
             .first()
+            is not None
         )
-        if existing:
-            logger.info(
-                "Reprocess keeping published history | product=%s version=%s",
-                product.id,
-                existing.id,
-            )
+        if not is_published_here and not has_published_version:
             return
 
         snapshot = self._published_snapshot_for_reprocess(catalog, product)
-        if not (snapshot.get("media") or []):
+
+        if snapshot.get("media"):
+            # create_version with skip_duplicate_hash=True will return the
+            # existing version if the snapshot hash matches (e.g. V3 still
+            # live), or create a new one if live state has drifted (merchant
+            # manually changed Shopify → X).
+            preserved = MediaVersionsService(self.db, self.shop).create_version(
+                product=catalog,
+                snapshot=snapshot,
+                version_type=MediaVersionType.PUBLISHED,
+                activate=True,
+                processing_batch_id=product.batch_id,
+                created_by="reprocess",
+                skip_duplicate_hash=True,
+            )
+            ImageVersionsService(self.db, self.shop).mark_published_for_product_version(
+                product_id=catalog.id,
+                product_media_version_id=preserved.id,
+                media_items=list((preserved.items_json or {}).get("media") or []),
+                actor_type="reprocess",
+            )
+            logger.info(
+                "Preserved published history before reprocess | product=%s version=%s",
+                product.id,
+                preserved.id,
+            )
+        else:
             logger.warning(
                 "Published product has no snapshot media to preserve | product=%s",
                 product.id,
             )
-            return
 
-        published = MediaVersionsService(self.db, self.shop).create_version(
-            product=catalog,
-            snapshot=snapshot,
-            version_type=MediaVersionType.PUBLISHED,
-            activate=True,
-            processing_batch_id=product.batch_id,
-            created_by="reprocess",
-            skip_duplicate_hash=True,
-        )
-        ImageVersionsService(self.db, self.shop).mark_published_for_product_version(
-            product_id=catalog.id,
-            product_media_version_id=published.id,
-            media_items=list((published.items_json or {}).get("media") or []),
-            actor_type="reprocess",
-        )
-        logger.info(
-            "Preserved published history before reprocess | product=%s version=%s",
-            product.id,
-            published.id,
-        )
+        self._refresh_baseline_to_live(product, catalog, snapshot)
 
     def _published_snapshot_for_reprocess(
         self,
@@ -622,6 +633,31 @@ class ReprocessService:
                 "variants": [],
             }
         return snapshot_from_baseline(batch_product.baseline_snapshot_json)
+
+    def _refresh_baseline_to_live(
+        self,
+        product: BatchProduct,
+        catalog: Product,
+        live_snapshot: dict[str, Any],
+    ) -> None:
+        """Update baseline_snapshot_json to current live media so publish
+        conflict detection does not false-fire after reprocess of a
+        previously published product."""
+        if not (live_snapshot.get("media") or []):
+            return
+        product_snap = product.product_snapshot_json or {}
+        product.baseline_snapshot_json = {
+            "product": product_snap,
+            "media": live_snapshot.get("media") or [],
+            "product_gid": live_snapshot.get("product_gid") or catalog.shopify_product_gid,
+            "featured_media_gid": live_snapshot.get("featured_media_gid"),
+            "variants": live_snapshot.get("variants") or [],
+        }
+        logger.info(
+            "Refreshed baseline to live media before reprocess | product=%s media=%s",
+            product.id,
+            len(live_snapshot.get("media") or []),
+        )
 
     def _resolve_preview_steps(
         self,

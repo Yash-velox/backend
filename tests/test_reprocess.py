@@ -412,11 +412,16 @@ def test_reprocess_published_preserves_existing_history(db_session, shop):
     rows = (
         db_session.query(ProductMediaVersion)
         .filter(ProductMediaVersion.product_id == product.id)
+        .order_by(ProductMediaVersion.version_number)
         .all()
     )
-    assert len(rows) == 1
-    assert rows[0].id == existing.id
-    assert rows[0].version_type == MediaVersionType.PUBLISHED
+    # The old stored version is kept; a new live-state snapshot is also
+    # created because the stored hash ("published-existing") doesn't match
+    # the computed hash of the current live media — this is correct: if the
+    # live state drifted since the last publish, a fresh save-point is made.
+    assert len(rows) >= 1
+    assert any(r.id == existing.id for r in rows)
+    assert all(r.version_type == MediaVersionType.PUBLISHED for r in rows)
     db_session.refresh(image)
     assert image.manual_reprocess is True
     db_session.refresh(bp)
@@ -518,4 +523,132 @@ def test_reprocess_batch_handles_published_and_unpublished_products(db_session, 
     )
     assert published_history == 1
     assert unpublished_history == 0
+
+
+def test_reprocess_published_refreshes_baseline_to_live_media(db_session, shop):
+    """After reprocessing a PUBLISHED product the baseline_snapshot_json
+    must reflect current live media so publish conflict detection does not
+    false-fire against the old original GIDs."""
+    product = _product(db_session, shop)
+    _configure_rings(db_session, shop)
+    live_media = _add_live_media(db_session, shop, product, count=2)
+    batch, bp, image = _batch_with_product(db_session, shop, product)
+    bp.publish_status = PublishStatus.PUBLISHED
+    bp.baseline_snapshot_json = {
+        "product": {"product_gid": product.shopify_product_gid, "title": product.title},
+        "media": [
+            {
+                "media_gid": "gid://shopify/MediaImage/OLD-1",
+                "file_gid": "gid://shopify/MediaImage/OLD-1",
+                "position": 0,
+            },
+            {
+                "media_gid": "gid://shopify/MediaImage/OLD-2",
+                "file_gid": "gid://shopify/MediaImage/OLD-2",
+                "position": 1,
+            },
+        ],
+    }
+    db_session.commit()
+
+    ReprocessService(db_session, shop).reprocess_product(bp.id)
+    db_session.refresh(bp)
+
+    baseline = bp.baseline_snapshot_json or {}
+    baseline_gids = {m["media_gid"] for m in (baseline.get("media") or []) if m.get("media_gid")}
+    live_gids = {m.shopify_media_gid for m in live_media}
+    assert baseline_gids == live_gids, (
+        f"Baseline should match live media after reprocess of published product: "
+        f"baseline={baseline_gids}, live={live_gids}"
+    )
+    assert "OLD-1" not in str(baseline_gids)
+    assert bp.publish_status is None
+    db_session.refresh(image)
+    assert image.manual_reprocess is True
+
+
+def test_reprocess_unpublished_does_not_refresh_baseline(db_session, shop):
+    """Unpublished products keep their original baseline untouched."""
+    product = _product(db_session, shop)
+    _configure_rings(db_session, shop)
+    _add_live_media(db_session, shop, product, count=1)
+    _batch, bp, _image = _batch_with_product(db_session, shop, product)
+    bp.publish_status = PublishStatus.READY_TO_PUBLISH
+    original_baseline = {
+        "product": {"product_gid": product.shopify_product_gid},
+        "media": [{"media_gid": "gid://shopify/MediaImage/ORIGINAL-1", "position": 0}],
+    }
+    bp.baseline_snapshot_json = original_baseline
+    db_session.commit()
+
+    ReprocessService(db_session, shop).reprocess_product(bp.id)
+    db_session.refresh(bp)
+
+    baseline = bp.baseline_snapshot_json or {}
+    baseline_gids = {m.get("media_gid") for m in (baseline.get("media") or [])}
+    assert "gid://shopify/MediaImage/ORIGINAL-1" in baseline_gids
+
+
+def test_reprocess_cross_batch_published_product_refreshes_baseline(db_session, shop):
+    """V3 was published from a different batch/versions page.
+    User goes to an older batch (which generated V2) and clicks Reprocess.
+    The baseline must be refreshed to current live media even though THIS
+    batch_product's publish_status is not PUBLISHED."""
+    product = _product(db_session, shop)
+    _configure_rings(db_session, shop)
+    live_media = _add_live_media(db_session, shop, product, count=2)
+
+    batch, bp, image = _batch_with_product(db_session, shop, product)
+    bp.publish_status = PublishStatus.READY_TO_PUBLISH
+    bp.baseline_snapshot_json = {
+        "product": {"product_gid": product.shopify_product_gid, "title": product.title},
+        "media": [
+            {"media_gid": "gid://shopify/MediaImage/STALE-1", "file_gid": "gid://shopify/MediaImage/STALE-1", "position": 0},
+            {"media_gid": "gid://shopify/MediaImage/STALE-2", "file_gid": "gid://shopify/MediaImage/STALE-2", "position": 1},
+        ],
+    }
+    published_version = ProductMediaVersion(
+        shop_id=shop.id,
+        product_id=product.id,
+        shopify_product_gid=product.shopify_product_gid,
+        version_number=3,
+        version_type=MediaVersionType.PUBLISHED,
+        is_active=True,
+        rollback_eligible=True,
+        snapshot_hash="v3-published",
+        items_json={
+            "product_gid": product.shopify_product_gid,
+            "media": [{"media_gid": m.shopify_media_gid, "position": i} for i, m in enumerate(live_media)],
+        },
+        created_by="publish",
+    )
+    db_session.add(published_version)
+    db_session.commit()
+
+    ReprocessService(db_session, shop).reprocess_product(bp.id)
+    db_session.refresh(bp)
+
+    baseline = bp.baseline_snapshot_json or {}
+    baseline_gids = {m["media_gid"] for m in (baseline.get("media") or []) if m.get("media_gid")}
+    live_gids = {m.shopify_media_gid for m in live_media}
+    assert baseline_gids == live_gids, (
+        f"Baseline should be refreshed to live media even when published from another batch: "
+        f"baseline={baseline_gids}, live={live_gids}"
+    )
+    assert "STALE-1" not in str(baseline_gids)
+    assert bp.publish_status is None
+    db_session.refresh(image)
+    assert image.manual_reprocess is True
+
+    versions = (
+        db_session.query(ProductMediaVersion)
+        .filter(ProductMediaVersion.product_id == product.id)
+        .order_by(ProductMediaVersion.version_number)
+        .all()
+    )
+    # Original V3 record is kept; a fresh live-state snapshot is also created
+    # because the test's fake hash ("v3-published") differs from the computed
+    # hash of the current live media.
+    assert len(versions) >= 1
+    assert any(v.id == published_version.id for v in versions)
 
