@@ -167,17 +167,20 @@ def create_manual_batch(
 ):
     svc = PrimaryBatchService(db, shop)
     try:
-        batch = svc.create_manual_batch(payload.productGids)
+        batch, warnings = svc.create_manual_batch(payload.productGids)
     except PrimaryBatchError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    data = _batch_out(batch).model_dump()
+    if warnings:
+        data["warnings"] = warnings
     return SuccessEnvelope(
         success=True,
         message="Manual batch created successfully.",
         requestId=_request_id(request),
-        data=_batch_out(batch).model_dump(),
+        data=data,
     )
 
 

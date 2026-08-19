@@ -30,7 +30,6 @@ from app.models import (
 from app.services.catalog_sync import CatalogSyncService
 from app.services.delta import compare_media_snapshots
 from app.services.prompt_resolver import PromptResolverError, assert_product_prompts_ready
-from app.services.shopify_graphql import ShopifyGraphQLError
 from app.services.snapshot import media_snapshots_from_models, product_snapshot_from_model
 from app.services.state_machine import (
     BATCH_PRODUCT_TRANSITIONS,
@@ -160,8 +159,8 @@ class PrimaryBatchService:
             if not node:
                 return None
             return self.catalog_sync.upsert_product_from_shopify_node(node)
-        except ShopifyGraphQLError as exc:
-            logger.error(
+        except Exception as exc:
+            logger.warning(
                 "Product refresh failed | shop=%s gid=%s error=%s",
                 self.shop.id,
                 product_gid,
@@ -186,7 +185,12 @@ class PrimaryBatchService:
         if force_refresh:
             refreshed = self._refresh_product_from_shopify(product_gid)
             if refreshed is not None:
-                return refreshed
+                return (
+                    self.db.query(Product)
+                    .options(selectinload(Product.media))
+                    .filter(Product.id == refreshed.id)
+                    .one()
+                )
         product = (
             self.db.query(Product)
             .options(selectinload(Product.media))
@@ -218,24 +222,40 @@ class PrimaryBatchService:
         except PromptResolverError as exc:
             raise PrimaryBatchError(str(exc)) from exc
 
-    def create_manual_batch(self, product_gids: list[str]) -> ProcessingBatch:
+    def create_manual_batch(self, product_gids: list[str]) -> tuple[ProcessingBatch, list[str]]:
         gids = self._validate_product_gids(product_gids)
         shop_settings = ensure_shop_settings(self.db, self.shop)
         now = datetime.now(timezone.utc)
 
-        # Validate every product (media + prompts) before creating the batch row.
+        # Validate products before creating the batch row. Skip products with no
+        # live attached images instead of failing the whole selection.
         prepared: list[tuple[str, Product, list]] = []
+        warnings: list[str] = []
         for gid in gids:
-            product = self._load_or_refresh_product(gid)
+            product = self._load_or_refresh_product(gid, force_refresh=True)
             if product is None:
                 raise PrimaryBatchError(f"Product not found: {gid}")
 
             visible_media = [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
             if not visible_media:
-                raise PrimaryBatchError(f"Product has no visible media: {gid}")
+                label = product.title or gid
+                warnings.append(
+                    f"{label} has no images attached on Shopify and was skipped."
+                )
+                logger.warning(
+                    "Manual batch skipped product with no attached media | shop=%s product=%s",
+                    self.shop.id,
+                    gid,
+                )
+                continue
 
             self._require_prompts_ready(product)
             prepared.append((gid, product, visible_media))
+
+        if not prepared:
+            raise PrimaryBatchError(
+                "None of the selected products have images attached on Shopify."
+            )
 
         batch = ProcessingBatch(
             shop_id=self.shop.id,
@@ -294,20 +314,21 @@ class PrimaryBatchService:
                 )
                 image_count += 1
 
-        batch.product_count = len(gids)
+        batch.product_count = len(prepared)
         batch.image_count = image_count
-        batch.pending_product_count = len(gids)
+        batch.pending_product_count = len(prepared)
         batch.started_at = now
         self.db.commit()
         self.db.refresh(batch)
         logger.info(
-            "Manual batch created | shop=%s batch=%s products=%s images=%s",
+            "Manual batch created | shop=%s batch=%s products=%s images=%s skipped=%s",
             self.shop.id,
             batch.id,
             batch.product_count,
             batch.image_count,
+            len(warnings),
         )
-        return batch
+        return batch, warnings
 
     def create_selective_manual_batch(
         self,

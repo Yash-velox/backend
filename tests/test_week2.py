@@ -570,7 +570,10 @@ def test_manual_batch_creates_initial_images(db_session, shop):
     db_session.commit()
     _configure_product_type(db_session, shop, "Shoes")
 
-    batch = PrimaryBatchService(db_session, shop).create_manual_batch(["gid://shopify/Product/42"])
+    batch, warnings = PrimaryBatchService(db_session, shop).create_manual_batch(
+        ["gid://shopify/Product/42"]
+    )
+    assert warnings == []
     assert batch.trigger_type == TriggerType.MANUAL
     assert batch.product_count == 1
     assert batch.image_count == 1
@@ -581,6 +584,50 @@ def test_manual_batch_creates_initial_images(db_session, shop):
     baseline_media = (bp.baseline_snapshot_json or {}).get("media") or []
     assert len(baseline_media) == 1
     assert baseline_media[0]["media_gid"] == "gid://shopify/MediaImage/7"
+
+
+def test_manual_batch_skips_product_without_attached_images(db_session, shop):
+    ensure_shop_settings(db_session, shop)
+    _configure_product_type(db_session, shop, "Shoes")
+    with_media = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/42",
+        title="Boot",
+        status="ACTIVE",
+        product_type="Shoes",
+    )
+    no_media = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/43",
+        title="Empty Boot",
+        status="ACTIVE",
+        product_type="Shoes",
+    )
+    db_session.add_all([with_media, no_media])
+    db_session.flush()
+    db_session.add(
+        ProductMedia(
+            shop_id=shop.id,
+            product_id=with_media.id,
+            shopify_media_gid="gid://shopify/MediaImage/7",
+            cdn_url="https://cdn.shopify.com/boot.png",
+            is_visible=True,
+            is_active=True,
+            position=1,
+            content_fingerprint="boot-fp",
+        )
+    )
+    db_session.commit()
+
+    batch, warnings = PrimaryBatchService(db_session, shop).create_manual_batch(
+        ["gid://shopify/Product/42", "gid://shopify/Product/43"]
+    )
+    assert batch.product_count == 1
+    assert batch.image_count == 1
+    assert len(warnings) == 1
+    assert "Empty Boot" in warnings[0]
+    assert "skipped" in warnings[0].lower()
+    assert db_session.query(BatchProduct).filter(BatchProduct.batch_id == batch.id).count() == 1
 
 
 def test_manual_batch_rejects_unconfigured_product_type(db_session, shop):
@@ -639,7 +686,9 @@ def test_manual_batch_uses_central_prompt_when_type_unconfigured(db_session, sho
     )
     db_session.commit()
 
-    batch = PrimaryBatchService(db_session, shop).create_manual_batch(["gid://shopify/Product/421"])
+    batch, _warnings = PrimaryBatchService(db_session, shop).create_manual_batch(
+        ["gid://shopify/Product/421"]
+    )
     assert batch.product_count == 1
     assert db_session.query(BatchProduct).filter(BatchProduct.batch_id == batch.id).count() == 1
 
