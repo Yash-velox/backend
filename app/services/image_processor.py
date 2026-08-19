@@ -26,6 +26,7 @@ from app.models import (
     Shop,
 )
 from app.poc.openai_client import OpenAIImageClient, OpenAIImageError
+from app.services.ai_provider import skip_ai_provider_call
 from app.services.image_versions import ImageVersionsService, build_generated_filename
 from app.services.openai_image_compat import supports_transparent_background
 from app.services.output_storage import OutputStorage, checksum_sha256, get_output_storage
@@ -414,7 +415,8 @@ class ImageProcessor:
         """Validate the generated PNG before Shopify upload."""
         meta = validate_generated_png_for_shopify(path)
         require_alpha = (
-            settings.openai_require_output_alpha
+            not skip_ai_provider_call()
+            and settings.openai_require_output_alpha
             and settings.openai_transparent_background
             and supports_transparent_background(settings.openai_image_model)
         )

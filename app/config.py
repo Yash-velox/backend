@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     poc_storage_dir: str = "storage/poc-jobs"
     poc_job_ttl_hours: int = 24
     openai_api_key: str = ""
+    # Load-test / local only. When true, workers never call OpenAI; they passthrough
+    # the Shopify source image (PNG) or a tiny placeholder (JPEG/WebP) and continue
+    # Shopify Files upload. Keep OPENAI_API_KEY in env; this flag is the switch.
+    skip_ai_provider_call: bool = False
     # gpt-image-1.5 supports background=transparent. gpt-image-2 rejects it.
     openai_image_model: str = "gpt-image-1.5"
     # GPT Image quality tier: low | medium | high | auto

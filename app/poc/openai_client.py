@@ -8,6 +8,7 @@ import httpx
 from openai import OpenAI
 
 from app.config import settings
+from app.services.ai_provider import skip_ai_output_bytes, skip_ai_provider_call
 from app.services.openai_image_compat import supports_transparent_background
 
 logger = logging.getLogger("app.poc.openai")
@@ -19,6 +20,10 @@ class OpenAIImageError(RuntimeError):
 
 class OpenAIImageClient:
     def __init__(self) -> None:
+        if skip_ai_provider_call():
+            self._client = None
+            logger.info("OpenAI client skipped | SKIP_AI_PROVIDER_CALL=true")
+            return
         if not settings.openai_api_key:
             raise OpenAIImageError("OPENAI_API_KEY is not configured")
         timeout = float(settings.openai_image_timeout_seconds)
@@ -39,6 +44,16 @@ class OpenAIImageClient:
         step: int = 0,
         transparent_background: bool = False,
     ) -> bytes:
+        if skip_ai_provider_call() or self._client is None:
+            output = skip_ai_output_bytes(image_bytes)
+            logger.info(
+                "Skipping OpenAI call | SKIP_AI_PROVIDER_CALL=true | job=%s step=%s input_bytes=%s output_bytes=%s",
+                job_id or "-",
+                step or "-",
+                len(image_bytes),
+                len(output),
+            )
+            return output
         model = settings.openai_image_model
         use_transparent = transparent_background and supports_transparent_background(model)
         if transparent_background and not use_transparent:

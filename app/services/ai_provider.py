@@ -6,6 +6,15 @@ from enum import Enum
 
 from app.config import settings
 
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# 1x1 RGBA PNG used when SKIP_AI_PROVIDER_CALL is on and the source is not already PNG.
+SKIP_AI_PLACEHOLDER_PNG = (
+    b"\x89PNG\r\n\x1a\n"
+    b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+    b"\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4"
+    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
 
 class AiProvider(str, Enum):
     OPEN_AI = "OPEN_AI"
@@ -45,3 +54,15 @@ def require_openai_provider() -> None:
             code="EXTERNAL_LLM_NOT_IMPLEMENTED",
         )
     raise AiProviderError(f"Unsupported AI_PROVIDER={provider!r}", code="INVALID_AI_PROVIDER")
+
+
+def skip_ai_provider_call() -> bool:
+    """When true, never call OpenAI. Used for load tests. Default false."""
+    return bool(settings.skip_ai_provider_call)
+
+
+def skip_ai_output_bytes(image_bytes: bytes) -> bytes:
+    """Identity passthrough for PNG sources; placeholder PNG otherwise (Shopify upload needs PNG)."""
+    if image_bytes.startswith(PNG_SIGNATURE):
+        return image_bytes
+    return SKIP_AI_PLACEHOLDER_PNG

@@ -14,6 +14,7 @@ from typing import Any, Iterable
 from openai import OpenAI
 
 from app.config import settings
+from app.services.ai_provider import skip_ai_provider_call
 from app.services.openai_image_compat import supports_transparent_background
 
 logger = logging.getLogger("app.services.openai_batch_client")
@@ -165,6 +166,11 @@ class OpenAIBatchClient:
         if client is not None:
             self._client = client
             return
+        if skip_ai_provider_call():
+            raise OpenAIBatchClientError(
+                "OpenAI Batch client is disabled by SKIP_AI_PROVIDER_CALL",
+                code="SKIP_AI_PROVIDER_CALL",
+            )
         if not settings.openai_api_key:
             raise OpenAIBatchClientError("OPENAI_API_KEY is not configured", code="OPENAI_NOT_CONFIGURED")
         self._client = OpenAI(api_key=settings.openai_api_key, timeout=settings.openai_image_timeout_seconds)

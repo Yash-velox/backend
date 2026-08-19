@@ -304,3 +304,125 @@ def test_import_maps_by_custom_id_not_order(db_session, shop, monkeypatch, tmp_p
     }
     assert reqs[cid_ok].status == OpenAIBatchRequestStatus.COMPLETED
     assert reqs[cid_bad].status == OpenAIBatchRequestStatus.FAILED
+
+
+def test_skip_ai_passthrough_does_not_call_openai(db_session, shop, monkeypatch, tmp_path):
+    from app.models import (
+        BatchImage,
+        BatchImageStatus,
+        BatchProduct,
+        BatchProductStatus,
+        BatchStatus,
+        DeltaType,
+        ProcessingAttempt,
+        ProcessingBatch,
+        Product,
+        TriggerType,
+    )
+    from app.models.openai_batch import OpenAIBatch
+    from app.services import openai_batch_orchestrator as orch_mod
+    from app.services.prompt_configuration import PromptConfigurationService
+    from app.services.prompt_product_types import PromptProductTypeService
+
+    monkeypatch.setattr(settings, "skip_ai_provider_call", True)
+    monkeypatch.setattr(settings, "ai_execution_mode", "OPENAI_BATCH")
+    monkeypatch.setattr(settings, "openai_batch_enabled", True)
+    monkeypatch.setattr(settings, "openai_allow_sync_fallback", False)
+    monkeypatch.setattr(settings, "ai_provider", "OPEN_AI")
+    monkeypatch.setattr(settings, "processing_output_directory", str(tmp_path))
+
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/skip-ai",
+        title="Skip Ring",
+        product_type="Rings",
+    )
+    db_session.add(product)
+    db_session.flush()
+    types = PromptProductTypeService(db_session, shop)
+    types.sync_shopify_product_types()
+    db_session.flush()
+    ppt = types.find_by_normalized_name("rings")
+    if ppt is None:
+        ppt = types.add_manual("Rings")
+    PromptConfigurationService(db_session, shop).add_step(
+        ppt.id, name="Enhance", prompt_text="enhance {{product_title}}", is_enabled=True
+    )
+    db_session.commit()
+
+    batch = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.MANUAL,
+        status=BatchStatus.QUEUED,
+        product_count=1,
+        image_count=1,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    bp = BatchProduct(
+        batch_id=batch.id,
+        shop_id=shop.id,
+        shopify_product_gid=product.shopify_product_gid,
+        product_id=product.id,
+        product_snapshot_json={"product_type": "Rings", "title": "Skip Ring"},
+        status=BatchProductStatus.QUEUED,
+        image_count=1,
+    )
+    db_session.add(bp)
+    db_session.flush()
+    image = BatchImage(
+        batch_product_id=bp.id,
+        shop_id=shop.id,
+        shopify_media_gid="gid://shopify/MediaImage/skip-1",
+        cdn_url="https://cdn.shopify.com/skip.png",
+        delta_type=DeltaType.INITIAL,
+        status=BatchImageStatus.QUEUED,
+        current_prompt_step=0,
+    )
+    db_session.add(image)
+    db_session.commit()
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        b"\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    def fake_download(url: str):
+        path = tmp_path / "src.png"
+        path.write_bytes(png)
+        return path
+
+    monkeypatch.setattr(
+        "app.services.image_processor.download_shopify_cdn_to_temp",
+        fake_download,
+    )
+
+    class BoomClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("OpenAI Batch client must not be constructed")
+
+    monkeypatch.setattr(orch_mod, "OpenAIBatchClient", BoomClient)
+    monkeypatch.setattr(
+        orch_mod.OpenAIBatchOrchestrator,
+        "finalize_ready_images",
+        lambda self, *, worker_id: 0,
+    )
+    orch = orch_mod.OpenAIBatchOrchestrator(db_session)
+    stats = orch.tick(worker_id="skip-ai-test")
+    db_session.commit()
+
+    db_session.refresh(image)
+    db_session.refresh(batch)
+    assert stats["submitted"] == 1
+    assert stats["polled"] == 0
+    assert image.output_storage_key is not None
+    assert (tmp_path / image.output_storage_key).read_bytes() == png
+    assert image.status == BatchImageStatus.PROCESSING
+    assert image.current_prompt_step >= 1
+    assert db_session.query(OpenAIBatch).count() == 0
+    attempts = db_session.query(ProcessingAttempt).filter(ProcessingAttempt.batch_image_id == image.id).all()
+    assert attempts
+    assert attempts[0].provider == "skip_ai"
+    assert batch.status == BatchStatus.PROCESSING

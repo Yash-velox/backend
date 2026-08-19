@@ -28,6 +28,7 @@ def db_engine():
     settings.openai_batch_enabled = False
     settings.openai_allow_sync_fallback = True
     settings.openai_require_output_alpha = False
+    settings.skip_ai_provider_call = False
 
     engine = create_engine(
         "sqlite+pysqlite://",

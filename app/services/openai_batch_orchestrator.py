@@ -142,12 +142,21 @@ class OpenAIBatchOrchestrator:
         self._client = client
 
     def _client_or_create(self) -> OpenAIBatchClient:
+        from app.services.ai_provider import skip_ai_provider_call
+
+        if skip_ai_provider_call():
+            raise OpenAIBatchOrchestratorError(
+                "OpenAI client is disabled by SKIP_AI_PROVIDER_CALL",
+                code="SKIP_AI_PROVIDER_CALL",
+            )
         if self._client is None:
             self._client = OpenAIBatchClient()
         return self._client
 
     def tick(self, *, worker_id: str = "openai-batch-worker") -> dict[str, int]:
         """Restart-safe poll/submit/import/cleanup cycle."""
+        from app.services.ai_provider import skip_ai_provider_call
+
         stats = {
             "polled": 0,
             "imported": 0,
@@ -165,6 +174,15 @@ class OpenAIBatchOrchestrator:
             stats["errors"] += 1
             return stats
 
+        if skip_ai_provider_call():
+            logger.warning(
+                "SKIP_AI_PROVIDER_CALL=true | OpenAI submit/poll disabled; passthrough source images"
+            )
+            stats["reused"] = self._reuse_existing_generated_outputs()
+            stats["submitted"] = self.submit_ready_stages(worker_id=worker_id)
+            stats["finalized"] = self.finalize_ready_images(worker_id=worker_id)
+            return stats
+
         stats["polled"] = self.poll_inflight_batches()
         stats["reused"] = self._reuse_existing_generated_outputs()
         stats["submitted"] = self.submit_ready_stages(worker_id=worker_id)
@@ -174,6 +192,10 @@ class OpenAIBatchOrchestrator:
 
     # ------------------------------------------------------------------ poll
     def poll_inflight_batches(self) -> int:
+        from app.services.ai_provider import skip_ai_provider_call
+
+        if skip_ai_provider_call():
+            return 0
         rows = (
             self.db.query(OpenAIBatch)
             .filter(OpenAIBatch.status.in_(list(IN_FLIGHT_OPENAI_STATUSES - {OpenAIBatchStatus.DRAFT})))
@@ -658,7 +680,7 @@ class OpenAIBatchOrchestrator:
                 logger.exception("Stage submit failed | batch=%s", batch.id)
         return submitted
 
-    def _submit_next_stage(self, batch: ProcessingBatch, *, worker_id: str) -> OpenAIBatch | None:
+    def _submit_next_stage(self, batch: ProcessingBatch, *, worker_id: str) -> OpenAIBatch | bool | None:
         shop = self.db.get(Shop, batch.shop_id)
         if shop is None:
             return None
@@ -696,6 +718,12 @@ class OpenAIBatchOrchestrator:
             # batch does not remain stuck in QUEUED with no OpenAI work left.
             PrimaryBatchService(self.db, shop).refresh_batch_counters(batch)
             return None
+
+        from app.services.ai_provider import skip_ai_provider_call
+
+        if skip_ai_provider_call():
+            self._passthrough_ready_without_openai(batch, shop, ready, worker_id=worker_id)
+            return True
 
         # Prefer lowest step order; one step_type per OpenAI batch
         min_step = min(t.step_order for _, _, t in ready)
@@ -876,6 +904,161 @@ class OpenAIBatchOrchestrator:
         )
         return openai_batch
 
+    def _transition_image_to_processing(self, image: BatchImage) -> None:
+        if image.status == BatchImageStatus.QUEUED:
+            assert_transition(
+                "batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.DOWNLOADING
+            )
+            image.status = BatchImageStatus.DOWNLOADING
+        if image.status == BatchImageStatus.RETRYING:
+            assert_transition(
+                "batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.DOWNLOADING
+            )
+            image.status = BatchImageStatus.DOWNLOADING
+        if image.status == BatchImageStatus.DOWNLOADING:
+            assert_transition(
+                "batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.PROCESSING
+            )
+            image.status = BatchImageStatus.PROCESSING
+        if image.status == BatchImageStatus.WAITING_FOR_PROVIDER:
+            assert_transition(
+                "batch_image", BATCH_IMAGE_TRANSITIONS, image.status, BatchImageStatus.PROCESSING
+            )
+            image.status = BatchImageStatus.PROCESSING
+
+    def _passthrough_ready_without_openai(
+        self,
+        batch: ProcessingBatch,
+        shop: Shop,
+        ready: list[tuple[BatchProduct, BatchImage, StageTarget]],
+        *,
+        worker_id: str,
+    ) -> None:
+        """Load-test path: download Shopify source, skip OpenAI, save local PNG for Files upload."""
+        from pathlib import Path
+
+        from app.services.ai_provider import skip_ai_output_bytes
+        from app.services.image_processor import ProcessingError, download_shopify_cdn_to_temp
+
+        now = datetime.now(timezone.utc)
+        if batch.status == BatchStatus.QUEUED:
+            assert_transition("batch", BATCH_TRANSITIONS, batch.status, BatchStatus.PROCESSING)
+            batch.status = BatchStatus.PROCESSING
+            batch.started_at = batch.started_at or now
+
+        batch.processing_phase = ProcessingPhase.PREPARING_OPENAI_STAGE.value
+        storage = get_output_storage()
+
+        for product, image, target in ready:
+            if product.status == BatchProductStatus.QUEUED:
+                assert_transition(
+                    "batch_product",
+                    BATCH_PRODUCT_TRANSITIONS,
+                    product.status,
+                    BatchProductStatus.PROCESSING,
+                )
+                product.status = BatchProductStatus.PROCESSING
+                product.locked_by = worker_id
+                product.locked_at = now
+                product.claimed_at = product.claimed_at or now
+                product.started_at = product.started_at or now
+
+            attempt_number = next_processing_attempt_number(
+                self.db,
+                image.id,
+                start_from=max(image.attempt_count, 0) + 1,
+            )
+            self._transition_image_to_processing(image)
+            image.attempt_count = attempt_number
+            image.started_at = image.started_at or now
+
+            attempt = ProcessingAttempt(
+                batch_image_id=image.id,
+                batch_product_id=product.id,
+                attempt_number=attempt_number,
+                status=AttemptStatus.STARTED,
+                provider="skip_ai",
+                shopify_source_url=image.cdn_url,
+            )
+            self.db.add(attempt)
+            self.db.flush()
+
+            temp_path: Path | None = None
+            try:
+                if not image.cdn_url:
+                    raise ProcessingError("Missing Shopify CDN URL", code="INVALID_CDN_URL", retryable=False)
+                temp_path = download_shopify_cdn_to_temp(image.cdn_url)
+                output_bytes = skip_ai_output_bytes(temp_path.read_bytes())
+                key = f"{image.shop_id}/{product.batch_id}/{image.id}/output.png"
+                output_ref = storage.save_bytes(key=key, data=output_bytes, content_type="image/png")
+                image.output_storage_key = key
+                image.output_url = output_ref
+                image.output_mime_type = "image/png"
+                image.output_checksum = checksum_sha256(output_bytes)
+                steps = self._resolved_steps_for_image(image)
+                last_order = max((step.step_order for step in steps), default=target.step_order)
+                image.current_prompt_step = last_order
+                if any(
+                    getattr(step, "step_type", PromptStepType.IMAGE) == PromptStepType.DESCRIPTION
+                    for step in steps
+                ):
+                    image.pending_description_context = "skipped (SKIP_AI_PROVIDER_CALL)"
+                image.error_code = None
+                image.error_message = None
+                attempt.status = AttemptStatus.COMPLETED
+                attempt.output_storage_key = key
+                attempt.completed_at = datetime.now(timezone.utc)
+                logger.info(
+                    "Skipped OpenAI call | SKIP_AI_PROVIDER_CALL=true | image=%s primary=%s output_bytes=%s",
+                    image.id,
+                    batch.id,
+                    len(output_bytes),
+                )
+            except ProcessingError as exc:
+                attempt.status = AttemptStatus.FAILED
+                attempt.error_code = exc.code
+                attempt.error_message = str(exc)
+                attempt.completed_at = datetime.now(timezone.utc)
+                RetryService(self.db).schedule_image_retry(
+                    image,
+                    product,
+                    error_code=exc.code,
+                    error_message=str(exc),
+                    retryable=exc.retryable,
+                )
+            except Exception:
+                logger.exception("Skip-AI passthrough failed | image=%s", image.id)
+                attempt.status = AttemptStatus.FAILED
+                attempt.error_code = "PROCESSING_ERROR"
+                attempt.error_message = "Skip-AI passthrough failed"
+                attempt.completed_at = datetime.now(timezone.utc)
+                RetryService(self.db).schedule_image_retry(
+                    image,
+                    product,
+                    error_code="PROCESSING_ERROR",
+                    error_message="Skip-AI passthrough failed",
+                    retryable=True,
+                )
+            finally:
+                if temp_path is not None:
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except OSError:
+                        logger.warning("Failed to delete temp CDN file | path=%s", temp_path)
+
+            if product.prompt_snapshot_json is None:
+                try:
+                    resolved = PromptResolver(self.db, shop).resolve_for_product(
+                        self.db.get(Product, product.product_id) if product.product_id else None,
+                        image=image,
+                    )
+                    product.prompt_snapshot_json = PromptResolver(self.db, shop).to_snapshot(resolved)
+                except PromptResolverError:
+                    pass
+
+        PrimaryBatchService(self.db, shop).refresh_batch_counters(batch)
+        self.db.flush()
+
     # ------------------------------------------------------------- finalize
     def finalize_ready_images(self, *, worker_id: str) -> int:
         """Upload final local outputs to Shopify Files using existing processor path."""
@@ -924,6 +1107,10 @@ class OpenAIBatchOrchestrator:
         return count
 
     def cleanup_temporary_files(self) -> int:
+        from app.services.ai_provider import skip_ai_provider_call
+
+        if skip_ai_provider_call():
+            return 0
         now = datetime.now(timezone.utc)
         rows = (
             self.db.query(OpenAITemporaryFile)

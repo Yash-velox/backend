@@ -56,3 +56,15 @@ def test_prepare_output_png_allows_opaque_when_alpha_not_required(tmp_path, monk
     processor = ImageProcessor(db=MagicMock())
     meta = processor._prepare_output_png(MagicMock(), path)
     assert meta["has_alpha"] is False
+
+
+def test_prepare_output_png_allows_opaque_when_skip_ai(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "skip_ai_provider_call", True)
+    monkeypatch.setattr(settings, "openai_require_output_alpha", True)
+    monkeypatch.setattr(settings, "openai_transparent_background", True)
+    monkeypatch.setattr(settings, "openai_image_model", "gpt-image-1.5")
+    path = tmp_path / "out.png"
+    path.write_bytes(PNG_BYTES)
+    processor = ImageProcessor(db=MagicMock())
+    meta = processor._prepare_output_png(MagicMock(), path)
+    assert meta["has_alpha"] is False
