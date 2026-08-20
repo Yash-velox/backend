@@ -426,3 +426,172 @@ def test_skip_ai_passthrough_does_not_call_openai(db_session, shop, monkeypatch,
     assert attempts
     assert attempts[0].provider == "skip_ai"
     assert batch.status == BatchStatus.PROCESSING
+
+
+def test_image_stage_body_never_uses_openai_file_id():
+    """Batch /v1/images/edits must use a public URL, not vision file_ids (HTTP_401)."""
+    from app.models import BatchImage, BatchImageStatus, DeltaType
+    from app.models.enums import PromptStepType
+    from app.services.openai_batch_orchestrator import OpenAIBatchOrchestrator
+
+    image = BatchImage(
+        id=uuid4(),
+        batch_product_id=uuid4(),
+        shop_id=uuid4(),
+        shopify_media_gid="gid://shopify/MediaImage/1",
+        cdn_url="https://cdn.shopify.com/source.png",
+        source_fingerprint="fp",
+        delta_type=DeltaType.NEW,
+        status=BatchImageStatus.WAITING_FOR_PROVIDER,
+        current_openai_file_id="file-vision-should-be-ignored",
+        output_url="https://cdn.shopify.com/intermediate.png",
+    )
+    orch = OpenAIBatchOrchestrator.__new__(OpenAIBatchOrchestrator)
+    body = OpenAIBatchOrchestrator._build_body_for_image(
+        orch,
+        image=image,
+        step_type=PromptStepType.IMAGE,
+        model="gpt-image-1.5",
+        prompt="brighten",
+    )
+    assert body["images"][0]["image_url"] == "https://cdn.shopify.com/intermediate.png"
+    assert "file_id" not in body["images"][0]
+    assert body["_input_reference"] == "https://cdn.shopify.com/intermediate.png"
+
+
+def test_import_image_success_hosts_cdn_for_next_image_step(
+    db_session, shop, monkeypatch, tmp_path
+):
+    """After IMAGE step 1 with another IMAGE step remaining, host CDN and clear file_id."""
+    from app.models import (
+        BatchImage,
+        BatchImageStatus,
+        BatchProduct,
+        BatchProductStatus,
+        BatchStatus,
+        DeltaType,
+        ProcessingBatch,
+        Product,
+        TriggerType,
+    )
+    from app.models.enums import PromptStepType
+    from app.models.openai_batch import OpenAIBatch, OpenAIBatchRequest
+    from app.models.enums import OpenAIBatchRequestStatus, OpenAIBatchStatus
+    from app.services import openai_batch_orchestrator as orch_mod
+
+    monkeypatch.setattr(settings, "processing_output_directory", str(tmp_path))
+
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/seq-image",
+        title="Sequential",
+        product_type="Earrings",
+    )
+    db_session.add(product)
+    db_session.flush()
+    batch = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.AUTOMATIC,
+        status=BatchStatus.PROCESSING,
+        product_count=1,
+        image_count=1,
+        processing_phase="WAITING_FOR_OPENAI",
+    )
+    db_session.add(batch)
+    db_session.flush()
+    bp = BatchProduct(
+        batch_id=batch.id,
+        shop_id=shop.id,
+        shopify_product_gid=product.shopify_product_gid,
+        product_id=product.id,
+        status=BatchProductStatus.PROCESSING,
+        image_count=1,
+        prompt_snapshot_json=[
+            {"step": 1, "stepType": "IMAGE", "prompt": "step1"},
+            {"step": 2, "stepType": "IMAGE", "prompt": "step2"},
+        ],
+    )
+    db_session.add(bp)
+    db_session.flush()
+    image = BatchImage(
+        batch_product_id=bp.id,
+        shop_id=shop.id,
+        shopify_media_gid="gid://shopify/MediaImage/seq-1",
+        cdn_url="https://cdn.shopify.com/source.png",
+        source_fingerprint="fp-seq",
+        delta_type=DeltaType.NEW,
+        status=BatchImageStatus.WAITING_FOR_PROVIDER,
+        current_prompt_step=0,
+        current_openai_file_id=None,
+    )
+    db_session.add(image)
+    db_session.flush()
+    ob = OpenAIBatch(
+        shop_id=shop.id,
+        primary_batch_id=batch.id,
+        workflow_step_order=1,
+        step_type=PromptStepType.IMAGE,
+        endpoint="/v1/images/edits",
+        model="gpt-image-1.5",
+        openai_batch_id="batch_seq_1",
+        openai_output_file_id="file_out_seq",
+        status=OpenAIBatchStatus.COMPLETED,
+        request_count=1,
+    )
+    db_session.add(ob)
+    db_session.flush()
+    cid = make_custom_id(shop_id=shop.id, batch_image_id=image.id, step_order=1, attempt=1)
+    req = OpenAIBatchRequest(
+        openai_batch_id=ob.id,
+        custom_id=cid,
+        batch_image_id=image.id,
+        batch_product_id=bp.id,
+        source_media_gid=image.shopify_media_gid,
+        workflow_step_order=1,
+        attempt_number=1,
+        status=OpenAIBatchRequestStatus.SUBMITTED,
+    )
+    db_session.add(req)
+    db_session.commit()
+
+    png = b"\x89PNG\r\n\x1a\n" + b"1" * 32
+    b64 = base64.b64encode(png).decode("ascii")
+
+    class FakeClient:
+        def download_file_text(self, file_id: str) -> str:
+            return json.dumps(
+                {"custom_id": cid, "response": {"status_code": 200, "body": {"data": [{"b64_json": b64}]}}, "error": None}
+            ) + "\n"
+
+        def upload_vision_image(self, image_bytes: bytes, *, filename: str = "intermediate.png") -> str:
+            raise AssertionError("vision upload must not be used for IMAGE→IMAGE handoff")
+
+    orch = orch_mod.OpenAIBatchOrchestrator(db_session, client=FakeClient())
+    monkeypatch.setattr(
+        orch,
+        "_host_intermediate_image_url",
+        lambda image, image_bytes: "https://cdn.shopify.com/hosted-intermediate.png",
+    )
+    monkeypatch.setattr(orch, "_remaining_image_steps_after", lambda image, step_order: 1)
+    monkeypatch.setattr(orch, "_remaining_steps_after", lambda image, step_order: 1)
+    monkeypatch.setattr(orch, "_create_retry_batch", lambda parent, failed: None)
+
+    orch.import_batch_results(ob, FakeClient())
+    db_session.commit()
+    db_session.refresh(image)
+    db_session.refresh(req)
+
+    assert image.output_url == "https://cdn.shopify.com/hosted-intermediate.png"
+    assert image.current_openai_file_id is None
+    assert image.current_prompt_step == 1
+    assert req.status == OpenAIBatchRequestStatus.COMPLETED
+    assert req.output_reference == "https://cdn.shopify.com/hosted-intermediate.png"
+
+    body = orch._build_body_for_image(
+        image=image,
+        step_type=PromptStepType.IMAGE,
+        model="gpt-image-1.5",
+        prompt="step2",
+    )
+    assert body["images"][0]["image_url"] == "https://cdn.shopify.com/hosted-intermediate.png"
+    assert "file_id" not in body["images"][0]

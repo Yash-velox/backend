@@ -417,8 +417,20 @@ class OpenAIBatchOrchestrator:
             image.output_mime_type = "image/png"
             image.output_checksum = checksum_sha256(image_bytes)
 
-        if later_any > 0:
-            # Keep intermediate/final-image bytes available for later DESCRIPTION stages.
+        if later_image > 0:
+            # Batch /v1/images/edits rejects vision-purpose file_ids with HTTP_401
+            # "Unable to authorize file access". Host the intermediate on Shopify CDN
+            # and pass image_url into the next IMAGE stage (same as step 1).
+            cdn_url = self._host_intermediate_image_url(image, image_bytes)
+            image.output_url = cdn_url
+            image.output_mime_type = "image/png"
+            prev = image.current_openai_file_id
+            image.current_openai_file_id = None
+            if prev:
+                self._mark_temp_file_pending_delete(prev)
+            req.output_reference = cdn_url
+        elif later_any > 0:
+            # Later stages are DESCRIPTION (or non-image): vision file_id is correct.
             file_id = client.upload_vision_image(image_bytes)
             expires = datetime.now(timezone.utc) + timedelta(hours=settings.openai_temp_file_retention_hours)
             self.db.add(
@@ -1198,6 +1210,55 @@ class OpenAIBatchOrchestrator:
             product.locked_by = None
             product.locked_at = None
 
+    def _host_intermediate_image_url(self, image: BatchImage, image_bytes: bytes) -> str:
+        """Upload an intermediate PNG to Shopify Files and return a public CDN URL."""
+        from app.core.shop_resolver import create_shopify_graphql_client
+        from app.services.shopify_file_upload import PublishUploadError, ShopifyFileUploadService
+
+        shop = self.db.get(Shop, image.shop_id)
+        if shop is None:
+            raise OpenAIBatchOrchestratorError(
+                "Shop missing for intermediate image upload",
+                code="SHOP_NOT_FOUND",
+            )
+        storage = get_output_storage()
+        key = f"{image.shop_id}/intermediate/{image.id}/step_{image.current_prompt_step or 0}.png"
+        storage.save_bytes(key=key, data=image_bytes, content_type="image/png")
+        path = storage.resolve_path(key)
+        try:
+            client = create_shopify_graphql_client(self.db, shop)
+            result = ShopifyFileUploadService(client).upload_png(
+                path=path,
+                filename=f"aone-intermediate-{image.id}.png",
+                existing_file_gid=None,
+            )
+        except (PublishUploadError, RuntimeError) as exc:
+            code = getattr(exc, "code", None) or "INTERMEDIATE_UPLOAD_FAILED"
+            raise OpenAIBatchOrchestratorError(str(exc), code=str(code)) from exc
+        finally:
+            storage.delete(key)
+
+        cdn_url = (result or {}).get("cdn_url") if isinstance(result, dict) else None
+        if not cdn_url:
+            raise OpenAIBatchOrchestratorError(
+                "Intermediate Shopify upload returned no CDN URL",
+                code="INTERMEDIATE_CDN_MISSING",
+            )
+        logger.info(
+            "Hosted intermediate IMAGE step output on Shopify CDN | image=%s url=%s",
+            image.id,
+            cdn_url,
+        )
+        return str(cdn_url)
+
+    @staticmethod
+    def _public_image_url(image: BatchImage) -> str | None:
+        """Prefer intermediate HTTPS URL from a prior IMAGE step; else source CDN."""
+        for candidate in (image.output_url, image.generated_shopify_cdn_url, image.cdn_url):
+            if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+                return candidate
+        return None
+
     def _build_body_for_image(
         self,
         *,
@@ -1206,24 +1267,33 @@ class OpenAIBatchOrchestrator:
         model: str,
         prompt: str,
     ) -> dict[str, Any]:
-        file_id = image.current_openai_file_id
-        image_url = None if file_id else image.cdn_url
         if step_type == PromptStepType.IMAGE:
+            # Never send OpenAI vision file_ids into Batch images/edits (HTTP_401).
+            image_url = self._public_image_url(image)
+            if not image_url:
+                raise OpenAIBatchOrchestratorError(
+                    "No public image URL available for IMAGE batch step",
+                    code="IMAGE_URL_MISSING",
+                )
             body = build_image_edit_body(
                 model=model,
                 prompt=prompt,
                 image_url=image_url,
-                file_id=file_id,
+                file_id=None,
                 transparent_background=settings.openai_transparent_background,
             )
-        else:
-            body = build_description_body(
-                model=model,
-                prompt=prompt,
-                image_url=image_url,
-                file_id=file_id,
-                prior_description=image.pending_description_context,
-            )
+            body["_input_reference"] = image_url
+            return body
+
+        file_id = image.current_openai_file_id
+        image_url = None if file_id else self._public_image_url(image)
+        body = build_description_body(
+            model=model,
+            prompt=prompt,
+            image_url=image_url,
+            file_id=file_id,
+            prior_description=image.pending_description_context,
+        )
         body["_input_reference"] = file_id or image_url
         return body
 
