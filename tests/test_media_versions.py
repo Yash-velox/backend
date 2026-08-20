@@ -172,10 +172,21 @@ def test_search_products_with_versions(client, db_session, shop):
 
     res = client.get("/api/products/media-versions?search=Gold")
     assert res.status_code == 200
-    items = res.json()["data"]["items"]
+    payload = res.json()["data"]
+    items = payload["items"]
     assert len(items) == 1
     assert items[0]["productId"] == str(catalog.id)
     assert str(other.id) not in {i["productId"] for i in items}
+    assert payload["pagination"]["totalItems"] == 1
+    assert payload["pagination"]["page"] == 1
+    assert payload["pagination"]["pageSize"] == 10
+
+    paged = client.get("/api/products/media-versions?page=1&pageSize=1")
+    assert paged.status_code == 200
+    paged_data = paged.json()["data"]
+    assert len(paged_data["items"]) == 1
+    assert paged_data["pagination"]["totalItems"] == 1
+    assert paged_data["pagination"]["pageSize"] == 1
 
 
 def test_shop_isolation_versions(client, db_session, shop, SessionLocal):

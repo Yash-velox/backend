@@ -384,7 +384,15 @@ class MediaVersionsService:
         )
         return published
 
-    def search_products_with_versions(self, search: str | None = None, *, limit: int = 50) -> list[dict[str, Any]]:
+    def search_products_with_versions(
+        self,
+        search: str | None = None,
+        *,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> tuple[list[dict[str, Any]], int]:
+        page = max(1, page)
+        page_size = min(max(1, page_size), 100)
         q = (
             self.db.query(Product, ProductMediaVersion)
             .join(
@@ -402,7 +410,13 @@ class MediaVersionsService:
                 | (Product.handle.ilike(term))
                 | (Product.shopify_product_gid.ilike(term))
             )
-        rows = q.order_by(Product.title.asc()).limit(limit).all()
+        total = q.count()
+        rows = (
+            q.order_by(Product.title.asc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
         out: list[dict[str, Any]] = []
         for product, active in rows:
             media = (active.items_json or {}).get("media") or []
@@ -419,7 +433,7 @@ class MediaVersionsService:
                     "imageCount": len(media),
                 }
             )
-        return out
+        return out, total
 
     def mark_unavailable(self, version: ProductMediaVersion, reason: str) -> None:
         version.rollback_eligible = False

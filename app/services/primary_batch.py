@@ -21,6 +21,7 @@ from app.models import (
     ProcessingBaseline,
     ProcessingBatch,
     Product,
+    PublishStatus,
     SecondaryQueueItem,
     SecondaryQueueStatus,
     Shop,
@@ -1325,6 +1326,21 @@ class PrimaryBatchService:
             .all()
         )
         return items, total
+
+    def published_product_counts(self, batch_ids: list[UUID]) -> dict[UUID, int]:
+        if not batch_ids:
+            return {}
+        rows = (
+            self.db.query(BatchProduct.batch_id, func.count(BatchProduct.id))
+            .filter(
+                BatchProduct.shop_id == self.shop.id,
+                BatchProduct.batch_id.in_(batch_ids),
+                BatchProduct.publish_status == PublishStatus.PUBLISHED,
+            )
+            .group_by(BatchProduct.batch_id)
+            .all()
+        )
+        return {batch_id: int(count) for batch_id, count in rows}
 
     def get_batch(self, batch_id: UUID) -> ProcessingBatch | None:
         return (

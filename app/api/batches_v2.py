@@ -46,7 +46,7 @@ def _request_id(request: Request) -> str:
     return request.headers.get("x-request-id") or f"req_{uuid.uuid4().hex[:12]}"
 
 
-def _batch_out(batch) -> BatchOut:
+def _batch_out(batch, *, published_product_count: int = 0) -> BatchOut:
     return BatchOut(
         id=batch.id,
         triggerType=batch.trigger_type.value,
@@ -63,6 +63,7 @@ def _batch_out(batch) -> BatchOut:
         processingProductCount=batch.processing_product_count,
         completedProductCount=batch.completed_product_count,
         failedProductCount=batch.failed_product_count,
+        publishedProductCount=published_product_count,
         retryingProductCount=batch.retrying_product_count,
         settingsSnapshotJson=batch.settings_snapshot_json,
         errorSummary=batch.error_summary,
@@ -200,18 +201,23 @@ def list_batches(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"Invalid status: {status}") from exc
 
-    items, total = PrimaryBatchService(db, shop).list_batches(
+    svc = PrimaryBatchService(db, shop)
+    items, total = svc.list_batches(
         status=status_filter,
         page=page,
         page_size=pageSize,
     )
+    published_counts = svc.published_product_counts([b.id for b in items])
     total_pages = max(1, math.ceil(total / pageSize)) if total else 0
     return SuccessEnvelope(
         success=True,
         message="Batches retrieved successfully.",
         requestId=_request_id(request),
         data={
-            "items": [_batch_out(b).model_dump() for b in items],
+            "items": [
+                _batch_out(b, published_product_count=published_counts.get(b.id, 0)).model_dump()
+                for b in items
+            ],
             "pagination": PaginationMeta(
                 page=page,
                 pageSize=pageSize,
@@ -224,15 +230,17 @@ def list_batches(
 
 @router.get("/{batch_id}")
 def get_batch(batch_id: UUID, request: Request, db: DbSession, shop: CurrentShop):
-    batch = PrimaryBatchService(db, shop).get_batch(batch_id)
+    svc = PrimaryBatchService(db, shop)
+    batch = svc.get_batch(batch_id)
     if batch is None:
         raise HTTPException(status_code=404, detail="Batch not found")
 
+    published_count = svc.published_product_counts([batch.id]).get(batch.id, 0)
     return SuccessEnvelope(
         success=True,
         message="Batch retrieved successfully.",
         requestId=_request_id(request),
-        data=_batch_out(batch).model_dump(),
+        data=_batch_out(batch, published_product_count=published_count).model_dump(),
     )
 
 

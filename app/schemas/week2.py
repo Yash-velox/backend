@@ -119,6 +119,7 @@ class BatchOut(BaseModel):
     processingProductCount: int
     completedProductCount: int
     failedProductCount: int
+    publishedProductCount: int = 0
     retryingProductCount: int
     settingsSnapshotJson: dict[str, Any] | None = None
     errorSummary: str | None = None

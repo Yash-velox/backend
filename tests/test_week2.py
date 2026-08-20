@@ -283,8 +283,11 @@ def test_settings_validation(db_session, shop, monkeypatch):
     updated = svc.update(auto_sync_enabled=True, batch_interval_minutes=10)
     assert updated.auto_sync_enabled is True
     assert updated.batch_interval_minutes == 10
-    zero = svc.update(batch_interval_minutes=0)
-    assert zero.batch_interval_minutes == 0
+    try:
+        svc.update(batch_interval_minutes=0)
+        assert False
+    except SettingsValidationError:
+        pass
     try:
         svc.update(batch_interval_minutes=-1)
         assert False
@@ -1227,8 +1230,14 @@ def test_settings_api(client, shop, db_session):
         "/api/settings",
         json={"batchIntervalMinutes": 0},
     )
+    assert res.status_code == 400
+
+    res = client.put(
+        "/api/settings",
+        json={"batchIntervalMinutes": 1},
+    )
     assert res.status_code == 200
-    assert res.json()["data"]["batchIntervalMinutes"] == 0
+    assert res.json()["data"]["batchIntervalMinutes"] == 1
 
 
 def test_secondary_queue_api(client, shop, db_session):
@@ -1322,6 +1331,8 @@ def test_primary_batch_list_newest_first_page_size_seven(client, shop, db_sessio
     ids = [item["id"] for item in payload["items"]]
     assert ids[0] == str(newer.id)
     assert payload["pagination"]["pageSize"] == 7
+    assert payload["items"][0]["publishedProductCount"] == 0
+    assert "failedProductCount" in payload["items"][0]
 
 
 def test_manual_batch_api(client, shop, db_session):

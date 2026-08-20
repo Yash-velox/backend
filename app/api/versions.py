@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import uuid
 from uuid import UUID
 
@@ -10,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from app.core.deps import CurrentShop, DbSession
 from app.models import ProductMediaVersion, ProductRollbackOperation
-from app.schemas.week2 import ReprocessPromptStepIn, SuccessEnvelope
+from app.schemas.week2 import PaginationMeta, ReprocessPromptStepIn, SuccessEnvelope
 from app.services.media_versions import MediaVersionError, MediaVersionsService
 from app.services.primary_batch import PrimaryBatchService
 from app.services.product_rollback import RollbackError, ProductRollbackService
@@ -170,14 +171,37 @@ def search_products_with_versions(
     db: DbSession,
     shop: CurrentShop,
     search: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=100),
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(10, ge=1, le=100),
+    limit: int | None = Query(
+        default=None,
+        ge=1,
+        le=100,
+        description="Deprecated alias for pageSize (page 1). Prefer page + pageSize.",
+    ),
 ):
-    items = MediaVersionsService(db, shop).search_products_with_versions(search, limit=limit)
+    effective_page = 1 if limit is not None else page
+    effective_page_size = limit if limit is not None else pageSize
+    items, total = MediaVersionsService(db, shop).search_products_with_versions(
+        search,
+        page=effective_page,
+        page_size=effective_page_size,
+    )
+    total_pages = max(1, math.ceil(total / effective_page_size)) if total else 0
     return SuccessEnvelope(
         success=True,
         message="Products with media versions.",
         requestId=_request_id(request),
-        data={"items": items, "count": len(items)},
+        data={
+            "items": items,
+            "count": len(items),
+            "pagination": PaginationMeta(
+                page=effective_page,
+                pageSize=effective_page_size,
+                totalItems=total,
+                totalPages=total_pages,
+            ).model_dump(),
+        },
     )
 
 
