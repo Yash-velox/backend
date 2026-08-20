@@ -30,6 +30,7 @@ from app.models import (
 from app.services.catalog_sync import CatalogSyncService
 from app.services.delta import compare_media_snapshots
 from app.services.prompt_resolver import PromptResolverError, assert_product_prompts_ready
+from app.services.secondary_queue import PUBLISH_ECHO_SKIP_REASON, SecondaryQueueService
 from app.services.snapshot import media_snapshots_from_models, product_snapshot_from_model
 from app.services.state_machine import (
     BATCH_PRODUCT_TRANSITIONS,
@@ -879,6 +880,7 @@ class PrimaryBatchService:
         capacity = max(int(settings.auto_batch_product_limit), 1)
         touched_batches: dict[UUID, ProcessingBatch] = {}
         first_batch: ProcessingBatch | None = None
+        secondary_queue = SecondaryQueueService(self.db, self.shop)
 
         for item in items:
             try:
@@ -886,6 +888,17 @@ class PrimaryBatchService:
                 eligible_product = item.eligible_product_snapshot_json or {}
                 eligible_media = item.eligible_media_snapshot_json or []
                 product_gid = item.shopify_product_gid
+
+                if secondary_queue.is_publish_webhook_echo(product_gid, eligible_media):
+                    self._mark_secondary_skipped_no_delta(
+                        item,
+                        product=product,
+                        eligible_product=eligible_product,
+                        eligible_media=eligible_media,
+                        skip_reason=PUBLISH_ECHO_SKIP_REASON,
+                    )
+                    self.db.commit()
+                    continue
 
                 effective_baseline = self._effective_baseline_media(
                     product, product_gid, now=now

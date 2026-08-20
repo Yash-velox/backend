@@ -735,3 +735,256 @@ def test_advance_processing_baseline_after_publish(db_session, shop):
     gids = {m["media_gid"] for m in (baseline.media_snapshot_json or [])}
     assert gids == {"gid://shopify/MediaImage/999", "gid://shopify/MediaImage/11"}
     assert "gid://shopify/MediaImage/10" not in gids
+
+
+def _seed_published_operation(
+    db_session,
+    shop,
+    *,
+    pre_media: list[dict],
+    published_media: list[dict],
+    assets: list[dict],
+):
+    from datetime import datetime, timezone
+
+    product = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/publish-echo",
+        title="Echo Product",
+        status="ACTIVE",
+    )
+    db_session.add(product)
+    db_session.flush()
+
+    batch = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.MANUAL,
+        status=BatchStatus.COMPLETED,
+        product_count=1,
+        image_count=len(assets),
+    )
+    db_session.add(batch)
+    db_session.flush()
+
+    bp = BatchProduct(
+        batch_id=batch.id,
+        shop_id=shop.id,
+        product_id=product.id,
+        shopify_product_gid=product.shopify_product_gid,
+        status=BatchProductStatus.COMPLETED,
+        image_count=len(assets),
+        publish_status=PublishStatus.PUBLISHED,
+    )
+    db_session.add(bp)
+    db_session.flush()
+
+    db_session.add(
+        ProductPublishOperation(
+            shop_id=shop.id,
+            processing_batch_id=batch.id,
+            batch_product_id=bp.id,
+            shopify_product_gid=product.shopify_product_gid,
+            status=PublishStatus.PUBLISHED,
+            trigger_source=PublishTriggerSource.MANUAL,
+            idempotency_key=f"pub-echo-{uuid4()}",
+            completed_at=datetime.now(timezone.utc),
+            published_at=datetime.now(timezone.utc),
+            pre_publish_snapshot_json={"media": pre_media},
+            assets_json=assets,
+        )
+    )
+    db_session.add(
+        ProcessingBaseline(
+            shop_id=shop.id,
+            product_id=product.id,
+            media_snapshot_json=published_media,
+        )
+    )
+    db_session.commit()
+    return product
+
+
+def test_secondary_queue_skips_publish_echo_after_completed(db_session, shop):
+    from app.core.shop_resolver import ensure_shop_settings
+    from app.services.secondary_queue import SecondaryQueueService
+
+    ensure_shop_settings(db_session, shop)
+    pre = [
+        _media("gid://shopify/MediaImage/10", 0),
+        _media("gid://shopify/MediaImage/11", 1),
+        _media("gid://shopify/MediaImage/12", 2),
+        _media("gid://shopify/MediaImage/13", 3),
+    ]
+    published = [
+        _media("gid://shopify/MediaImage/999", 0, featured=True),
+        _media("gid://shopify/MediaImage/998", 1),
+        _media("gid://shopify/MediaImage/997", 2),
+        _media("gid://shopify/MediaImage/996", 3),
+    ]
+    assets = [
+        {
+            "shopify_file_gid": "gid://shopify/MediaImage/999",
+            "shopify_media_gid": "gid://shopify/MediaImage/999",
+            "shopify_cdn_url": "https://cdn.shopify.com/999.png",
+            "source_media_gid": "gid://shopify/MediaImage/10",
+        }
+    ]
+    product = _seed_published_operation(
+        db_session,
+        shop,
+        pre_media=pre,
+        published_media=published,
+        assets=assets,
+    )
+
+    result = SecondaryQueueService(db_session, shop).upsert_from_webhook(
+        product_gid=product.shopify_product_gid,
+        product_snapshot={
+            "product_gid": product.shopify_product_gid,
+            "title": "Echo Product",
+            "status": "ACTIVE",
+        },
+        media_snapshot=pre,
+        webhook_id="wh-after-publish-old-gallery",
+    )
+    assert result is None
+
+
+def test_secondary_queue_skips_mixed_publish_echo(db_session, shop):
+    from app.core.shop_resolver import ensure_shop_settings
+    from app.services.secondary_queue import SecondaryQueueService
+
+    ensure_shop_settings(db_session, shop)
+    pre = [_media("gid://shopify/MediaImage/10", 0), _media("gid://shopify/MediaImage/11", 1)]
+    published = [_media("gid://shopify/MediaImage/999", 0, featured=True), _media("gid://shopify/MediaImage/11", 1)]
+    assets = [
+        {
+            "shopify_file_gid": "gid://shopify/MediaImage/999",
+            "shopify_media_gid": "gid://shopify/MediaImage/999",
+            "shopify_cdn_url": "https://cdn.shopify.com/999.png",
+            "source_media_gid": "gid://shopify/MediaImage/10",
+        }
+    ]
+    product = _seed_published_operation(
+        db_session,
+        shop,
+        pre_media=pre,
+        published_media=published,
+        assets=assets,
+    )
+
+    result = SecondaryQueueService(db_session, shop).upsert_from_webhook(
+        product_gid=product.shopify_product_gid,
+        product_snapshot={
+            "product_gid": product.shopify_product_gid,
+            "title": "Echo Product",
+            "status": "ACTIVE",
+        },
+        media_snapshot=pre + [published[0]],
+        webhook_id="wh-after-publish-mixed",
+    )
+    assert result is None
+
+
+def test_secondary_queue_enqueues_new_image_after_publish(db_session, shop):
+    from app.core.shop_resolver import ensure_shop_settings
+    from app.services.secondary_queue import SecondaryQueueService
+
+    ensure_shop_settings(db_session, shop)
+    pre = [_media("gid://shopify/MediaImage/10", 0)]
+    published = [_media("gid://shopify/MediaImage/999", 0, featured=True)]
+    assets = [
+        {
+            "shopify_file_gid": "gid://shopify/MediaImage/999",
+            "shopify_media_gid": "gid://shopify/MediaImage/999",
+            "shopify_cdn_url": "https://cdn.shopify.com/999.png",
+            "source_media_gid": "gid://shopify/MediaImage/10",
+        }
+    ]
+    product = _seed_published_operation(
+        db_session,
+        shop,
+        pre_media=pre,
+        published_media=published,
+        assets=assets,
+    )
+
+    result = SecondaryQueueService(db_session, shop).upsert_from_webhook(
+        product_gid=product.shopify_product_gid,
+        product_snapshot={
+            "product_gid": product.shopify_product_gid,
+            "title": "Echo Product",
+            "status": "ACTIVE",
+        },
+        media_snapshot=[_media("gid://shopify/MediaImage/777", 0, alt="merchant-added")],
+        webhook_id="wh-after-publish-real-edit",
+    )
+    assert result is not None
+
+
+def test_publish_echo_skips_conversion_for_stale_pending_item(db_session, shop):
+    from datetime import datetime, timezone
+
+    from app.core.shop_resolver import ensure_shop_settings
+    from app.models import SecondaryQueueItem, SecondaryQueueStatus
+    from app.services.primary_batch import PrimaryBatchService
+    from app.services.secondary_queue import PUBLISH_ECHO_SKIP_REASON, SecondaryQueueService
+    from tests.test_week2 import _configure_central
+
+    ensure_shop_settings(db_session, shop)
+    _configure_central(db_session, shop)
+    pre = [
+        _media("gid://shopify/MediaImage/10", 0),
+        _media("gid://shopify/MediaImage/11", 1),
+    ]
+    published = [
+        _media("gid://shopify/MediaImage/999", 0, featured=True),
+        _media("gid://shopify/MediaImage/998", 1),
+    ]
+    assets = [
+        {
+            "shopify_file_gid": "gid://shopify/MediaImage/999",
+            "shopify_media_gid": "gid://shopify/MediaImage/999",
+            "shopify_cdn_url": "https://cdn.shopify.com/999.png",
+            "source_media_gid": "gid://shopify/MediaImage/10",
+        }
+    ]
+    product = _seed_published_operation(
+        db_session,
+        shop,
+        pre_media=pre,
+        published_media=published,
+        assets=assets,
+    )
+
+    now = datetime.now(timezone.utc)
+    item = SecondaryQueueItem(
+        shop_id=shop.id,
+        shopify_product_gid=product.shopify_product_gid,
+        product_id=product.id,
+        queue_revision=1,
+        status=SecondaryQueueStatus.PENDING,
+        eligible_product_snapshot_json={
+            "product_gid": product.shopify_product_gid,
+            "title": "Echo Product",
+            "status": "ACTIVE",
+        },
+        eligible_media_snapshot_json=pre,
+        first_queued_at=now,
+        last_queued_at=now,
+        latest_eligible_webhook_id="wh-stale-before-publish-echo",
+        webhook_count=1,
+    )
+    db_session.add(item)
+    db_session.commit()
+
+    assert SecondaryQueueService(db_session, shop).is_publish_webhook_echo(
+        product.shopify_product_gid,
+        pre,
+    )
+
+    batch = PrimaryBatchService(db_session, shop).convert_secondary_items([item])
+    assert batch is None
+    db_session.refresh(item)
+    assert item.status == SecondaryQueueStatus.SKIPPED_NO_ELIGIBLE_IMAGE_DELTA
+    assert item.skip_reason == PUBLISH_ECHO_SKIP_REASON

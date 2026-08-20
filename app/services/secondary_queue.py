@@ -31,6 +31,9 @@ _ACTIVE_PUBLISH_STATUSES = (PublishStatus.QUEUED, PublishStatus.PUBLISHING)
 _ACTIVE_ROLLBACK_STATUSES = (RollbackStatus.QUEUED, RollbackStatus.ROLLING_BACK)
 # Shopify often delivers products/update after rollback status is already ROLLED_BACK.
 _ROLLBACK_ECHO_WINDOW = timedelta(minutes=15)
+# Same pattern: async webhook intake can process products/update after PUBLISHED.
+_PUBLISH_ECHO_WINDOW = timedelta(minutes=15)
+PUBLISH_ECHO_SKIP_REASON = "Publish webhook echo (no new merchant media)"
 
 
 def _media_identity_keys(media_rows: list[Any] | None) -> set[str]:
@@ -43,6 +46,26 @@ def _media_identity_keys(media_rows: list[Any] | None) -> set[str]:
             if value:
                 keys.add(str(value))
         path = cdn_path_identity(row.get("cdn_url"))
+        if path:
+            keys.add(path)
+    return keys
+
+
+def _publish_asset_identity_keys(assets: list[Any] | None) -> set[str]:
+    keys: set[str] = set()
+    for asset in assets or []:
+        if not isinstance(asset, dict):
+            continue
+        for field in (
+            "shopify_file_gid",
+            "shopify_media_gid",
+            "source_media_gid",
+            "source_file_gid",
+        ):
+            value = asset.get(field)
+            if value:
+                keys.add(str(value))
+        path = cdn_path_identity(asset.get("shopify_cdn_url"))
         if path:
             keys.add(path)
     return keys
@@ -125,6 +148,21 @@ class SecondaryQueueService:
         )
         return row is not None
 
+    def _recent_completed_publish(self, product_gid: str) -> ProductPublishOperation | None:
+        cutoff = datetime.now(timezone.utc) - _PUBLISH_ECHO_WINDOW
+        return (
+            self.db.query(ProductPublishOperation)
+            .filter(
+                ProductPublishOperation.shop_id == self.shop.id,
+                ProductPublishOperation.shopify_product_gid == product_gid,
+                ProductPublishOperation.status == PublishStatus.PUBLISHED,
+                ProductPublishOperation.completed_at.is_not(None),
+                ProductPublishOperation.completed_at >= cutoff,
+            )
+            .order_by(ProductPublishOperation.completed_at.desc())
+            .first()
+        )
+
     def _recent_completed_rollback(self, product_gid: str) -> ProductRollbackOperation | None:
         cutoff = datetime.now(timezone.utc) - _ROLLBACK_ECHO_WINDOW
         return (
@@ -139,6 +177,59 @@ class SecondaryQueueService:
             .order_by(ProductRollbackOperation.completed_at.desc())
             .first()
         )
+
+    def is_publish_webhook_echo(self, product_gid: str, media_snapshot: list[dict]) -> bool:
+        """True when this webhook is Shopify catching up after our own Publish.
+
+        Late products/update can arrive after status is already PUBLISHED, sometimes still
+        showing pre-publish originals or a mix of old and new media. Those must not enter
+        the Secondary Queue. A media row whose GID/CDN is not in the publish set is treated
+        as a real merchant edit and still enqueues.
+        """
+        op = self._recent_completed_publish(product_gid)
+        if op is None:
+            return False
+
+        known = set()
+        pre = op.pre_publish_snapshot_json if isinstance(op.pre_publish_snapshot_json, dict) else {}
+        known |= _media_identity_keys(pre.get("media") if isinstance(pre.get("media"), list) else None)
+        known |= _publish_asset_identity_keys(op.assets_json if isinstance(op.assets_json, list) else None)
+
+        product = (
+            self.db.query(Product)
+            .filter(
+                Product.shop_id == self.shop.id,
+                Product.shopify_product_gid == product_gid,
+            )
+            .one_or_none()
+        )
+        if product is not None:
+            baseline = (
+                self.db.query(ProcessingBaseline)
+                .filter(
+                    ProcessingBaseline.shop_id == self.shop.id,
+                    ProcessingBaseline.product_id == product.id,
+                )
+                .one_or_none()
+            )
+            if baseline is not None:
+                known |= _media_identity_keys(
+                    baseline.media_snapshot_json if isinstance(baseline.media_snapshot_json, list) else None
+                )
+
+        if not media_snapshot:
+            return True
+        if not known:
+            return True
+        for row in media_snapshot:
+            if not isinstance(row, dict):
+                continue
+            row_keys = _media_identity_keys([row])
+            if not row_keys:
+                continue
+            if row_keys.isdisjoint(known):
+                return False
+        return True
 
     def _is_rollback_webhook_echo(self, product_gid: str, media_snapshot: list[dict]) -> bool:
         """True when this webhook is Shopify catching up after our own Revert.
@@ -253,6 +344,15 @@ class SecondaryQueueService:
         if self._is_rollback_webhook_echo(product_gid, media_snapshot):
             logger.info(
                 "Secondary queue skip rollback echo | shop=%s product=%s webhook=%s",
+                self.shop.id,
+                product_gid,
+                webhook_id,
+            )
+            return None
+
+        if self.is_publish_webhook_echo(product_gid, media_snapshot):
+            logger.info(
+                "Secondary queue skip publish echo | shop=%s product=%s webhook=%s",
                 self.shop.id,
                 product_gid,
                 webhook_id,
