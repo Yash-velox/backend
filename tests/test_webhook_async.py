@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from uuid import UUID
 
 from app.core.crypto import sign_internal_payload
+from app.core.shop_resolver import ensure_shop_settings
 from app.models import WebhookEvent, WebhookProcessingResult
 from app.services.webhook_intake import WebhookIntakeService
 
@@ -20,7 +21,14 @@ def _payload(product_id: int, title: str = "Webhook Product") -> dict:
     }
 
 
+def _enable_auto_sync(db_session, shop) -> None:
+    row = ensure_shop_settings(db_session, shop)
+    row.auto_sync_enabled = True
+    db_session.commit()
+
+
 def test_http_webhook_enqueues_without_shopify_fetch(client, shop, db_session, monkeypatch):
+    _enable_auto_sync(db_session, shop)
     monkeypatch.setattr("app.config.settings.internal_handoff_secret", "handoff-secret")
     monkeypatch.setattr("app.core.crypto.settings.internal_handoff_secret", "handoff-secret")
     body = {
@@ -52,7 +60,57 @@ def test_http_webhook_enqueues_without_shopify_fetch(client, shop, db_session, m
     assert event.shopify_product_gid == "gid://shopify/Product/101"
 
 
+def test_http_webhook_ignored_when_auto_sync_off(client, shop, db_session, monkeypatch):
+    ensure_shop_settings(db_session, shop)
+    db_session.commit()
+    monkeypatch.setattr("app.config.settings.internal_handoff_secret", "handoff-secret")
+    monkeypatch.setattr("app.core.crypto.settings.internal_handoff_secret", "handoff-secret")
+    body = {
+        "shop": shop.shop_domain,
+        "topic": "products/update",
+        "webhookId": "wh-http-autosync-off",
+        "payload": _payload(303),
+    }
+    raw = json.dumps(body).encode("utf-8")
+    ts, sig = sign_internal_payload(raw)
+    res = client.post(
+        "/internal/webhooks/products-update",
+        content=raw,
+        headers={"Content-Type": "application/json", "X-Timestamp": ts, "X-Signature": sig},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["processingResult"] == WebhookProcessingResult.IGNORED.value
+    db_session.expire_all()
+    event = db_session.get(WebhookEvent, UUID(data["eventId"]))
+    assert event is not None
+    assert event.error_summary == "Auto Sync disabled"
+    assert event.payload_json is None
+
+
+def test_process_event_ignores_when_auto_sync_turned_off(db_session, shop):
+    _enable_auto_sync(db_session, shop)
+    svc = WebhookIntakeService(db_session)
+    queued = svc.enqueue_products_update(
+        shop.shop_domain,
+        "wh-turn-off-midflight",
+        "products/update",
+        _payload(404),
+        "hash-mid",
+    )
+    assert queued.processing_result == WebhookProcessingResult.QUEUED
+
+    settings_row = ensure_shop_settings(db_session, shop)
+    settings_row.auto_sync_enabled = False
+    db_session.commit()
+
+    processed = svc.process_event(queued.id)
+    assert processed.processing_result == WebhookProcessingResult.IGNORED
+    assert processed.error_summary == "Auto Sync disabled"
+
+
 def test_http_webhook_dedupes_same_id(client, shop, db_session, monkeypatch):
+    _enable_auto_sync(db_session, shop)
     monkeypatch.setattr("app.config.settings.internal_handoff_secret", "handoff-secret")
     monkeypatch.setattr("app.core.crypto.settings.internal_handoff_secret", "handoff-secret")
     body = {
@@ -76,6 +134,7 @@ def test_http_webhook_dedupes_same_id(client, shop, db_session, monkeypatch):
 
 
 def test_claim_caps_global_concurrency(db_session, shop, monkeypatch):
+    _enable_auto_sync(db_session, shop)
     monkeypatch.setattr("app.config.settings.webhook_process_concurrency", 1)
     monkeypatch.setattr("app.config.settings.webhook_process_concurrency_per_shop", 2)
     monkeypatch.setattr("app.config.settings.webhook_claim_limit", 10)
@@ -104,6 +163,7 @@ def test_claim_caps_global_concurrency(db_session, shop, monkeypatch):
 
 
 def test_claim_caps_per_shop_and_coalesces_same_product(db_session, shop, monkeypatch):
+    _enable_auto_sync(db_session, shop)
     monkeypatch.setattr("app.config.settings.webhook_process_concurrency", 4)
     monkeypatch.setattr("app.config.settings.webhook_process_concurrency_per_shop", 1)
     monkeypatch.setattr("app.config.settings.webhook_claim_limit", 10)
@@ -136,6 +196,7 @@ def test_claim_caps_per_shop_and_coalesces_same_product(db_session, shop, monkey
 
 
 def test_process_event_runs_after_enqueue(db_session, shop, monkeypatch):
+    _enable_auto_sync(db_session, shop)
     graphql_node = {
         "id": "gid://shopify/Product/4243",
         "title": "Queued Ring",
@@ -205,6 +266,7 @@ def test_unknown_shop_is_ignored_without_queueing_work(db_session):
 
 
 def test_queue_metrics_reports_depth_lag_and_retries(db_session, shop, monkeypatch):
+    _enable_auto_sync(db_session, shop)
     monkeypatch.setattr("app.config.settings.webhook_queue_warn_depth", 1)
     monkeypatch.setattr("app.config.settings.webhook_lag_warn_seconds", 5)
     svc = WebhookIntakeService(db_session)
@@ -236,6 +298,7 @@ def test_queue_metrics_reports_depth_lag_and_retries(db_session, shop, monkeypat
 
 
 def test_health_live_ready_and_webhooks(client, shop, db_session):
+    _enable_auto_sync(db_session, shop)
     live = client.get("/health")
     assert live.status_code == 200
     assert live.json()["status"] == "ok"

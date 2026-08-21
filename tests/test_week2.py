@@ -1456,7 +1456,8 @@ def test_internal_install_hmac(client, monkeypatch, db_session):
 
 
 def test_webhook_dedupe(db_session, shop):
-    ensure_shop_settings(db_session, shop)
+    settings_row = ensure_shop_settings(db_session, shop)
+    settings_row.auto_sync_enabled = True
     db_session.commit()
     payload = {
         "admin_graphql_api_id": "gid://shopify/Product/999",
@@ -1492,7 +1493,8 @@ def test_webhook_dedupe(db_session, shop):
 
 def test_webhook_seeds_baseline_before_catalog_upsert_so_new_image_converts(db_session, shop, monkeypatch):
     """Adding an image with an empty ProcessingBaseline must convert, not skip."""
-    ensure_shop_settings(db_session, shop)
+    settings_row = ensure_shop_settings(db_session, shop)
+    settings_row.auto_sync_enabled = True
     product = Product(
         shop_id=shop.id,
         shopify_product_gid="gid://shopify/Product/4242",

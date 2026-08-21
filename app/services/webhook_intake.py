@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
 from app.core.shop_resolver import create_shopify_graphql_client, get_shop_by_domain
-from app.models import Product, Shop, WebhookEvent, WebhookProcessingResult
+from app.models import Product, Shop, ShopSettings, WebhookEvent, WebhookProcessingResult
 from app.services.catalog_sync import CatalogSyncService
 from app.services.primary_batch import PrimaryBatchService
 from app.services.secondary_queue import SecondaryQueueService
@@ -193,6 +193,17 @@ class WebhookIntakeService:
             result = WebhookProcessingResult.IGNORED
             error_summary = "Shop not found"
             stored_payload = None
+        elif not self._shop_auto_sync_enabled(shop.id):
+            # Merchant turned Auto Sync off: ACK but do not queue GraphQL / Secondary work.
+            result = WebhookProcessingResult.IGNORED
+            error_summary = "Auto Sync disabled"
+            stored_payload = None
+            logger.info(
+                "Webhook ignored; Auto Sync off | webhook_id=%s shop=%s product=%s",
+                webhook_id,
+                shop_domain,
+                product_gid,
+            )
         elif not product_gid or not _GID_PRODUCT_RE.match(product_gid):
             result = WebhookProcessingResult.FAILED
             error_summary = "Missing or invalid product GID in webhook payload"
@@ -463,6 +474,8 @@ class WebhookIntakeService:
         product_gid = event.shopify_product_gid
         if shop is None:
             return self._finish_event(event, WebhookProcessingResult.IGNORED, "Shop not found")
+        if not self._shop_auto_sync_enabled(shop.id):
+            return self._finish_event(event, WebhookProcessingResult.IGNORED, "Auto Sync disabled")
         if not product_gid or not _GID_PRODUCT_RE.match(product_gid):
             return self._finish_event(
                 event,
@@ -495,6 +508,14 @@ class WebhookIntakeService:
         self.db.commit()
         self.db.refresh(event)
         return event
+
+    def _shop_auto_sync_enabled(self, shop_id: UUID) -> bool:
+        row = (
+            self.db.query(ShopSettings)
+            .filter(ShopSettings.shop_id == shop_id)
+            .one_or_none()
+        )
+        return bool(row and row.auto_sync_enabled)
 
     def _get_by_webhook_id(self, webhook_id: str) -> WebhookEvent | None:
         return (
