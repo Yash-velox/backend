@@ -27,6 +27,13 @@ from app.services.state_machine import SECONDARY_TRANSITIONS, assert_transition
 
 logger = logging.getLogger("app.services.secondary_queue")
 
+# Terminal / done rows - safe to delete; PENDING + CLAIMED must remain.
+_PROCESSED_SECONDARY_STATUSES = (
+    SecondaryQueueStatus.CONVERTED,
+    SecondaryQueueStatus.SKIPPED_NO_ELIGIBLE_IMAGE_DELTA,
+    SecondaryQueueStatus.FAILED_CONVERSION,
+)
+
 _ACTIVE_PUBLISH_STATUSES = (PublishStatus.QUEUED, PublishStatus.PUBLISHING)
 _ACTIVE_ROLLBACK_STATUSES = (RollbackStatus.QUEUED, RollbackStatus.ROLLING_BACK)
 # Shopify often delivers products/update after rollback status is already ROLLED_BACK.
@@ -545,3 +552,75 @@ class SecondaryQueueService:
                 worker_id,
             )
         return items
+
+    def purge_processed(self) -> dict[str, int]:
+        """Delete converted / skipped / failed rows for this shop; keep PENDING and CLAIMED."""
+        return purge_processed_secondary_queue_items(self.db, shop_id=self.shop.id)
+
+
+def purge_processed_secondary_queue_items(
+    db: Session,
+    *,
+    shop_id: UUID | None = None,
+) -> dict[str, int]:
+    """Remove processed secondary-queue rows so only pending (and in-flight claimed) remain.
+
+    Deletes: CONVERTED, SKIPPED_NO_ELIGIBLE_IMAGE_DELTA, FAILED_CONVERSION.
+    Keeps: PENDING, CLAIMED.
+    """
+    filters = [SecondaryQueueItem.status.in_(_PROCESSED_SECONDARY_STATUSES)]
+    if shop_id is not None:
+        filters.append(SecondaryQueueItem.shop_id == shop_id)
+
+    count_rows = (
+        db.query(SecondaryQueueItem.status, func.count(SecondaryQueueItem.id))
+        .filter(*filters)
+        .group_by(SecondaryQueueItem.status)
+        .all()
+    )
+    by_status = {status.value: int(count) for status, count in count_rows}
+
+    deleted = (
+        db.query(SecondaryQueueItem)
+        .filter(*filters)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+
+    remaining_filters = [
+        SecondaryQueueItem.status.in_(
+            (SecondaryQueueStatus.PENDING, SecondaryQueueStatus.CLAIMED)
+        )
+    ]
+    if shop_id is not None:
+        remaining_filters.append(SecondaryQueueItem.shop_id == shop_id)
+    remaining = (
+        db.query(func.count(SecondaryQueueItem.id)).filter(*remaining_filters).scalar() or 0
+    )
+    pending_remaining = (
+        db.query(func.count(SecondaryQueueItem.id))
+        .filter(
+            *(
+                [SecondaryQueueItem.status == SecondaryQueueStatus.PENDING]
+                + ([SecondaryQueueItem.shop_id == shop_id] if shop_id is not None else [])
+            )
+        )
+        .scalar()
+        or 0
+    )
+
+    logger.info(
+        "Secondary queue purge processed | shop_id=%s deleted=%s by_status=%s remaining=%s",
+        shop_id,
+        deleted,
+        by_status,
+        remaining,
+    )
+    return {
+        "deleted": int(deleted),
+        "converted": by_status.get(SecondaryQueueStatus.CONVERTED.value, 0),
+        "skipped": by_status.get(SecondaryQueueStatus.SKIPPED_NO_ELIGIBLE_IMAGE_DELTA.value, 0),
+        "failed": by_status.get(SecondaryQueueStatus.FAILED_CONVERSION.value, 0),
+        "remaining": int(remaining),
+        "pendingRemaining": int(pending_remaining),
+    }

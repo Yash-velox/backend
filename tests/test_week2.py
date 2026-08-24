@@ -1274,6 +1274,88 @@ def test_secondary_queue_api(client, shop, db_session):
     assert item["storefrontUrl"] == "https://test-shop.myshopify.com/products/charm"
 
 
+def test_internal_purge_processed_secondary_queue(client, shop, db_session, monkeypatch):
+    monkeypatch.setattr("app.config.settings.internal_handoff_secret", "handoff-secret")
+    monkeypatch.setattr("app.core.crypto.settings.internal_handoff_secret", "handoff-secret")
+    now = datetime.now(timezone.utc)
+    db_session.add_all(
+        [
+            SecondaryQueueItem(
+                shop_id=shop.id,
+                shopify_product_gid="gid://shopify/Product/pending-1",
+                status=SecondaryQueueStatus.PENDING,
+                queue_revision=1,
+                webhook_count=1,
+                first_queued_at=now,
+                last_queued_at=now,
+            ),
+            SecondaryQueueItem(
+                shop_id=shop.id,
+                shopify_product_gid="gid://shopify/Product/claimed-1",
+                status=SecondaryQueueStatus.CLAIMED,
+                queue_revision=1,
+                webhook_count=1,
+                first_queued_at=now,
+                last_queued_at=now,
+            ),
+            SecondaryQueueItem(
+                shop_id=shop.id,
+                shopify_product_gid="gid://shopify/Product/converted-1",
+                status=SecondaryQueueStatus.CONVERTED,
+                queue_revision=1,
+                webhook_count=1,
+                first_queued_at=now,
+                last_queued_at=now,
+            ),
+            SecondaryQueueItem(
+                shop_id=shop.id,
+                shopify_product_gid="gid://shopify/Product/skipped-1",
+                status=SecondaryQueueStatus.SKIPPED_NO_ELIGIBLE_IMAGE_DELTA,
+                queue_revision=1,
+                webhook_count=1,
+                first_queued_at=now,
+                last_queued_at=now,
+            ),
+            SecondaryQueueItem(
+                shop_id=shop.id,
+                shopify_product_gid="gid://shopify/Product/failed-1",
+                status=SecondaryQueueStatus.FAILED_CONVERSION,
+                queue_revision=1,
+                webhook_count=1,
+                first_queued_at=now,
+                last_queued_at=now,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    raw = json.dumps({"shop": shop.shop_domain}).encode("utf-8")
+    ts, sig = sign_internal_payload(raw)
+    res = client.post(
+        "/internal/secondary-queue/purge-processed",
+        content=raw,
+        headers={"Content-Type": "application/json", "X-Timestamp": ts, "X-Signature": sig},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["deleted"] == 3
+    assert data["converted"] == 1
+    assert data["skipped"] == 1
+    assert data["failed"] == 1
+    assert data["pendingRemaining"] == 1
+    assert data["remaining"] == 2
+
+    remaining = (
+        db_session.query(SecondaryQueueItem)
+        .filter(SecondaryQueueItem.shop_id == shop.id)
+        .all()
+    )
+    assert {item.status for item in remaining} == {
+        SecondaryQueueStatus.PENDING,
+        SecondaryQueueStatus.CLAIMED,
+    }
+
+
 def test_secondary_queue_list_newest_first_page_size_seven(client, shop, db_session):
     ensure_shop_settings(db_session, shop)
     now = datetime.now(timezone.utc)

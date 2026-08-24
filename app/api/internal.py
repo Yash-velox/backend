@@ -11,8 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.crypto import verify_internal_signature, verify_shopify_webhook_hmac
 from app.core.deps import DbSession
-from app.core.shop_resolver import mark_shop_uninstalled, upsert_shop_install
+from app.core.shop_resolver import get_shop_by_domain, mark_shop_uninstalled, upsert_shop_install
 from app.schemas.week2 import SuccessEnvelope
+from app.services.secondary_queue import purge_processed_secondary_queue_items
 from app.services.webhook_intake import WebhookIntakeService
 
 router = APIRouter(prefix="/internal", tags=["internal"])
@@ -32,6 +33,13 @@ class ShopInstallRequest(BaseModel):
 
 class ShopUninstallRequest(BaseModel):
     shop: str
+
+
+class SecondaryQueuePurgeRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    # Optional shop domain. When omitted, purge processed rows for every shop.
+    shop: str | None = None
 
 
 class WebhookProductsUpdateRequest(BaseModel):
@@ -155,6 +163,48 @@ async def shop_uninstall(request: Request, db: DbSession):
         message="Shop uninstalled successfully.",
         requestId=_request_id(request),
         data={"shop": shop.shop_domain, "status": shop.status.value},
+    )
+
+
+@router.post("/secondary-queue/purge-processed")
+async def purge_processed_secondary_queue(request: Request, db: DbSession):
+    """Private ops API: delete converted / skipped / failed secondary-queue rows.
+
+    Keeps PENDING (and in-flight CLAIMED). Optional body ``{"shop": "..."}`` scopes
+    to one shop; omit shop to purge across all tenants.
+    """
+    body = await request.body()
+    _require_internal_signature(request, body)
+
+    shop_domain: str | None = None
+    if body.strip():
+        try:
+            payload = SecondaryQueuePurgeRequest.model_validate(json.loads(body))
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid purge payload") from exc
+        shop_domain = payload.shop.strip().lower() if payload.shop else None
+
+    shop_id = None
+    if shop_domain:
+        shop = get_shop_by_domain(db, shop_domain)
+        if shop is None:
+            raise HTTPException(status_code=404, detail="Shop not found")
+        shop_id = shop.id
+
+    stats = purge_processed_secondary_queue_items(db, shop_id=shop_id)
+    return SuccessEnvelope(
+        success=True,
+        message="Processed secondary queue items purged successfully.",
+        requestId=_request_id(request),
+        data={
+            "shop": shop_domain,
+            "deleted": stats["deleted"],
+            "converted": stats["converted"],
+            "skipped": stats["skipped"],
+            "failed": stats["failed"],
+            "remaining": stats["remaining"],
+            "pendingRemaining": stats["pendingRemaining"],
+        },
     )
 
 
