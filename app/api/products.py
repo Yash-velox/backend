@@ -6,12 +6,12 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
-from sqlalchemy import exists, func, or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.core.deps import CurrentShop, DbSession
-from app.models import Product, ProductMedia
+from app.models import Product
 from app.schemas.week2 import SuccessEnvelope
 
 router = APIRouter(prefix="/api/products", tags=["products"])
@@ -35,18 +35,6 @@ def _thumbnail_url(product: Product) -> str | None:
         return None
     visible.sort(key=lambda m: (0 if m.is_primary else 1, m.position if m.position is not None else 10_000))
     return visible[0].cdn_url
-
-
-def _eligible_media_exists(shop_id):
-    """Same eligibility as PrimaryBatchService.create_manual_batch visible_media."""
-    return exists().where(
-        ProductMedia.product_id == Product.id,
-        ProductMedia.shop_id == shop_id,
-        ProductMedia.is_active.is_(True),
-        ProductMedia.is_visible.is_(True),
-        ProductMedia.cdn_url.isnot(None),
-        ProductMedia.cdn_url != "",
-    )
 
 
 def _filtered_products_query(
@@ -74,10 +62,11 @@ def _filtered_products_query(
         query = query.filter(func.lower(func.trim(Product.product_type)) == wanted)
     if status and status.strip():
         query = query.filter(Product.status == status.strip().upper())
+    # Denormalized at catalog sync (products.has_images).
     if has_images is True:
-        query = query.filter(_eligible_media_exists(shop_id))
+        query = query.filter(Product.has_images.is_(True))
     elif has_images is False:
-        query = query.filter(~_eligible_media_exists(shop_id))
+        query = query.filter(Product.has_images.is_(False))
     return query
 
 

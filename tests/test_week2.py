@@ -1518,7 +1518,7 @@ def test_catalog_products_list_and_select_all(client, shop, db_session):
 
 
 def test_catalog_products_has_images_filter(client, shop, db_session):
-    """Picker eligibility: hasImages matches manual-batch visible_media rule."""
+    """Picker eligibility: hasImages uses products.has_images set at catalog sync."""
     with_media = Product(
         shop_id=shop.id,
         shopify_product_gid="gid://shopify/Product/2001",
@@ -1526,6 +1526,7 @@ def test_catalog_products_has_images_filter(client, shop, db_session):
         product_type="Shoes",
         status="ACTIVE",
         is_deleted=False,
+        has_images=True,
     )
     no_media = Product(
         shop_id=shop.id,
@@ -1534,6 +1535,7 @@ def test_catalog_products_has_images_filter(client, shop, db_session):
         product_type="Shoes",
         status="ACTIVE",
         is_deleted=False,
+        has_images=False,
     )
     inactive_only = Product(
         shop_id=shop.id,
@@ -1542,6 +1544,7 @@ def test_catalog_products_has_images_filter(client, shop, db_session):
         product_type="Shoes",
         status="ACTIVE",
         is_deleted=False,
+        has_images=False,
     )
     empty_cdn = Product(
         shop_id=shop.id,
@@ -1550,6 +1553,7 @@ def test_catalog_products_has_images_filter(client, shop, db_session):
         product_type="Shoes",
         status="ACTIVE",
         is_deleted=False,
+        has_images=False,
     )
     db_session.add_all([with_media, no_media, inactive_only, empty_cdn])
     db_session.flush()
@@ -1607,6 +1611,65 @@ def test_catalog_products_has_images_filter(client, shop, db_session):
     without = client.get("/api/products?productType=Shoes&hasImages=false")
     assert without.status_code == 200
     assert without.json()["data"]["total"] == 3
+
+
+def test_catalog_sync_sets_has_images_flag(shop, db_session):
+    """Product sync writes has_images from eligible media."""
+    from app.services.catalog_sync import CatalogSyncService
+
+    svc = CatalogSyncService(db_session, shop)
+    with_img = svc.upsert_product_from_shopify_node(
+        {
+            "id": "gid://shopify/Product/3001",
+            "title": "Synced With Image",
+            "handle": "synced-with",
+            "status": "ACTIVE",
+            "productType": "Shoes",
+            "media": {
+                "nodes": [
+                    {
+                        "id": "gid://shopify/MediaImage/3001",
+                        "alt": None,
+                        "mimeType": "image/png",
+                        "image": {
+                            "url": "https://cdn.shopify.com/synced.png",
+                            "width": 100,
+                            "height": 100,
+                        },
+                    }
+                ]
+            },
+            "variants": {"nodes": []},
+        }
+    )
+    assert with_img.has_images is True
+
+    no_img = svc.upsert_product_from_shopify_node(
+        {
+            "id": "gid://shopify/Product/3002",
+            "title": "Synced Empty",
+            "handle": "synced-empty",
+            "status": "ACTIVE",
+            "productType": "Shoes",
+            "media": {"nodes": []},
+            "variants": {"nodes": []},
+        }
+    )
+    assert no_img.has_images is False
+
+    # Removing all media on re-sync clears the flag.
+    cleared = svc.upsert_product_from_shopify_node(
+        {
+            "id": "gid://shopify/Product/3001",
+            "title": "Synced With Image",
+            "handle": "synced-with",
+            "status": "ACTIVE",
+            "productType": "Shoes",
+            "media": {"nodes": []},
+            "variants": {"nodes": []},
+        }
+    )
+    assert cleared.has_images is False
 
 
 def test_internal_install_hmac(client, monkeypatch, db_session):

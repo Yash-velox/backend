@@ -178,8 +178,26 @@ class CatalogSyncService:
         self._upsert_variants(product, variants_data, now)
         self._upsert_media(product, media_data, now)
         self.db.flush()
+        self._refresh_has_images(product)
+        self.db.flush()
         self.db.refresh(product)
         return product
+
+    def _refresh_has_images(self, product: Product) -> None:
+        """Set products.has_images from eligible media (same rule as manual batch / picker)."""
+        has = (
+            self.db.query(ProductMedia.id)
+            .filter(
+                ProductMedia.product_id == product.id,
+                ProductMedia.is_active.is_(True),
+                ProductMedia.is_visible.is_(True),
+                ProductMedia.cdn_url.isnot(None),
+                ProductMedia.cdn_url != "",
+            )
+            .first()
+            is not None
+        )
+        product.has_images = has
 
     def _upsert_variants(self, product: Product, variants_data: list[dict[str, Any]], now: datetime) -> None:
         seen_gids: set[str] = set()

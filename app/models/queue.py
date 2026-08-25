@@ -126,6 +126,7 @@ class Product(Base):
         UniqueConstraint("shop_id", "shopify_product_gid", name="uq_products_shop_gid"),
         Index("ix_products_shop_updated", "shop_id", "shopify_updated_at"),
         Index("ix_products_shop_status", "shop_id", "status"),
+        Index("ix_products_shop_has_images", "shop_id", "has_images"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -145,6 +146,8 @@ class Product(Base):
     shopify_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     raw_snapshot_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Set at catalog sync: True when product has eligible visible media (active + visible + cdn_url).
+    has_images: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
