@@ -1517,6 +1517,98 @@ def test_catalog_products_list_and_select_all(client, shop, db_session):
     assert set(types.json()["data"]["items"]) >= {"Rings", "Charms"}
 
 
+def test_catalog_products_has_images_filter(client, shop, db_session):
+    """Picker eligibility: hasImages matches manual-batch visible_media rule."""
+    with_media = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/2001",
+        title="Boot With Image",
+        product_type="Shoes",
+        status="ACTIVE",
+        is_deleted=False,
+    )
+    no_media = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/2002",
+        title="Boot Empty",
+        product_type="Shoes",
+        status="ACTIVE",
+        is_deleted=False,
+    )
+    inactive_only = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/2003",
+        title="Boot Inactive Media",
+        product_type="Shoes",
+        status="ACTIVE",
+        is_deleted=False,
+    )
+    empty_cdn = Product(
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/2004",
+        title="Boot Empty CDN",
+        product_type="Shoes",
+        status="ACTIVE",
+        is_deleted=False,
+    )
+    db_session.add_all([with_media, no_media, inactive_only, empty_cdn])
+    db_session.flush()
+    db_session.add_all(
+        [
+            ProductMedia(
+                shop_id=shop.id,
+                product_id=with_media.id,
+                shopify_media_gid="gid://shopify/MediaImage/2001",
+                cdn_url="https://cdn.shopify.com/boot.png",
+                is_visible=True,
+                is_active=True,
+                position=1,
+            ),
+            ProductMedia(
+                shop_id=shop.id,
+                product_id=inactive_only.id,
+                shopify_media_gid="gid://shopify/MediaImage/2003",
+                cdn_url="https://cdn.shopify.com/inactive.png",
+                is_visible=True,
+                is_active=False,
+                position=1,
+            ),
+            ProductMedia(
+                shop_id=shop.id,
+                product_id=empty_cdn.id,
+                shopify_media_gid="gid://shopify/MediaImage/2004",
+                cdn_url="",
+                is_visible=True,
+                is_active=True,
+                position=1,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    all_listed = client.get("/api/products?productType=Shoes")
+    assert all_listed.status_code == 200
+    assert all_listed.json()["data"]["total"] == 4
+
+    with_images = client.get("/api/products?productType=Shoes&hasImages=true")
+    assert with_images.status_code == 200, with_images.text
+    data = with_images.json()["data"]
+    assert data["total"] == 1
+    assert data["items"][0]["shopifyProductGid"] == "gid://shopify/Product/2001"
+    assert data["items"][0]["imageUrl"] == "https://cdn.shopify.com/boot.png"
+
+    gids = client.get("/api/products/matching-gids?productType=Shoes&hasImages=true")
+    assert gids.status_code == 200
+    payload = gids.json()["data"]
+    assert payload["total"] == 1
+    assert payload["returned"] == 1
+    assert payload["items"][0]["shopifyProductGid"] == "gid://shopify/Product/2001"
+
+    without = client.get("/api/products?productType=Shoes&hasImages=false")
+    assert without.status_code == 200
+    assert without.json()["data"]["total"] == 3
+
+
 def test_internal_install_hmac(client, monkeypatch, db_session):
     monkeypatch.setattr("app.config.settings.internal_handoff_secret", "handoff-secret")
     monkeypatch.setattr("app.core.crypto.settings.internal_handoff_secret", "handoff-secret")
