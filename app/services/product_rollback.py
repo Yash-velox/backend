@@ -452,13 +452,6 @@ class ProductRollbackService:
             .one_or_none()
         )
         if existing:
-            if existing.status == RollbackStatus.ROLLED_BACK:
-                return {
-                    "operationId": str(existing.id),
-                    "status": existing.status.value,
-                    "message": "Rollback already completed",
-                    "alreadyCompleted": True,
-                }
             if existing.status in ACTIVE_ROLLBACK_STATUSES_LOCAL:
                 return {
                     "operationId": str(existing.id),
@@ -466,7 +459,17 @@ class ProductRollbackService:
                     "message": "Rollback already queued",
                     "alreadyQueued": True,
                 }
-            if existing.status in RETRYABLE_ROLLBACK_STATUSES:
+            # Same from→target key after a prior success or failure: merchant may have
+            # switched away (e.g. revert to published, then original again). Target is
+            # not active here (VERSION_ALREADY_ACTIVE already returned above).
+            if (
+                existing.status == RollbackStatus.ROLLED_BACK
+                or existing.status in RETRYABLE_ROLLBACK_STATUSES
+            ):
+                prior_success = existing.status == RollbackStatus.ROLLED_BACK
+                existing.from_version_id = active.id
+                existing.target_version_id = target.id
+                existing.result_version_id = None
                 existing.status = RollbackStatus.QUEUED
                 existing.current_stage = "QUEUED"
                 existing.attempt_number = (existing.attempt_number or 1) + 1
@@ -478,11 +481,13 @@ class ProductRollbackService:
                 existing.last_error_message = None
                 existing.locked_by = None
                 existing.locked_at = None
+                existing.pre_rollback_snapshot_json = None
                 if force_despite_conflict:
-                    # Keep prior conflict details for audit; mark force intent.
                     details = dict(existing.conflict_details or {})
                     details["forceRequested"] = True
                     existing.conflict_details = details
+                elif prior_success:
+                    existing.conflict_details = None
                 self.db.commit()
                 return {
                     "operationId": str(existing.id),
@@ -490,9 +495,14 @@ class ProductRollbackService:
                     "message": (
                         "Rollback force retry queued"
                         if force_despite_conflict
-                        else "Rollback retry queued"
+                        else (
+                            "Rollback re-queued"
+                            if prior_success
+                            else "Rollback retry queued"
+                        )
                     ),
                     "retried": True,
+                    "requeuedAfterPriorSuccess": prior_success,
                     "forceDespiteConflict": bool(force_despite_conflict),
                 }
 

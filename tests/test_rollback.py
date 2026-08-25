@@ -95,6 +95,53 @@ def test_rollback_requires_confirm(db_session, shop):
         assert exc.code == "ROLLBACK_CONFIRM_REQUIRED"
 
 
+def test_enqueue_requeues_same_target_after_prior_success(db_session, shop):
+    """A→B then B→A then A→B again must not short-circuit as alreadyCompleted."""
+    from app.services.product_rollback import build_rollback_idempotency_key
+
+    product, original, published = _seed_product_with_versions(db_session, shop)
+    key = build_rollback_idempotency_key(
+        shop_id=shop.id,
+        shopify_product_gid=product.shopify_product_gid,
+        from_version_id=published.id,
+        target_version_id=original.id,
+    )
+    # Simulate: published→original already completed, then original→published
+    # left published active again (same as prod St Jude product).
+    MediaVersionsService(db_session, shop).activate_existing_version(original)
+    db_session.add(
+        ProductRollbackOperation(
+            shop_id=shop.id,
+            product_id=product.id,
+            shopify_product_gid=product.shopify_product_gid,
+            from_version_id=published.id,
+            target_version_id=original.id,
+            status=RollbackStatus.ROLLED_BACK,
+            idempotency_key=key,
+            current_stage="ROLLED_BACK",
+            attempt_number=1,
+        )
+    )
+    MediaVersionsService(db_session, shop).activate_existing_version(published)
+    db_session.commit()
+
+    svc = ProductRollbackService(db_session, shop, client=MagicMock())
+    out = svc.enqueue(product_id=product.id, target_version_id=original.id, confirm=True)
+
+    assert out["status"] == RollbackStatus.QUEUED.value
+    assert out.get("requeuedAfterPriorSuccess") is True
+    assert "alreadyCompleted" not in out
+    op = (
+        db_session.query(ProductRollbackOperation)
+        .filter(ProductRollbackOperation.idempotency_key == key)
+        .one()
+    )
+    assert op.status == RollbackStatus.QUEUED
+    assert op.attempt_number == 2
+    assert op.from_version_id == published.id
+    assert op.target_version_id == original.id
+
+
 def test_publish_and_rollback_cannot_run_concurrently(db_session, shop):
     product, original, _published = _seed_product_with_versions(db_session, shop)
 
