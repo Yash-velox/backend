@@ -1863,6 +1863,115 @@ def test_webhook_seeds_baseline_before_catalog_upsert_so_new_image_converts(db_s
     assert images[0].shopify_media_gid.endswith("/101")
 
 
+def test_create_then_update_first_ingest_converts_images(db_session, shop, monkeypatch):
+    """Regression: Shopify create+update must not skip all images as 'no delta'."""
+    settings_row = ensure_shop_settings(db_session, shop)
+    settings_row.auto_sync_enabled = True
+    db_session.commit()
+    _configure_product_type(db_session, shop, "Rings")
+
+    graphql_node = {
+        "id": "gid://shopify/Product/7777",
+        "title": "Brand New Ring",
+        "status": "ACTIVE",
+        "productType": "Rings",
+        "handle": "brand-new-ring",
+        "tags": [],
+        "featuredMedia": {"id": "gid://shopify/MediaImage/7001"},
+        "media": {
+            "nodes": [
+                {
+                    "id": "gid://shopify/MediaImage/7001",
+                    "mediaContentType": "IMAGE",
+                    "alt": None,
+                    "image": {
+                        "url": "https://cdn.shopify.com/new-ring.png",
+                        "width": 100,
+                        "height": 100,
+                    },
+                }
+            ]
+        },
+        "variants": {"nodes": []},
+    }
+    mock_client = MagicMock()
+    mock_client.fetch_product_by_gid.return_value = graphql_node
+    monkeypatch.setattr(
+        "app.services.webhook_intake.create_shopify_graphql_client",
+        lambda _db, _shop: mock_client,
+    )
+
+    payload = {
+        "admin_graphql_api_id": "gid://shopify/Product/7777",
+        "id": 7777,
+        "title": "Brand New Ring",
+        "status": "active",
+        "product_type": "Rings",
+        "images": [
+            {"id": 7001, "src": "https://cdn.shopify.com/new-ring.png", "width": 100, "height": 100},
+        ],
+    }
+    svc = WebhookIntakeService(db_session)
+    create_event = svc.record_and_process_products_update(
+        shop_domain=shop.shop_domain,
+        webhook_id="wh-create-7777",
+        topic="products/create",
+        payload=payload,
+        raw_hash="hash-create-7777",
+    )
+    assert create_event.processing_result == WebhookProcessingResult.ACCEPTED
+
+    product = (
+        db_session.query(Product)
+        .filter(Product.shopify_product_gid == "gid://shopify/Product/7777")
+        .one()
+    )
+    baseline_after_create = (
+        db_session.query(ProcessingBaseline)
+        .filter(ProcessingBaseline.product_id == product.id)
+        .one()
+    )
+    assert baseline_after_create.media_snapshot_json == []
+
+    update_event = svc.record_and_process_products_update(
+        shop_domain=shop.shop_domain,
+        webhook_id="wh-update-7777",
+        topic="products/update",
+        payload=payload,
+        raw_hash="hash-update-7777",
+    )
+    assert update_event.processing_result == WebhookProcessingResult.ACCEPTED
+
+    db_session.refresh(baseline_after_create)
+    # Follow-up update must not freeze create media into the baseline.
+    assert baseline_after_create.media_snapshot_json == []
+
+    pending = (
+        db_session.query(SecondaryQueueItem)
+        .filter(
+            SecondaryQueueItem.shop_id == shop.id,
+            SecondaryQueueItem.shopify_product_gid == "gid://shopify/Product/7777",
+            SecondaryQueueItem.status == SecondaryQueueStatus.PENDING,
+        )
+        .one()
+    )
+    assert pending.webhook_count == 2
+    pending.status = SecondaryQueueStatus.CLAIMED
+    pending.claimed_by = "worker_test"
+    pending.claimed_at = datetime.now(timezone.utc)
+    db_session.commit()
+
+    batch = PrimaryBatchService(db_session, shop).convert_secondary_items([pending])
+    assert batch is not None
+    db_session.refresh(pending)
+    assert pending.status == SecondaryQueueStatus.CONVERTED
+    assert pending.skip_reason is None
+    images = db_session.query(BatchImage).filter(BatchImage.shop_id == shop.id).all()
+    assert len(images) == 1
+    assert images[0].delta_type == DeltaType.NEW
+    assert images[0].shopify_media_gid.endswith("/7001")
+
+
 def test_batch_image_output_endpoint(client, db_session, shop, tmp_path):
     batch = ProcessingBatch(
         shop_id=shop.id,

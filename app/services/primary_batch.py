@@ -27,6 +27,8 @@ from app.models import (
     Shop,
     ShopSettings,
     TriggerType,
+    WebhookEvent,
+    WebhookProcessingResult,
 )
 from app.services.catalog_sync import CatalogSyncService
 from app.services.delta import compare_media_snapshots
@@ -96,11 +98,28 @@ class PrimaryBatchService:
 
         Uses a SAVEPOINT so a unique-constraint race cannot abort the outer webhook
         transaction.
+
+        Create→update race: if products/create was just ACCEPTED for this product and
+        we have never successfully processed it, freeze [] instead of catalog media so
+        first-time images still convert (create may have already written them to DB).
         """
         try:
             with self.db.begin_nested():
                 baseline = self._get_or_create_baseline(product)
                 if baseline.media_snapshot_json is not None:
+                    return baseline
+                if self._recent_accepted_create_without_success(product, baseline):
+                    baseline.media_snapshot_json = []
+                    baseline.product_snapshot_json = (
+                        baseline.product_snapshot_json or product_snapshot_from_model(product)
+                    )
+                    baseline.evaluated_at = datetime.now(timezone.utc)
+                    self.db.flush()
+                    logger.info(
+                        "Seeded empty ProcessingBaseline as [] after recent create | shop=%s product=%s",
+                        self.shop.id,
+                        product.shopify_product_gid,
+                    )
                     return baseline
                 catalog_media = media_snapshots_from_models(
                     [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
@@ -130,6 +149,14 @@ class PrimaryBatchService:
             )
             if baseline.media_snapshot_json is not None:
                 return baseline
+            if self._recent_accepted_create_without_success(product, baseline):
+                baseline.media_snapshot_json = []
+                baseline.product_snapshot_json = (
+                    baseline.product_snapshot_json or product_snapshot_from_model(product)
+                )
+                baseline.evaluated_at = datetime.now(timezone.utc)
+                self.db.flush()
+                return baseline
             catalog_media = media_snapshots_from_models(
                 [m for m in product.media if m.is_visible and m.is_active and m.cdn_url]
             )
@@ -139,6 +166,73 @@ class PrimaryBatchService:
             )
             baseline.evaluated_at = datetime.now(timezone.utc)
             self.db.flush()
+            return baseline
+
+    def _recent_accepted_create_without_success(
+        self, product: Product, baseline: ProcessingBaseline
+    ) -> bool:
+        """True when a recent products/create was accepted and this product never processed."""
+        if baseline.successfully_processed_at is not None:
+            return False
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+        row = (
+            self.db.query(WebhookEvent.id)
+            .filter(
+                WebhookEvent.shop_id == self.shop.id,
+                WebhookEvent.shopify_product_gid == product.shopify_product_gid,
+                WebhookEvent.topic == "products/create",
+                WebhookEvent.processing_result == WebhookProcessingResult.ACCEPTED,
+                WebhookEvent.received_at >= cutoff,
+            )
+            .first()
+        )
+        return row is not None
+
+    def seed_first_ingest_baseline_empty(self, product: Product) -> ProcessingBaseline:
+        """Freeze [] on first catalog insert so create→update does not skip all images.
+
+        Shopify often sends products/create then products/update within ~1s. Create upserts
+        media into the catalog; the follow-up update used to seed ProcessingBaseline from
+        that catalog and conversion then reported "No eligible new or replaced images".
+
+        Explicit [] means "no prior processed media" and must not be overwritten by
+        seed_empty_baseline_from_product_media (which only fills when snapshot is None).
+        Existing catalog-synced products still use seed_empty_baseline_from_product_media
+        on later updates so title-only edits do not re-queue every image.
+        """
+        try:
+            with self.db.begin_nested():
+                baseline = self._get_or_create_baseline(product)
+                if baseline.media_snapshot_json is not None:
+                    return baseline
+                baseline.media_snapshot_json = []
+                baseline.product_snapshot_json = (
+                    baseline.product_snapshot_json or product_snapshot_from_model(product)
+                )
+                baseline.evaluated_at = datetime.now(timezone.utc)
+                self.db.flush()
+                logger.info(
+                    "Seeded first-ingest ProcessingBaseline as empty | shop=%s product=%s",
+                    self.shop.id,
+                    product.shopify_product_gid,
+                )
+                return baseline
+        except IntegrityError:
+            baseline = (
+                self.db.query(ProcessingBaseline)
+                .filter(
+                    ProcessingBaseline.shop_id == self.shop.id,
+                    ProcessingBaseline.product_id == product.id,
+                )
+                .one()
+            )
+            if baseline.media_snapshot_json is None:
+                baseline.media_snapshot_json = []
+                baseline.product_snapshot_json = (
+                    baseline.product_snapshot_json or product_snapshot_from_model(product)
+                )
+                baseline.evaluated_at = datetime.now(timezone.utc)
+                self.db.flush()
             return baseline
 
     def _advance_evaluated_baseline(

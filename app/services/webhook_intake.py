@@ -679,6 +679,7 @@ class WebhookIntakeService:
         #
         # Failures here must not fail the webhook (Shopify would retry 5xx). Worst case
         # we keep the old skip behavior until the next update.
+        first_ingest = old_product is None
         if old_product is not None:
             try:
                 PrimaryBatchService(self.db, shop).seed_empty_baseline_from_product_media(old_product)
@@ -692,6 +693,7 @@ class WebhookIntakeService:
         product_snapshot = _product_snapshot_from_webhook(payload, product_gid)
         media_snapshot: list[dict[str, Any]] = []
         graphql_ok = False
+        upserted_product: Product | None = None
 
         try:
             client = create_shopify_graphql_client(self.db, shop)
@@ -701,7 +703,7 @@ class WebhookIntakeService:
                 # Prefer GraphQL product fields when available; keep REST for status-only compare above.
                 product_snapshot = product_snapshot_from_shopify(normalized["product"])
                 media_snapshot = media_snapshots_from_shopify(normalized["media"])
-                catalog.upsert_product_from_shopify_node(node)
+                upserted_product = catalog.upsert_product_from_shopify_node(node)
                 graphql_ok = True
             elif old_product is None:
                 event.processing_result = WebhookProcessingResult.FAILED
@@ -734,6 +736,18 @@ class WebhookIntakeService:
 
         if old_product and new_status is not None:
             old_product.status = str(new_status)
+
+        # Brand-new product (create, or update that won the race): freeze [] so a
+        # follow-up update cannot seed the create's images as "already known".
+        if first_ingest and upserted_product is not None:
+            try:
+                PrimaryBatchService(self.db, shop).seed_first_ingest_baseline_empty(upserted_product)
+            except Exception:
+                logger.exception(
+                    "First-ingest baseline seed failed; continuing webhook | shop=%s product=%s",
+                    shop.id,
+                    product_gid,
+                )
 
         SecondaryQueueService(self.db, shop).upsert_from_webhook(
             product_gid,
