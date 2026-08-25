@@ -86,9 +86,11 @@ def _parse_webhook_payload(
     body: bytes,
     data: dict[str, Any],
 ) -> tuple[str, str, str, dict[str, Any]]:
+    from app.services.webhook_intake import normalize_webhook_topic
+
     if data.get("shop") and data.get("webhookId"):
         shop = str(data["shop"]).strip().lower()
-        topic = str(data.get("topic") or "products/update")
+        topic = normalize_webhook_topic(str(data.get("topic") or "products/update"))
         webhook_id = str(data["webhookId"])
         payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
         return shop, topic, webhook_id, payload
@@ -101,7 +103,7 @@ def _parse_webhook_payload(
     if not shop:
         raise HTTPException(status_code=400, detail="Shop domain is required")
 
-    topic = (
+    topic = normalize_webhook_topic(
         request.headers.get("X-Shopify-Topic")
         or request.headers.get("x-shopify-topic")
         or "products/update"
@@ -210,6 +212,7 @@ async def purge_processed_secondary_queue(request: Request, db: DbSession):
 
 @router.post("/webhooks/products-update")
 async def products_update_webhook(request: Request, db: DbSession):
+    """Async intake for products/create and products/update (topic on event)."""
     body = await request.body()
     _require_webhook_signature(request, body)
 
@@ -238,6 +241,7 @@ async def products_update_webhook(request: Request, db: DbSession):
         data={
             "webhookId": webhook_id,
             "eventId": str(event.id),
+            "topic": topic,
             "processingResult": event.processing_result.value,
             "shopifyProductGid": event.shopify_product_gid,
         },

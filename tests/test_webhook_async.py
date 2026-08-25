@@ -317,3 +317,112 @@ def test_health_live_ready_and_webhooks(client, shop, db_session):
     hooks = client.get("/health/webhooks")
     assert hooks.status_code == 200
     assert "queued" in hooks.json()["webhooks"]
+
+
+def test_products_create_enqueues_and_normalizes_topic(client, shop, db_session, monkeypatch):
+    _enable_auto_sync(db_session, shop)
+    monkeypatch.setattr("app.config.settings.internal_handoff_secret", "handoff-secret")
+    monkeypatch.setattr("app.core.crypto.settings.internal_handoff_secret", "handoff-secret")
+    body = {
+        "shop": shop.shop_domain,
+        "topic": "PRODUCTS_CREATE",
+        "webhookId": "wh-create-1",
+        "payload": _payload(501, "Brand New"),
+    }
+    raw = json.dumps(body).encode("utf-8")
+    ts, sig = sign_internal_payload(raw)
+    res = client.post(
+        "/internal/webhooks/products-update",
+        content=raw,
+        headers={"Content-Type": "application/json", "X-Timestamp": ts, "X-Signature": sig},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["processingResult"] == WebhookProcessingResult.QUEUED.value
+    assert data["topic"] == "products/create"
+    event = db_session.get(WebhookEvent, UUID(data["eventId"]))
+    assert event is not None
+    assert event.topic == "products/create"
+    assert event.shopify_product_gid == "gid://shopify/Product/501"
+
+
+def test_create_then_update_keeps_only_newest_queued(db_session, shop):
+    """Shopify often fires create + update for a new product; process once."""
+    _enable_auto_sync(db_session, shop)
+    svc = WebhookIntakeService(db_session)
+    created = svc.enqueue_products_update(
+        shop.shop_domain,
+        "wh-new-create",
+        "products/create",
+        _payload(777, "Created"),
+        "hash-create",
+    )
+    updated = svc.enqueue_products_update(
+        shop.shop_domain,
+        "wh-new-update",
+        "products/update",
+        _payload(777, "Updated"),
+        "hash-update",
+    )
+    db_session.expire_all()
+    created_row = db_session.get(WebhookEvent, created.id)
+    updated_row = db_session.get(WebhookEvent, updated.id)
+    assert updated_row.processing_result == WebhookProcessingResult.QUEUED
+    assert created_row.processing_result == WebhookProcessingResult.IGNORED
+    assert "Superseded" in (created_row.error_summary or "")
+    assert "wh-new-update" in (created_row.error_summary or "")
+
+
+def test_accepted_update_supersedes_stale_queued_create(db_session, shop, monkeypatch):
+    _enable_auto_sync(db_session, shop)
+    graphql_node = {
+        "id": "gid://shopify/Product/888",
+        "title": "Race Winner",
+        "status": "ACTIVE",
+        "productType": "Rings",
+        "handle": "race-winner",
+        "tags": [],
+        "featuredMedia": None,
+        "media": {"nodes": []},
+        "variants": {"nodes": []},
+    }
+    mock_client = MagicMock()
+    mock_client.fetch_product_by_gid.return_value = graphql_node
+    monkeypatch.setattr(
+        "app.services.webhook_intake.create_shopify_graphql_client",
+        lambda _db, _shop: mock_client,
+    )
+    svc = WebhookIntakeService(db_session)
+    # Simulate update already PROCESSING while a late create is still QUEUED.
+    update = svc.enqueue_products_update(
+        shop.shop_domain,
+        "wh-race-update",
+        "products/update",
+        _payload(888, "Race Winner"),
+        "hash-update-race",
+    )
+    update.processing_result = WebhookProcessingResult.PROCESSING
+    update.claimed_by = "worker-race"
+    update.claimed_at = datetime.now(timezone.utc)
+    update.received_at = datetime.now(timezone.utc) - timedelta(seconds=2)
+    db_session.commit()
+
+    create = WebhookEvent(
+        shop_id=shop.id,
+        shopify_webhook_id="wh-race-create",
+        topic="products/create",
+        shopify_product_gid="gid://shopify/Product/888",
+        payload_json=_payload(888, "Created First"),
+        payload_hash="hash-create-race",
+        processing_result=WebhookProcessingResult.QUEUED,
+        received_at=datetime.now(timezone.utc) - timedelta(seconds=5),
+    )
+    db_session.add(create)
+    db_session.commit()
+
+    processed = svc.process_event(update.id)
+    assert processed.processing_result == WebhookProcessingResult.ACCEPTED
+    db_session.expire_all()
+    create_row = db_session.get(WebhookEvent, create.id)
+    assert create_row.processing_result == WebhookProcessingResult.IGNORED
+    assert "Superseded by accepted webhook wh-race-update" in (create_row.error_summary or "")

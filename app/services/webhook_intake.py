@@ -42,6 +42,19 @@ def product_gid_from_webhook_payload(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def normalize_webhook_topic(topic: str | None) -> str:
+    """Normalize Shopify topic headers (products/create, PRODUCTS_CREATE, etc.)."""
+    raw = (topic or "").strip()
+    if not raw:
+        return "products/update"
+    lowered = raw.lower().replace(".", "/")
+    if lowered in {"products/create", "products_create"}:
+        return "products/create"
+    if lowered in {"products/update", "products_update"}:
+        return "products/update"
+    return lowered
+
+
 def normalize_status(value: str | None) -> str | None:
     if value is None:
         return None
@@ -183,6 +196,7 @@ class WebhookIntakeService:
             logger.info("Duplicate webhook ignored | webhook_id=%s shop=%s", webhook_id, shop_domain)
             return existing
 
+        topic = normalize_webhook_topic(topic)
         shop = get_shop_by_domain(self.db, shop_domain)
         product_gid = product_gid_from_webhook_payload(payload)
         result = WebhookProcessingResult.QUEUED
@@ -199,10 +213,11 @@ class WebhookIntakeService:
             error_summary = "Auto Sync disabled"
             stored_payload = None
             logger.info(
-                "Webhook ignored; Auto Sync off | webhook_id=%s shop=%s product=%s",
+                "Webhook ignored; Auto Sync off | webhook_id=%s shop=%s product=%s topic=%s",
                 webhook_id,
                 shop_domain,
                 product_gid,
+                topic,
             )
         elif not product_gid or not _GID_PRODUCT_RE.match(product_gid):
             result = WebhookProcessingResult.FAILED
@@ -234,15 +249,51 @@ class WebhookIntakeService:
                 return duplicate
             raise
         self.db.refresh(event)
+
+        # Create + update often arrive together for a new product. Keep only the
+        # newest QUEUED row per shop+product so we do not GraphQL/Secondary twice.
+        superseded = 0
+        if event.processing_result == WebhookProcessingResult.QUEUED:
+            superseded = self._supersede_older_queued_for_product(event)
+
         logger.info(
-            "Webhook enqueued | webhook_id=%s shop=%s product=%s result=%s",
+            "Webhook enqueued | webhook_id=%s shop=%s product=%s topic=%s result=%s superseded=%s",
             webhook_id,
             shop_domain,
             product_gid,
+            topic,
             event.processing_result.value,
+            superseded,
         )
         return event
 
+    def _supersede_older_queued_for_product(self, newest: WebhookEvent) -> int:
+        """Mark older QUEUED events for the same shop+product as IGNORED."""
+        if newest.shop_id is None or not newest.shopify_product_gid:
+            return 0
+        older_rows = (
+            self.db.query(WebhookEvent)
+            .filter(
+                WebhookEvent.shop_id == newest.shop_id,
+                WebhookEvent.shopify_product_gid == newest.shopify_product_gid,
+                WebhookEvent.processing_result == WebhookProcessingResult.QUEUED,
+                WebhookEvent.id != newest.id,
+            )
+            .all()
+        )
+        if not older_rows:
+            return 0
+        for older in older_rows:
+            older.processing_result = WebhookProcessingResult.IGNORED
+            older.error_summary = (
+                f"Superseded by later webhook {newest.shopify_webhook_id} ({newest.topic})"
+            )
+            older.claimed_by = None
+            older.claimed_at = None
+            older.payload_json = None
+        self.db.commit()
+        self.db.refresh(newest)
+        return len(older_rows)
     def queue_metrics(self) -> dict[str, Any]:
         """Counts and lag for ops dashboards. Does not scan historical ACCEPTED rows."""
         now = datetime.now(timezone.utc)
@@ -505,10 +556,49 @@ class WebhookIntakeService:
         event.error_summary = None
         event.claimed_by = None
         event.claimed_at = None
+        # Drop stale create/update twins still sitting in QUEUED for this product.
+        self._supersede_stale_queued_after_accept(event)
         self.db.commit()
         self.db.refresh(event)
         return event
 
+    def _supersede_stale_queued_after_accept(self, accepted: WebhookEvent) -> int:
+        """Ignore older QUEUED twins after a successful create/update for the same product."""
+        if accepted.shop_id is None or not accepted.shopify_product_gid:
+            return 0
+        accepted_at = accepted.received_at or datetime.now(timezone.utc)
+        older_rows = (
+            self.db.query(WebhookEvent)
+            .filter(
+                WebhookEvent.shop_id == accepted.shop_id,
+                WebhookEvent.shopify_product_gid == accepted.shopify_product_gid,
+                WebhookEvent.processing_result == WebhookProcessingResult.QUEUED,
+                WebhookEvent.id != accepted.id,
+            )
+            .all()
+        )
+        superseded = 0
+        for older in older_rows:
+            older_at = older.received_at or accepted_at
+            if older_at > accepted_at:
+                # Newer event may carry later media/title changes — keep it.
+                continue
+            older.processing_result = WebhookProcessingResult.IGNORED
+            older.error_summary = (
+                f"Superseded by accepted webhook {accepted.shopify_webhook_id} ({accepted.topic})"
+            )
+            older.claimed_by = None
+            older.claimed_at = None
+            older.payload_json = None
+            superseded += 1
+        if superseded:
+            logger.info(
+                "Webhook post-accept supersede | product=%s accepted=%s superseded=%s",
+                accepted.shopify_product_gid,
+                accepted.shopify_webhook_id,
+                superseded,
+            )
+        return superseded
     def _shop_auto_sync_enabled(self, shop_id: UUID) -> bool:
         row = (
             self.db.query(ShopSettings)
