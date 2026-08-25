@@ -82,6 +82,9 @@ def compare_publish_snapshots(
     featured_baseline = baseline.get("featured_media_gid")
     featured_live = live.get("featured_media_gid")
     featured_changed = bool(featured_baseline and featured_live and featured_baseline != featured_live)
+    # Shopify often attaches the featured image to variants that previously had no media.
+    # That is not a merchant gallery edit; treat null → featured as non-conflicting.
+    featured_for_variants = featured_live or featured_baseline
 
     baseline_variants = {
         v["variant_gid"]: v.get("media_gid")
@@ -93,15 +96,27 @@ def compare_publish_snapshots(
         for v in (live.get("variants") or [])
         if v.get("variant_gid")
     }
+
+    def _benign_null_to_featured(baseline_media: Any, live_media: Any) -> bool:
+        if baseline_media:
+            return False
+        if not live_media or not featured_for_variants:
+            return False
+        return live_media == featured_for_variants
+
     variant_changes: list[dict[str, Any]] = []
     for vgid, b_media in baseline_variants.items():
         l_media = live_variants.get(vgid)
         if vgid in live_variants and b_media != l_media:
+            if _benign_null_to_featured(b_media, l_media):
+                continue
             variant_changes.append(
                 {"variant_gid": vgid, "baseline_media_gid": b_media, "live_media_gid": l_media}
             )
     for vgid, l_media in live_variants.items():
         if vgid not in baseline_variants and l_media:
+            if _benign_null_to_featured(None, l_media):
+                continue
             variant_changes.append(
                 {"variant_gid": vgid, "baseline_media_gid": None, "live_media_gid": l_media}
             )

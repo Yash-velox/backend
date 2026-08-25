@@ -317,6 +317,46 @@ def test_conflict_detects_added_removed_reorder_alt(db_session):
     assert diff4["altChanges"]
 
 
+def test_variant_null_to_featured_is_not_publish_conflict():
+    """Shopify often materializes featured media onto variants that had none."""
+    featured = "gid://shopify/MediaImage/68615427654001"
+    media = [
+        _media(featured, 0, alt="front", featured=True),
+        _media("gid://shopify/MediaImage/2", 1, alt="side"),
+        _media("gid://shopify/MediaImage/3", 2, alt="back"),
+        _media("gid://shopify/MediaImage/4", 3, alt="detail"),
+    ]
+    baseline = _snapshot(
+        media,
+        variants=[{"variant_gid": "gid://shopify/ProductVariant/63571382108529", "media_gid": None}],
+    )
+    live = _snapshot(
+        media,
+        variants=[{"variant_gid": "gid://shopify/ProductVariant/63571382108529", "media_gid": featured}],
+    )
+    diff = compare_publish_snapshots(baseline, live)
+    assert diff["hasConflict"] is False
+    assert diff["variantChanges"] == []
+    assert diff["membershipChanged"] is False
+
+
+def test_variant_media_swap_still_conflicts():
+    featured = "gid://shopify/MediaImage/1"
+    other = "gid://shopify/MediaImage/2"
+    media = [_media(featured, 0, featured=True), _media(other, 1)]
+    baseline = _snapshot(
+        media,
+        variants=[{"variant_gid": "gid://shopify/ProductVariant/1", "media_gid": featured}],
+    )
+    live = _snapshot(
+        media,
+        variants=[{"variant_gid": "gid://shopify/ProductVariant/1", "media_gid": other}],
+    )
+    diff = compare_publish_snapshots(baseline, live)
+    assert diff["hasConflict"] is True
+    assert len(diff["variantChanges"]) == 1
+
+
 def test_heal_empty_baseline_when_sources_match_live():
     empty = {"product_gid": "gid://shopify/Product/1", "media": [], "variants": []}
     live = _snapshot([_media("gid://shopify/MediaImage/10", 0, alt="front", featured=True)])
