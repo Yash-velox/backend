@@ -264,26 +264,20 @@ class ImageVersionsService:
         except_version_id: UUID | None = None,
         batch_id: UUID | None = None,
         actor_type: str = "processing",
-    ) -> list[ImageVersion]:
-        """Deactivate every current row for this source, then flush (unique index safe)."""
+    ) -> int:
+        """Deactivate every current row for this source via SQL UPDATE, then flush."""
         now = datetime.now(timezone.utc)
-        rows = (
-            self.db.query(ImageVersion)
-            .filter(
-                ImageVersion.shop_id == self.shop.id,
-                ImageVersion.product_id == product_id,
-                ImageVersion.source_media_gid == source_media_gid,
-                ImageVersion.is_current.is_(True),
-            )
-            .all()
+        q = self.db.query(ImageVersion).filter(
+            ImageVersion.shop_id == self.shop.id,
+            ImageVersion.product_id == product_id,
+            ImageVersion.source_media_gid == source_media_gid,
+            ImageVersion.is_current.is_(True),
         )
-        cleared: list[ImageVersion] = []
+        if except_version_id is not None:
+            q = q.filter(ImageVersion.id != except_version_id)
+        # Capture ids for audit before bulk update.
+        rows = q.all()
         for row in rows:
-            if except_version_id is not None and row.id == except_version_id:
-                continue
-            row.is_current = False
-            row.superseded_at = now
-            cleared.append(row)
             self._record_event(
                 product_id=product_id,
                 event_type=ImageVersionEventType.VERSION_SUPERSEDED,
@@ -292,9 +286,16 @@ class ImageVersionsService:
                 batch_id=batch_id,
                 actor_type=actor_type,
             )
-        # Critical: release ix_image_versions_current before any new is_current=True insert.
+        updated = q.update(
+            {
+                ImageVersion.is_current: False,
+                ImageVersion.superseded_at: now,
+            },
+            synchronize_session="fetch",
+        )
+        # Critical: release ix_image_versions_current before any new is_current=True.
         self.db.flush()
-        return cleared
+        return int(updated or 0)
 
     def _ensure_sole_current(
         self,
@@ -361,7 +362,7 @@ class ImageVersionsService:
         previous = self.current_for_source(product_id=product_id, source_media_gid=source_media_gid)
         version_number = self.next_version_number(product_id=product_id, source_media_gid=source_media_gid)
 
-        # Clear ALL currents for this source (not only `previous`) then flush before insert.
+        # Clear ALL currents for this source (SQL UPDATE + flush).
         self._clear_current_for_source(
             product_id=product_id,
             source_media_gid=source_media_gid,
@@ -374,6 +375,8 @@ class ImageVersionsService:
             source_media_gid=source_media_gid,
             version_number=version_number,
         )
+        # Insert as non-current first so ix_image_versions_current cannot fire on INSERT,
+        # then activate after a second clear (same pattern as product media versions).
         version = ImageVersion(
             shop_id=self.shop.id,
             product_id=product_id,
@@ -390,7 +393,7 @@ class ImageVersionsService:
             width=width,
             height=height,
             checksum=checksum,
-            is_current=True,
+            is_current=False,
             is_published=False,
             is_original=False,
             is_protected=False,
@@ -402,6 +405,18 @@ class ImageVersionsService:
         )
         self.db.add(version)
         self.db.flush()
+
+        self._clear_current_for_source(
+            product_id=product_id,
+            source_media_gid=source_media_gid,
+            except_version_id=version.id,
+            batch_id=batch_id,
+            actor_type=actor_type,
+        )
+        version.is_current = True
+        version.superseded_at = None
+        self.db.flush()
+
         self._record_event(
             product_id=product_id,
             event_type=ImageVersionEventType.VERSION_GENERATED,
