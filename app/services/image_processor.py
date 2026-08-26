@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from uuid import UUID
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
@@ -32,7 +33,12 @@ from app.services.openai_image_compat import supports_transparent_background
 from app.services.output_storage import OutputStorage, checksum_sha256, get_output_storage
 from app.services.primary_batch import PrimaryBatchService
 from app.services.prompt_resolver import PromptResolver, PromptResolverError
-from app.services.retry_service import RetryService, complete_image_from_shopify_file, find_generated_version_for_batch_image, next_processing_attempt_number
+from app.services.retry_service import (
+    RetryService,
+    complete_image_from_shopify_file,
+    find_generated_version_for_batch_image,
+    next_processing_attempt_number,
+)
 from app.services.shopify_file_upload import (
     PublishUploadError,
     ShopifyFileUploadService,
@@ -276,10 +282,24 @@ class ImageProcessor:
         self.db.commit()
 
     def finalize_local_output(self, batch_image_id: UUID, *, worker_id: str) -> bool:
-        """Upload an already-generated local output to Shopify Files (OpenAI Batch path)."""
-        image = self.db.get(BatchImage, batch_image_id)
+        """Upload an already-generated local output to Shopify Files (OpenAI Batch path).
+
+        Idempotent and concurrency-safe: exclusive row lock, reuse existing Shopify file /
+        image_version when present, never create duplicate currents.
+        """
+        dialect = self.db.bind.dialect.name if self.db.bind is not None else ""
+        stmt = select(BatchImage).where(BatchImage.id == batch_image_id)
+        if dialect == "postgresql":
+            stmt = stmt.with_for_update(skip_locked=True)
+        else:
+            stmt = stmt.with_for_update()
+        image = self.db.execute(stmt).scalar_one_or_none()
         if not image:
+            # Another worker holds the lock, or the row vanished.
             return False
+        if image.status == BatchImageStatus.COMPLETED and image.generated_shopify_file_gid:
+            return True
+
         version = find_generated_version_for_batch_image(self.db, image)
         if version is not None and version.shopify_file_gid:
             complete_image_from_shopify_file(
@@ -293,15 +313,52 @@ class ImageProcessor:
                 self.retry_service.complete_unpublished_generated_work(batch_product)
             self.db.commit()
             return True
-        if not image.output_storage_key:
-            return False
-        if image.generated_shopify_file_gid:
-            return True
+
         batch_product = self.db.get(BatchProduct, image.batch_product_id)
         if not batch_product:
             return False
         shop = self.db.get(Shop, image.shop_id)
         if not shop:
+            return False
+
+        # Shopify file already uploaded (GID saved) but version/complete may be pending.
+        # Prefer local file when present so we can validate; otherwise reconcile from GID.
+        if image.generated_shopify_file_gid and not image.output_storage_key:
+            if not batch_product.product_id:
+                raise ProcessingError(
+                    "Catalog product id required before Shopify Files upload",
+                    code="PRODUCT_NOT_LINKED",
+                    retryable=False,
+                )
+            idempotency_key = (
+                f"upload:{image.id}:{image.output_checksum or image.generated_shopify_file_gid}"
+            )
+            version = ImageVersionsService(self.db, shop).create_generated_after_upload(
+                product_id=batch_product.product_id,
+                source_media_gid=image.shopify_media_gid,
+                shopify_file_gid=image.generated_shopify_file_gid,
+                shopify_cdn_url=image.generated_shopify_cdn_url,
+                width=None,
+                height=None,
+                file_size_bytes=None,
+                checksum=image.output_checksum,
+                mime_type=image.output_mime_type or "image/png",
+                original_filename=image.original_filename,
+                upload_idempotency_key=idempotency_key,
+                batch_id=batch_product.batch_id,
+                batch_image_id=image.id,
+            )
+            complete_image_from_shopify_file(
+                image,
+                file_gid=image.generated_shopify_file_gid,
+                cdn_url=image.generated_shopify_cdn_url,
+                version_id=version.id,
+            )
+            self.retry_service.complete_unpublished_generated_work(batch_product)
+            self.db.commit()
+            return True
+
+        if not image.output_storage_key:
             return False
         if not self._local_output_usable(image):
             raise ProcessingError(
@@ -320,15 +377,9 @@ class ImageProcessor:
             # images; product rollup below can still COMPLETE from RETRYING.
             batch_product.locked_by = worker_id
             batch_product.locked_at = now
-        attempt_number = max(image.attempt_count, 1)
-        existing_numbers = {
-            row[0]
-            for row in self.db.query(ProcessingAttempt.attempt_number)
-            .filter(ProcessingAttempt.batch_image_id == image.id)
-            .all()
-        }
-        while attempt_number in existing_numbers:
-            attempt_number += 1
+        attempt_number = next_processing_attempt_number(
+            self.db, image.id, start_from=max(image.attempt_count, 1)
+        )
         attempt = ProcessingAttempt(
             batch_image_id=image.id,
             batch_product_id=batch_product.id,

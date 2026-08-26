@@ -83,6 +83,30 @@ def find_generated_version_for_batch_image(db: Session, image: BatchImage) -> Im
     )
 
 
+def should_skip_openai_for_image(
+    db: Session,
+    image: BatchImage,
+    *,
+    next_stage_exists: bool,
+) -> bool:
+    """Cost guard: never send OpenAI work when durable/local output already exists.
+
+    Merchant ``manual_reprocess`` is intentional new AI work and must still call OpenAI.
+    """
+    if image.manual_reprocess:
+        return False
+    if image.status in {BatchImageStatus.COMPLETED, BatchImageStatus.FAILED, BatchImageStatus.UPLOADING}:
+        return True
+    if image.generated_shopify_file_gid:
+        return True
+    if find_generated_version_for_batch_image(db, image) is not None:
+        return True
+    # Final AI output is on disk and no further prompt stages remain → finalize only.
+    if image.output_storage_key and not next_stage_exists:
+        return True
+    return False
+
+
 _COMPLETE_FROM_STATUS: dict[BatchImageStatus, tuple[BatchImageStatus, ...]] = {
     BatchImageStatus.QUEUED: (BatchImageStatus.UPLOADING, BatchImageStatus.COMPLETED),
     BatchImageStatus.RETRYING: (BatchImageStatus.UPLOADING, BatchImageStatus.COMPLETED),

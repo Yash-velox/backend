@@ -216,6 +216,31 @@ def test_create_generated_from_original_current_no_unique_violation(db_session, 
         .count()
     ) == 1
 
+    # Third call must still be a no-op (idempotent finalize).
+    again2 = svc.create_generated_after_upload(
+        product_id=product.id,
+        source_media_gid=media.shopify_media_gid,
+        shopify_file_gid="gid://shopify/File/gen-a",
+        shopify_cdn_url="https://cdn.shopify.com/ga.png",
+        width=10,
+        height=10,
+        file_size_bytes=100,
+        checksum="aaa",
+        upload_idempotency_key="upload:stuck:aaa",
+    )
+    db_session.commit()
+    assert again2.id == g1.id
+    generated = (
+        db_session.query(ImageVersion)
+        .filter(
+            ImageVersion.product_id == product.id,
+            ImageVersion.version_type == ImageVersionType.GENERATED,
+        )
+        .all()
+    )
+    assert len(generated) == 1
+    assert generated[0].shopify_file_gid == "gid://shopify/File/gen-a"
+
 
 def test_reject_oversized_generated_png(tmp_path, monkeypatch):
     monkeypatch.setattr("app.config.settings.shopify_image_reject_mb", 0)
@@ -312,6 +337,132 @@ def test_upload_retry_idempotent_no_duplicate_version(db_session, shop, tmp_path
     )
     assert len(versions) == 1
     assert upload_calls["n"] >= 1
+
+
+def test_finalize_local_output_idempotent_with_existing_gid(db_session, shop, tmp_path, monkeypatch):
+    """After Shopify GID is persisted, retries must finish version write without re-upload."""
+    monkeypatch.setattr("app.config.settings.processing_output_directory", str(tmp_path / "processed"))
+    product, media = _seed_catalog(db_session, shop)
+    storage = LocalFilesystemOutputStorage(tmp_path / "processed")
+    key = f"{shop.id}/out.png"
+    storage.save_bytes(key=key, data=PNG_BYTES, content_type="image/png")
+
+    batch = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.MANUAL,
+        status=BatchStatus.PROCESSING,
+        product_count=1,
+        image_count=1,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    bp = BatchProduct(
+        batch_id=batch.id,
+        shop_id=shop.id,
+        product_id=product.id,
+        shopify_product_gid=product.shopify_product_gid,
+        status=BatchProductStatus.PROCESSING,
+        image_count=1,
+    )
+    db_session.add(bp)
+    db_session.flush()
+    image = BatchImage(
+        batch_product_id=bp.id,
+        shop_id=shop.id,
+        shopify_media_gid=media.shopify_media_gid,
+        shopify_file_gid=media.shopify_file_gid,
+        cdn_url=media.cdn_url or "https://cdn.shopify.com/x.png",
+        delta_type=DeltaType.INITIAL,
+        status=BatchImageStatus.UPLOADING,
+        output_storage_key=key,
+        output_checksum="abc",
+        generated_shopify_file_gid="gid://shopify/File/already-up",
+        generated_shopify_cdn_url="https://cdn.shopify.com/already-up.png",
+        attempt_count=1,
+    )
+    db_session.add(image)
+    db_session.commit()
+
+    upload_calls = {"n": 0}
+
+    def fake_upload(*, path, filename, existing_file_gid=None):
+        upload_calls["n"] += 1
+        assert existing_file_gid == "gid://shopify/File/already-up"
+        return {
+            "file_gid": "gid://shopify/File/already-up",
+            "file_status": "READY",
+            "cdn_url": "https://cdn.shopify.com/already-up.png",
+            "width": 1,
+            "height": 1,
+        }
+
+    with patch("app.services.image_processor.create_shopify_graphql_client"), patch(
+        "app.services.image_processor.ShopifyFileUploadService.upload_png",
+        side_effect=fake_upload,
+    ):
+        processor = ImageProcessor(db_session, storage=storage)
+        assert processor.finalize_local_output(image.id, worker_id="w1") is True
+        db_session.refresh(image)
+        assert image.status == BatchImageStatus.COMPLETED
+        assert image.generated_image_version_id is not None
+        # Second finalize is a no-op success
+        assert processor.finalize_local_output(image.id, worker_id="w2") is True
+
+    versions = (
+        db_session.query(ImageVersion)
+        .filter(
+            ImageVersion.product_id == product.id,
+            ImageVersion.version_type == ImageVersionType.GENERATED,
+        )
+        .all()
+    )
+    assert len(versions) == 1
+    assert versions[0].shopify_file_gid == "gid://shopify/File/already-up"
+    assert upload_calls["n"] == 1
+
+
+def test_should_skip_openai_when_local_final_output_exists(db_session, shop):
+    from app.services.retry_service import should_skip_openai_for_image
+
+    product, media = _seed_catalog(db_session, shop)
+    batch = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.MANUAL,
+        status=BatchStatus.PROCESSING,
+        product_count=1,
+        image_count=1,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    bp = BatchProduct(
+        batch_id=batch.id,
+        shop_id=shop.id,
+        product_id=product.id,
+        shopify_product_gid=product.shopify_product_gid,
+        status=BatchProductStatus.PROCESSING,
+        image_count=1,
+    )
+    db_session.add(bp)
+    db_session.flush()
+    image = BatchImage(
+        batch_product_id=bp.id,
+        shop_id=shop.id,
+        shopify_media_gid=media.shopify_media_gid,
+        cdn_url="https://cdn.shopify.com/x.png",
+        delta_type=DeltaType.INITIAL,
+        status=BatchImageStatus.PROCESSING,
+        output_storage_key=f"{shop.id}/done.png",
+        current_prompt_step=1,
+    )
+    db_session.add(image)
+    db_session.commit()
+
+    assert should_skip_openai_for_image(db_session, image, next_stage_exists=False) is True
+    # Multi-step: intermediate output must still allow the next OpenAI stage.
+    assert should_skip_openai_for_image(db_session, image, next_stage_exists=True) is False
+    image.manual_reprocess = True
+    db_session.commit()
+    assert should_skip_openai_for_image(db_session, image, next_stage_exists=False) is False
 
 
 def test_publish_reuses_ready_file_without_local(db_session, shop, tmp_path, monkeypatch):

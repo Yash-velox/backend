@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
@@ -53,6 +54,7 @@ from app.services.retry_service import (
     complete_image_from_shopify_file,
     find_generated_version_for_batch_image,
     next_processing_attempt_number,
+    should_skip_openai_for_image,
 )
 from app.services.state_machine import (
     BATCH_IMAGE_TRANSITIONS,
@@ -721,6 +723,14 @@ class OpenAIBatchOrchestrator:
                     )
                     continue
                 target = self._next_stage_for_image(shop, product, image)
+                if should_skip_openai_for_image(
+                    self.db,
+                    image,
+                    next_stage_exists=target is not None,
+                ):
+                    # Local/Shopify output already exists — finalize owns the rest.
+                    # Do not mark COMPLETED here without an image_version row.
+                    continue
                 if target is None:
                     continue
                 ready.append((product, image, target))
@@ -1076,24 +1086,36 @@ class OpenAIBatchOrchestrator:
         """Upload final local outputs to Shopify Files using existing processor path."""
         from app.services.image_processor import ImageProcessor
 
-        images = (
-            self.db.query(BatchImage)
-            .filter(
+        dialect = self.db.bind.dialect.name if self.db.bind is not None else ""
+        eligible = and_(
+            BatchImage.status.in_(
+                [
+                    BatchImageStatus.PROCESSING,
+                    BatchImageStatus.WAITING_FOR_PROVIDER,
+                    BatchImageStatus.UPLOADING,
+                    BatchImageStatus.RETRYING,
+                ]
+            ),
+            or_(
                 BatchImage.output_storage_key.is_not(None),
-                BatchImage.generated_shopify_file_gid.is_(None),
-                BatchImage.status.in_(
-                    [
-                        BatchImageStatus.PROCESSING,
-                        BatchImageStatus.WAITING_FOR_PROVIDER,
-                        BatchImageStatus.UPLOADING,
-                        BatchImageStatus.RETRYING,
-                    ]
+                # GID persisted after Shopify upload but version/complete not finished yet.
+                and_(
+                    BatchImage.generated_shopify_file_gid.is_not(None),
+                    BatchImage.generated_image_version_id.is_(None),
                 ),
-            )
+            ),
+        )
+        stmt = (
+            select(BatchImage)
+            .where(eligible)
             .order_by(BatchImage.created_at.asc())
             .limit(20)
-            .all()
         )
+        if dialect == "postgresql":
+            stmt = stmt.with_for_update(skip_locked=True)
+        else:
+            stmt = stmt.with_for_update()
+        images = list(self.db.execute(stmt).scalars().all())
         count = 0
         processor = ImageProcessor(self.db)
         for image in images:
