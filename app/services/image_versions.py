@@ -256,6 +256,67 @@ class ImageVersionsService:
             .one_or_none()
         )
 
+    def _clear_current_for_source(
+        self,
+        *,
+        product_id: UUID,
+        source_media_gid: str,
+        except_version_id: UUID | None = None,
+        batch_id: UUID | None = None,
+        actor_type: str = "processing",
+    ) -> list[ImageVersion]:
+        """Deactivate every current row for this source, then flush (unique index safe)."""
+        now = datetime.now(timezone.utc)
+        rows = (
+            self.db.query(ImageVersion)
+            .filter(
+                ImageVersion.shop_id == self.shop.id,
+                ImageVersion.product_id == product_id,
+                ImageVersion.source_media_gid == source_media_gid,
+                ImageVersion.is_current.is_(True),
+            )
+            .all()
+        )
+        cleared: list[ImageVersion] = []
+        for row in rows:
+            if except_version_id is not None and row.id == except_version_id:
+                continue
+            row.is_current = False
+            row.superseded_at = now
+            cleared.append(row)
+            self._record_event(
+                product_id=product_id,
+                event_type=ImageVersionEventType.VERSION_SUPERSEDED,
+                image_version_id=row.id,
+                previous_version_id=row.id,
+                batch_id=batch_id,
+                actor_type=actor_type,
+            )
+        # Critical: release ix_image_versions_current before any new is_current=True insert.
+        self.db.flush()
+        return cleared
+
+    def _ensure_sole_current(
+        self,
+        version: ImageVersion,
+        *,
+        batch_id: UUID | None = None,
+        actor_type: str = "processing",
+    ) -> ImageVersion:
+        """Make ``version`` the only current row for its source (retry / reuse path)."""
+        self._clear_current_for_source(
+            product_id=version.product_id,
+            source_media_gid=version.source_media_gid,
+            except_version_id=version.id,
+            batch_id=batch_id,
+            actor_type=actor_type,
+        )
+        if not version.is_current:
+            version.is_current = True
+            version.superseded_at = None
+            self.db.flush()
+        return version
+
     def create_generated_after_upload(
         self,
         *,
@@ -279,10 +340,10 @@ class ImageVersionsService:
     ) -> ImageVersion:
         existing = self.find_by_idempotency_key(upload_idempotency_key)
         if existing:
-            return existing
+            return self._ensure_sole_current(existing, batch_id=batch_id, actor_type=actor_type)
         by_file = self.find_by_file_gid(shopify_file_gid)
         if by_file:
-            return by_file
+            return self._ensure_sole_current(by_file, batch_id=batch_id, actor_type=actor_type)
 
         # Ensure ORIGINAL exists when catalog product is known.
         media = (
@@ -299,19 +360,14 @@ class ImageVersionsService:
 
         previous = self.current_for_source(product_id=product_id, source_media_gid=source_media_gid)
         version_number = self.next_version_number(product_id=product_id, source_media_gid=source_media_gid)
-        now = datetime.now(timezone.utc)
 
-        if previous:
-            previous.is_current = False
-            previous.superseded_at = now
-            self._record_event(
-                product_id=product_id,
-                event_type=ImageVersionEventType.VERSION_SUPERSEDED,
-                image_version_id=previous.id,
-                previous_version_id=previous.id,
-                batch_id=batch_id,
-                actor_type=actor_type,
-            )
+        # Clear ALL currents for this source (not only `previous`) then flush before insert.
+        self._clear_current_for_source(
+            product_id=product_id,
+            source_media_gid=source_media_gid,
+            batch_id=batch_id,
+            actor_type=actor_type,
+        )
 
         filename = stored_filename or build_generated_filename(
             product_id=product_id,

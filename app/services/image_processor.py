@@ -496,6 +496,17 @@ class ImageProcessor:
             )
             raise ProcessingError(str(exc), code=exc.code, retryable=exc.retryable) from exc
 
+        # Persist Shopify file identity before image_versions bookkeeping so a later
+        # UniqueViolation/rollback can reuse this file on retry (no duplicate upload).
+        image.generated_shopify_file_gid = result["file_gid"]
+        image.generated_shopify_cdn_url = result.get("cdn_url")
+        image.output_checksum = meta.get("checksum") or image.output_checksum
+        image.output_mime_type = "image/png"
+        self.db.commit()
+        self.db.refresh(image)
+        self.db.refresh(attempt)
+        self.db.refresh(batch_product)
+
         version = ImageVersionsService(self.db, shop).create_generated_after_upload(
             product_id=batch_product.product_id,
             source_media_gid=image.shopify_media_gid,

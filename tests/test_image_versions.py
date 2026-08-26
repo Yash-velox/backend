@@ -159,6 +159,64 @@ def test_create_generated_keeps_old_versions_one_current(db_session, shop):
     assert again.id == g2.id
 
 
+def test_create_generated_from_original_current_no_unique_violation(db_session, shop):
+    """Prod bug: ORIGINAL is_current=True then GENERATED insert must not hit ix_image_versions_current."""
+    product, media = _seed_catalog(db_session, shop)
+    svc = ImageVersionsService(db_session, shop)
+    original = svc.ensure_original_from_media(media)
+    db_session.commit()
+    assert original.is_current is True
+
+    g1 = svc.create_generated_after_upload(
+        product_id=product.id,
+        source_media_gid=media.shopify_media_gid,
+        shopify_file_gid="gid://shopify/File/gen-a",
+        shopify_cdn_url="https://cdn.shopify.com/ga.png",
+        width=10,
+        height=10,
+        file_size_bytes=100,
+        checksum="aaa",
+        upload_idempotency_key="upload:stuck:aaa",
+    )
+    db_session.commit()
+    db_session.refresh(original)
+    assert g1.is_current is True
+    assert original.is_current is False
+    assert (
+        db_session.query(ImageVersion)
+        .filter(
+            ImageVersion.product_id == product.id,
+            ImageVersion.source_media_gid == media.shopify_media_gid,
+            ImageVersion.is_current.is_(True),
+        )
+        .count()
+    ) == 1
+
+    # Worker retry after partial failure (same file / same idempotency key)
+    again = svc.create_generated_after_upload(
+        product_id=product.id,
+        source_media_gid=media.shopify_media_gid,
+        shopify_file_gid="gid://shopify/File/gen-a",
+        shopify_cdn_url="https://cdn.shopify.com/ga.png",
+        width=10,
+        height=10,
+        file_size_bytes=100,
+        checksum="aaa",
+        upload_idempotency_key="upload:stuck:aaa",
+    )
+    db_session.commit()
+    assert again.id == g1.id
+    assert (
+        db_session.query(ImageVersion)
+        .filter(
+            ImageVersion.product_id == product.id,
+            ImageVersion.source_media_gid == media.shopify_media_gid,
+            ImageVersion.is_current.is_(True),
+        )
+        .count()
+    ) == 1
+
+
 def test_reject_oversized_generated_png(tmp_path, monkeypatch):
     monkeypatch.setattr("app.config.settings.shopify_image_reject_mb", 0)
     path = tmp_path / "big.png"
