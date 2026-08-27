@@ -14,6 +14,7 @@ from app.schemas.week2 import (
     BatchImageOut,
     BatchOut,
     BatchProductOut,
+    BatchSummaryOut,
     ManualBatchCreateRequest,
     PaginationMeta,
     ReprocessRequest,
@@ -22,20 +23,6 @@ from app.schemas.week2 import (
 from app.services.output_storage import get_output_storage
 from app.services.primary_batch import PrimaryBatchError, PrimaryBatchService
 from app.services.product_links import catalog_by_id, product_link_fields
-from app.services.reprocess_service import ReprocessError, ReprocessService
-from app.services.retry_service import RetryService
-from app.schemas.queue import AttemptOut
-from app.schemas.week2 import (
-    BatchImageOut,
-    BatchOut,
-    BatchProductOut,
-    ManualBatchCreateRequest,
-    PaginationMeta,
-    ReprocessRequest,
-    SuccessEnvelope,
-)
-from app.services.output_storage import get_output_storage
-from app.services.primary_batch import PrimaryBatchError, PrimaryBatchService
 from app.services.reprocess_service import ReprocessError, ReprocessService
 from app.services.retry_service import RetryService
 
@@ -182,6 +169,18 @@ def create_manual_batch(
         message="Manual batch created successfully.",
         requestId=_request_id(request),
         data=data,
+    )
+
+
+@router.get("/summary")
+def batches_summary(request: Request, db: DbSession, shop: CurrentShop):
+    summary = PrimaryBatchService(db, shop).dashboard_summary()
+    out = BatchSummaryOut(**summary)
+    return SuccessEnvelope(
+        success=True,
+        message="Batch summary retrieved successfully.",
+        requestId=_request_id(request),
+        data=out.model_dump(),
     )
 
 

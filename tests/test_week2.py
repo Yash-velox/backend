@@ -1417,6 +1417,40 @@ def test_primary_batch_list_newest_first_page_size_seven(client, shop, db_sessio
     assert "failedProductCount" in payload["items"][0]
 
 
+def test_batches_summary(client, shop, db_session):
+    batch = ProcessingBatch(
+        shop_id=shop.id,
+        trigger_type=TriggerType.MANUAL,
+        status=BatchStatus.COMPLETED,
+        completed_product_count=1,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    db_session.add(
+        BatchProduct(
+            shop_id=shop.id,
+            batch_id=batch.id,
+            shopify_product_gid="gid://shopify/Product/summary-1",
+            status=BatchProductStatus.COMPLETED,
+            image_count=1,
+        )
+    )
+    db_session.add(
+        ProcessingBatch(
+            shop_id=shop.id,
+            trigger_type=TriggerType.AUTOMATIC,
+            status=BatchStatus.PROCESSING,
+        )
+    )
+    db_session.commit()
+
+    res = client.get("/api/batches/summary")
+    assert res.status_code == 200
+    data = res.json()["data"]
+    assert data["completedProductCount"] == 1
+    assert data["activeBatchCount"] == 1
+
+
 def test_manual_batch_api(client, shop, db_session):
     ensure_shop_settings(db_session, shop)
     product = Product(

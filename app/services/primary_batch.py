@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -1420,6 +1420,38 @@ class PrimaryBatchService:
             .all()
         )
         return items, total
+
+    def dashboard_summary(self) -> dict[str, int]:
+        """Shop-wide batch metrics for the dashboard (not paginated)."""
+        completed = (
+            self.db.query(
+                func.count(
+                    func.distinct(
+                        func.coalesce(
+                            cast(BatchProduct.product_id, String),
+                            BatchProduct.shopify_product_gid,
+                        )
+                    )
+                )
+            )
+            .filter(
+                BatchProduct.shop_id == self.shop.id,
+                BatchProduct.status == BatchProductStatus.COMPLETED,
+            )
+            .scalar()
+        )
+        active = (
+            self.db.query(func.count(ProcessingBatch.id))
+            .filter(
+                ProcessingBatch.shop_id == self.shop.id,
+                ProcessingBatch.status.in_([BatchStatus.PROCESSING, BatchStatus.QUEUED]),
+            )
+            .scalar()
+        )
+        return {
+            "completedProductCount": int(completed or 0),
+            "activeBatchCount": int(active or 0),
+        }
 
     def published_product_counts(self, batch_ids: list[UUID]) -> dict[UUID, int]:
         if not batch_ids:

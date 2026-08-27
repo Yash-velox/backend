@@ -13,6 +13,7 @@ __all__ = [
     "BatchImageOut",
     "BatchOut",
     "BatchProductOut",
+    "BatchSummaryOut",
     "ManualBatchCreateRequest",
     "PaginationMeta",
     "SecondaryQueueItemOut",
@@ -101,6 +102,11 @@ class SecondaryQueueItemOut(BaseModel):
     failureReason: str | None = None
     createdAt: datetime
     updatedAt: datetime
+
+
+class BatchSummaryOut(BaseModel):
+    completedProductCount: int
+    activeBatchCount: int
 
 
 class BatchOut(BaseModel):
