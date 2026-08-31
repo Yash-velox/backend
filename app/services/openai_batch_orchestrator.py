@@ -44,6 +44,7 @@ from app.services.openai_batch_client import (
     extract_batch_error_message,
     extract_image_bytes_from_response_body,
     extract_text_from_responses_body,
+    is_missing_file_error,
     lines_to_jsonl,
     parse_jsonl,
 )
@@ -506,6 +507,21 @@ class OpenAIBatchOrchestrator:
                 return
             except Exception:
                 logger.exception("Partial import after terminal OpenAI batch failed | id=%s", row.id)
+
+        # Validation-only "Cannot find file" races: re-upload a fresh JSONL and resubmit
+        # with the same attempt numbers so we do not burn merchant retries.
+        if self._should_attempt_missing_file_recovery(row):
+            recovered = self._resubmit_after_missing_input_file(row, client)
+            if recovered is not None:
+                logger.info(
+                    "Recovered OpenAI batch after missing input file | parent=%s child=%s primary=%s",
+                    row.id,
+                    recovered.id,
+                    row.primary_batch_id,
+                )
+                self._refresh_primary_batch_counters(row.primary_batch_id)
+                return
+
         reqs = self.db.query(OpenAIBatchRequest).filter(OpenAIBatchRequest.openai_batch_id == row.id).all()
         for req in reqs:
             if req.status == OpenAIBatchRequestStatus.COMPLETED:
@@ -521,6 +537,190 @@ class OpenAIBatchOrchestrator:
         self._create_retry_batch(row, [r for r in reqs if r.status != OpenAIBatchRequestStatus.COMPLETED])
         # If retries are exhausted, leave Jobs off stuck "Enhancing image".
         self._refresh_primary_batch_counters(row.primary_batch_id)
+
+    def _should_attempt_missing_file_recovery(self, row: OpenAIBatch) -> bool:
+        if row.status != OpenAIBatchStatus.FAILED:
+            return False
+        if not is_missing_file_error(row.error_message):
+            return False
+        # Only when OpenAI never processed any request lines (pure validation failure).
+        if row.openai_output_file_id or row.openai_error_file_id:
+            return False
+        if int(row.completed_count or 0) > 0:
+            return False
+        max_recoveries = max(0, int(settings.openai_batch_missing_file_recovery_max))
+        if max_recoveries <= 0:
+            return False
+        return self._missing_file_failure_count(row) <= max_recoveries
+
+    def _missing_file_failure_count(self, row: OpenAIBatch) -> int:
+        siblings = (
+            self.db.query(OpenAIBatch)
+            .filter(
+                OpenAIBatch.primary_batch_id == row.primary_batch_id,
+                OpenAIBatch.workflow_step_order == row.workflow_step_order,
+                OpenAIBatch.status == OpenAIBatchStatus.FAILED,
+            )
+            .all()
+        )
+        return sum(1 for sibling in siblings if is_missing_file_error(sibling.error_message))
+
+    def _resubmit_after_missing_input_file(
+        self, parent: OpenAIBatch, client: OpenAIBatchClient
+    ) -> OpenAIBatch | None:
+        """Re-upload JSONL + create a new OpenAI batch without incrementing attempt_number."""
+        pending = [
+            r
+            for r in self.db.query(OpenAIBatchRequest)
+            .filter(OpenAIBatchRequest.openai_batch_id == parent.id)
+            .all()
+            if r.status != OpenAIBatchRequestStatus.COMPLETED
+        ]
+        if not pending:
+            return None
+
+        child = OpenAIBatch(
+            shop_id=parent.shop_id,
+            primary_batch_id=parent.primary_batch_id,
+            workflow_step_id=parent.workflow_step_id,
+            workflow_step_order=parent.workflow_step_order,
+            step_type=parent.step_type,
+            endpoint=parent.endpoint,
+            model=parent.model,
+            status=OpenAIBatchStatus.DRAFT,
+            is_retry=True,
+            parent_openai_batch_id=parent.id,
+            request_count=0,
+        )
+        self.db.add(child)
+        self.db.flush()
+
+        lines: list[BatchLine] = []
+        now = datetime.now(timezone.utc)
+        for old in pending:
+            image = self.db.get(BatchImage, old.batch_image_id)
+            product = self.db.get(BatchProduct, old.batch_product_id)
+            if image is None or product is None:
+                continue
+            if image.status in {BatchImageStatus.COMPLETED, BatchImageStatus.FAILED}:
+                # Do not re-queue finished or permanently failed images.
+                continue
+            attempt = max(1, int(old.attempt_number or 1))
+            custom_id = make_custom_id(
+                shop_id=image.shop_id,
+                batch_image_id=image.id,
+                step_order=old.workflow_step_order,
+                attempt=attempt,
+            )
+            try:
+                body = self._build_body_for_image(
+                    image=image,
+                    step_type=parent.step_type,
+                    model=parent.model,
+                    prompt=self._resolve_prompt_text(image, old.workflow_step_order),
+                )
+            except Exception:
+                logger.exception(
+                    "Missing-file recovery skipped image; body build failed | image=%s",
+                    image.id,
+                )
+                continue
+
+            # Close out the old request for audit; recovery keeps the same attempt on the child.
+            old.status = OpenAIBatchRequestStatus.FAILED
+            old.error_code = "INPUT_FILE_NOT_READY"
+            old.error_message = parent.error_message or "OpenAI input file not ready during validation"
+            old.completed_at = now
+
+            self.db.add(
+                OpenAIBatchRequest(
+                    openai_batch_id=child.id,
+                    custom_id=custom_id,
+                    batch_image_id=image.id,
+                    batch_product_id=product.id,
+                    source_media_gid=image.shopify_media_gid,
+                    workflow_step_id=old.workflow_step_id,
+                    workflow_step_order=old.workflow_step_order,
+                    attempt_number=attempt,
+                    status=OpenAIBatchRequestStatus.PENDING,
+                    input_reference=body.get("_input_reference"),
+                )
+            )
+            body.pop("_input_reference", None)
+            lines.append(BatchLine(custom_id=custom_id, method="POST", url=parent.endpoint, body=body))
+
+            if image.status != BatchImageStatus.WAITING_FOR_PROVIDER:
+                if image.status not in {BatchImageStatus.COMPLETED, BatchImageStatus.FAILED}:
+                    assert_transition(
+                        "batch_image",
+                        BATCH_IMAGE_TRANSITIONS,
+                        image.status,
+                        BatchImageStatus.WAITING_FOR_PROVIDER,
+                    )
+                    image.status = BatchImageStatus.WAITING_FOR_PROVIDER
+            image.error_code = None
+            image.error_message = None
+            if product.status == BatchProductStatus.FAILED:
+                assert_transition(
+                    "batch_product",
+                    BATCH_PRODUCT_TRANSITIONS,
+                    product.status,
+                    BatchProductStatus.RETRYING,
+                )
+                product.status = BatchProductStatus.RETRYING
+            if product.status == BatchProductStatus.RETRYING:
+                assert_transition(
+                    "batch_product",
+                    BATCH_PRODUCT_TRANSITIONS,
+                    product.status,
+                    BatchProductStatus.PROCESSING,
+                )
+                product.status = BatchProductStatus.PROCESSING
+            if product.status == BatchProductStatus.PROCESSING:
+                product.error_code = None
+                product.error_message = None
+
+        if not lines:
+            self.db.delete(child)
+            return None
+
+        self.db.flush()
+        try:
+            jsonl = lines_to_jsonl(lines)
+            file_id = client.upload_batch_jsonl(
+                jsonl,
+                filename=f"primary_{parent.primary_batch_id}_step_{parent.workflow_step_order}_recover.jsonl",
+            )
+            child.openai_input_file_id = file_id
+            child.request_count = len(lines)
+            remote = client.create_batch(
+                input_file_id=file_id,
+                endpoint=parent.endpoint,
+                metadata={
+                    "primary_batch_id": str(parent.primary_batch_id),
+                    "recover_missing_file_of": str(parent.id),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Missing-file recovery submit failed | parent=%s child=%s",
+                parent.id,
+                child.id,
+            )
+            self.db.delete(child)
+            return None
+
+        child.openai_batch_id = remote.id
+        child.status = OpenAIBatchStatus(getattr(remote, "status", "validating"))
+        child.submitted_at = datetime.now(timezone.utc)
+        expires = getattr(remote, "expires_at", None)
+        if expires:
+            child.expires_at = datetime.fromtimestamp(expires, tz=timezone.utc)
+        for req in self.db.query(OpenAIBatchRequest).filter(OpenAIBatchRequest.openai_batch_id == child.id).all():
+            req.status = OpenAIBatchRequestStatus.SUBMITTED
+        self._set_primary_phase(parent.primary_batch_id, ProcessingPhase.WAITING_FOR_OPENAI, active=child.id)
+        self.db.flush()
+        return child
 
     def _create_retry_batch(self, parent: OpenAIBatch, failed_reqs: list[OpenAIBatchRequest]) -> OpenAIBatch | None:
         retryable = [

@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     openai_batch_file_ready_max_delay_seconds: float = 4.0
     # If batches.create still races with "Cannot find file", re-check and retry create.
     openai_batch_create_max_attempts: int = 3
+    # When OpenAI fails a batch at validation with "Cannot find file", re-upload a fresh
+    # JSONL and resubmit with the same attempt numbers (does not burn merchant retries).
+    openai_batch_missing_file_recovery_max: int = 3
     poc_dev_skip_auth: bool = False
 
     # PostgreSQL (production). SQLite URL allowed for local/tests only.

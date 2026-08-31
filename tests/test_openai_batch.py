@@ -712,3 +712,274 @@ def test_import_image_success_hosts_cdn_for_next_image_step(
     )
     assert body["images"][0]["image_url"] == "https://cdn.shopify.com/hosted-intermediate.png"
     assert "file_id" not in body["images"][0]
+
+
+def test_missing_file_terminal_failure_recovers_same_attempt(db_session, shop, monkeypatch):
+    """Validation-only missing-file failure re-uploads without burning attempt_number."""
+    from app.models import (
+        BatchImage,
+        BatchImageStatus,
+        BatchProduct,
+        BatchProductStatus,
+        BatchStatus,
+        DeltaType,
+        ProcessingBatch,
+        TriggerType,
+    )
+    from app.models.enums import OpenAIBatchRequestStatus, OpenAIBatchStatus, PromptStepType
+    from app.models.openai_batch import OpenAIBatch, OpenAIBatchRequest
+    from app.services import openai_batch_orchestrator as orch_mod
+
+    monkeypatch.setattr(settings, "openai_batch_missing_file_recovery_max", 3)
+
+    batch = ProcessingBatch(
+        id=uuid4(),
+        shop_id=shop.id,
+        trigger_type=TriggerType.MANUAL,
+        status=BatchStatus.PROCESSING,
+        product_count=1,
+        image_count=1,
+        processing_phase="WAITING_FOR_OPENAI",
+    )
+    db_session.add(batch)
+    db_session.flush()
+    bp = BatchProduct(
+        id=uuid4(),
+        batch_id=batch.id,
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/99",
+        status=BatchProductStatus.PROCESSING,
+        image_count=1,
+        prompt_snapshot_json=[
+            {"step": 1, "name": "Enhance", "prompt": "go", "promptTemplate": "go", "stepType": "IMAGE"}
+        ],
+    )
+    db_session.add(bp)
+    db_session.flush()
+    image = BatchImage(
+        id=uuid4(),
+        batch_product_id=bp.id,
+        shop_id=shop.id,
+        shopify_media_gid="gid://shopify/MediaImage/99",
+        cdn_url="https://cdn.shopify.com/ring.png",
+        delta_type=DeltaType.INITIAL,
+        status=BatchImageStatus.WAITING_FOR_PROVIDER,
+        current_prompt_step=0,
+        attempt_count=1,
+    )
+    db_session.add(image)
+    db_session.flush()
+
+    parent = OpenAIBatch(
+        id=uuid4(),
+        shop_id=shop.id,
+        primary_batch_id=batch.id,
+        workflow_step_order=1,
+        step_type=PromptStepType.IMAGE,
+        endpoint="/v1/images/edits",
+        model="gpt-image-2",
+        openai_batch_id="batch_parent_fail",
+        openai_input_file_id="file-old",
+        status=OpenAIBatchStatus.FAILED,
+        request_count=1,
+        completed_count=0,
+        failed_count=0,
+        error_message=(
+            "Cannot find file file-old, or organization org-x does not have access to it."
+        ),
+    )
+    db_session.add(parent)
+    db_session.flush()
+    cid = make_custom_id(shop_id=shop.id, batch_image_id=image.id, step_order=1, attempt=1)
+    db_session.add(
+        OpenAIBatchRequest(
+            openai_batch_id=parent.id,
+            custom_id=cid,
+            batch_image_id=image.id,
+            batch_product_id=bp.id,
+            source_media_gid=image.shopify_media_gid,
+            workflow_step_order=1,
+            attempt_number=1,
+            status=OpenAIBatchRequestStatus.SUBMITTED,
+        )
+    )
+    db_session.commit()
+
+    uploads: list[str] = []
+
+    class FakeClient:
+        def upload_batch_jsonl(self, data: bytes, *, filename: str = "batch_input.jsonl") -> str:
+            uploads.append(filename)
+            return "file-fresh"
+
+        def create_batch(self, **kwargs):
+            assert kwargs["input_file_id"] == "file-fresh"
+
+            class R:
+                id = "batch_recovered"
+                status = "validating"
+                expires_at = None
+
+            return R()
+
+    orch = orch_mod.OpenAIBatchOrchestrator(db_session, client=FakeClient())
+    orch._handle_terminal_failure(parent, FakeClient())
+    db_session.commit()
+
+    children = (
+        db_session.query(OpenAIBatch)
+        .filter(OpenAIBatch.parent_openai_batch_id == parent.id)
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert child.openai_batch_id == "batch_recovered"
+    assert child.status == OpenAIBatchStatus.VALIDATING
+    assert uploads and "recover" in uploads[0]
+
+    child_reqs = (
+        db_session.query(OpenAIBatchRequest)
+        .filter(OpenAIBatchRequest.openai_batch_id == child.id)
+        .all()
+    )
+    assert len(child_reqs) == 1
+    assert child_reqs[0].attempt_number == 1
+    assert child_reqs[0].status == OpenAIBatchRequestStatus.SUBMITTED
+
+    db_session.refresh(image)
+    db_session.refresh(bp)
+    assert image.status == BatchImageStatus.WAITING_FOR_PROVIDER
+    assert image.attempt_count == 1
+    assert image.error_message is None
+    assert bp.status == BatchProductStatus.PROCESSING
+
+
+def test_missing_file_recovery_respects_max_then_normal_retry(db_session, shop, monkeypatch):
+    from app.models import (
+        BatchImage,
+        BatchImageStatus,
+        BatchProduct,
+        BatchProductStatus,
+        BatchStatus,
+        DeltaType,
+        ProcessingBatch,
+        TriggerType,
+    )
+    from app.models.enums import OpenAIBatchRequestStatus, OpenAIBatchStatus, PromptStepType
+    from app.models.openai_batch import OpenAIBatch, OpenAIBatchRequest
+    from app.services import openai_batch_orchestrator as orch_mod
+
+    monkeypatch.setattr(settings, "openai_batch_missing_file_recovery_max", 1)
+    monkeypatch.setattr(settings, "processing_max_attempts", 3)
+
+    batch = ProcessingBatch(
+        id=uuid4(),
+        shop_id=shop.id,
+        trigger_type=TriggerType.MANUAL,
+        status=BatchStatus.PROCESSING,
+        product_count=1,
+        image_count=1,
+        processing_phase="WAITING_FOR_OPENAI",
+    )
+    db_session.add(batch)
+    db_session.flush()
+    bp = BatchProduct(
+        id=uuid4(),
+        batch_id=batch.id,
+        shop_id=shop.id,
+        shopify_product_gid="gid://shopify/Product/100",
+        status=BatchProductStatus.PROCESSING,
+        image_count=1,
+        prompt_snapshot_json=[
+            {"step": 1, "name": "Enhance", "prompt": "go", "promptTemplate": "go", "stepType": "IMAGE"}
+        ],
+    )
+    db_session.add(bp)
+    db_session.flush()
+    image = BatchImage(
+        id=uuid4(),
+        batch_product_id=bp.id,
+        shop_id=shop.id,
+        shopify_media_gid="gid://shopify/MediaImage/100",
+        cdn_url="https://cdn.shopify.com/ring2.png",
+        delta_type=DeltaType.INITIAL,
+        status=BatchImageStatus.WAITING_FOR_PROVIDER,
+        current_prompt_step=0,
+        attempt_count=1,
+    )
+    db_session.add(image)
+    db_session.flush()
+
+    # Already used the one allowed missing-file failure recovery slot.
+    prior = OpenAIBatch(
+        id=uuid4(),
+        shop_id=shop.id,
+        primary_batch_id=batch.id,
+        workflow_step_order=1,
+        step_type=PromptStepType.IMAGE,
+        endpoint="/v1/images/edits",
+        model="gpt-image-2",
+        openai_batch_id="batch_prior",
+        status=OpenAIBatchStatus.FAILED,
+        request_count=1,
+        error_message="Cannot find file file-prior, or organization org-x does not have access to it.",
+    )
+    parent = OpenAIBatch(
+        id=uuid4(),
+        shop_id=shop.id,
+        primary_batch_id=batch.id,
+        workflow_step_order=1,
+        step_type=PromptStepType.IMAGE,
+        endpoint="/v1/images/edits",
+        model="gpt-image-2",
+        openai_batch_id="batch_parent",
+        openai_input_file_id="file-parent",
+        status=OpenAIBatchStatus.FAILED,
+        request_count=1,
+        completed_count=0,
+        error_message="Cannot find file file-parent, or organization org-x does not have access to it.",
+        is_retry=True,
+        parent_openai_batch_id=prior.id,
+    )
+    db_session.add_all([prior, parent])
+    db_session.flush()
+    cid = make_custom_id(shop_id=shop.id, batch_image_id=image.id, step_order=1, attempt=1)
+    db_session.add(
+        OpenAIBatchRequest(
+            openai_batch_id=parent.id,
+            custom_id=cid,
+            batch_image_id=image.id,
+            batch_product_id=bp.id,
+            source_media_gid=image.shopify_media_gid,
+            workflow_step_order=1,
+            attempt_number=1,
+            status=OpenAIBatchRequestStatus.SUBMITTED,
+        )
+    )
+    db_session.commit()
+
+    class FakeClient:
+        def upload_batch_jsonl(self, data: bytes, *, filename: str = "batch_input.jsonl") -> str:
+            return "file-retry"
+
+        def create_batch(self, **kwargs):
+            class R:
+                id = "batch_normal_retry"
+                status = "validating"
+                expires_at = None
+
+            return R()
+
+    orch = orch_mod.OpenAIBatchOrchestrator(db_session, client=FakeClient())
+    # With max=1 and 2 missing-file failures already recorded, recovery must NOT run.
+    assert orch._should_attempt_missing_file_recovery(parent) is False
+    orch._handle_terminal_failure(parent, FakeClient())
+    db_session.commit()
+
+    # Normal retry path increments attempt to 2.
+    retries = (
+        db_session.query(OpenAIBatchRequest)
+        .filter(OpenAIBatchRequest.batch_image_id == image.id, OpenAIBatchRequest.attempt_number == 2)
+        .all()
+    )
+    assert len(retries) == 1
