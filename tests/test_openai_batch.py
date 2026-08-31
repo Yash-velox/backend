@@ -12,10 +12,14 @@ from app.config import settings
 from app.services.openai_batch_client import (
     IMAGE_EDITS_ENDPOINT,
     BatchLine,
+    OpenAIBatchClient,
+    OpenAIBatchClientError,
     build_description_body,
     build_image_edit_body,
+    extract_batch_error_message,
     extract_image_bytes_from_response_body,
     extract_text_from_responses_body,
+    is_missing_file_error,
     lines_to_jsonl,
     parse_jsonl,
 )
@@ -38,6 +42,119 @@ def test_make_custom_id_is_deterministic():
     assert str(image) in a
     assert "step_2" in a
     assert "attempt_1" in a
+
+
+def test_is_missing_file_error_detects_openai_race_message():
+    assert is_missing_file_error(
+        "Cannot find file file-ABC, or organization org-x does not have access to it."
+    )
+    assert not is_missing_file_error("You have no credits remaining")
+
+
+def test_extract_batch_error_message_reads_remote_errors():
+    class Err:
+        message = "Cannot find file file-ABC"
+
+    class Errors:
+        data = [Err()]
+
+    class Remote:
+        errors = Errors()
+
+    assert "Cannot find file" in (extract_batch_error_message(Remote()) or "")
+    assert extract_batch_error_message(object()) is None
+
+
+def test_wait_until_file_ready_polls_until_visible(monkeypatch):
+    monkeypatch.setattr(settings, "openai_batch_file_ready_max_attempts", 5)
+    monkeypatch.setattr(settings, "openai_batch_file_ready_initial_delay_seconds", 0.0)
+    monkeypatch.setattr(settings, "openai_batch_file_ready_max_delay_seconds", 0.0)
+
+    class FakeFiles:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def retrieve(self, file_id: str):
+            self.calls += 1
+            if self.calls < 3:
+                raise RuntimeError("not visible yet")
+
+            class F:
+                id = file_id
+                purpose = "batch"
+                status = "processed"
+
+            return F()
+
+    class FakeOpenAI:
+        files = FakeFiles()
+
+    client = OpenAIBatchClient(client=FakeOpenAI())  # type: ignore[arg-type]
+    ready = client.wait_until_file_ready("file-ready")
+    assert ready.id == "file-ready"
+    assert FakeOpenAI.files.calls == 3
+
+
+def test_create_batch_retries_on_missing_file(monkeypatch):
+    monkeypatch.setattr(settings, "openai_batch_file_ready_max_attempts", 2)
+    monkeypatch.setattr(settings, "openai_batch_file_ready_initial_delay_seconds", 0.0)
+    monkeypatch.setattr(settings, "openai_batch_file_ready_max_delay_seconds", 0.0)
+    monkeypatch.setattr(settings, "openai_batch_create_max_attempts", 3)
+    monkeypatch.setattr(settings, "openai_batch_completion_window", "24h")
+
+    class FakeFiles:
+        def retrieve(self, file_id: str):
+            class F:
+                id = file_id
+                purpose = "batch"
+                status = "processed"
+
+            return F()
+
+    class FakeBatches:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.calls < 2:
+                raise RuntimeError(
+                    "Cannot find file file-ABC, or organization org-x does not have access to it."
+                )
+
+            class R:
+                id = "batch_ok"
+                status = "validating"
+                expires_at = None
+
+            return R()
+
+    class FakeOpenAI:
+        files = FakeFiles()
+        batches = FakeBatches()
+
+    client = OpenAIBatchClient(client=FakeOpenAI())  # type: ignore[arg-type]
+    remote = client.create_batch(input_file_id="file-ABC", endpoint=IMAGE_EDITS_ENDPOINT)
+    assert remote.id == "batch_ok"
+    assert FakeOpenAI.batches.calls == 2
+
+
+def test_create_batch_raises_when_file_never_ready(monkeypatch):
+    monkeypatch.setattr(settings, "openai_batch_file_ready_max_attempts", 2)
+    monkeypatch.setattr(settings, "openai_batch_file_ready_initial_delay_seconds", 0.0)
+    monkeypatch.setattr(settings, "openai_batch_file_ready_max_delay_seconds", 0.0)
+
+    class FakeFiles:
+        def retrieve(self, file_id: str):
+            raise RuntimeError("still missing")
+
+    class FakeOpenAI:
+        files = FakeFiles()
+
+    client = OpenAIBatchClient(client=FakeOpenAI())  # type: ignore[arg-type]
+    with pytest.raises(OpenAIBatchClientError) as exc:
+        client.wait_until_file_ready("file-missing")
+    assert exc.value.code == "FILE_NOT_READY"
 
 
 def test_jsonl_roundtrip_and_image_body():

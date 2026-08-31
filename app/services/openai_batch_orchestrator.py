@@ -41,6 +41,7 @@ from app.services.openai_batch_client import (
     OpenAIBatchClientError,
     build_description_body,
     build_image_edit_body,
+    extract_batch_error_message,
     extract_image_bytes_from_response_body,
     extract_text_from_responses_body,
     lines_to_jsonl,
@@ -260,6 +261,9 @@ class OpenAIBatchOrchestrator:
             logger.warning("Unknown OpenAI batch status %s for %s", status_raw, row.id)
         row.openai_output_file_id = getattr(remote, "output_file_id", None) or row.openai_output_file_id
         row.openai_error_file_id = getattr(remote, "error_file_id", None) or row.openai_error_file_id
+        remote_error = extract_batch_error_message(remote)
+        if remote_error:
+            row.error_message = remote_error
         counts = getattr(remote, "request_counts", None)
         if counts is not None:
             row.completed_count = int(getattr(counts, "completed", 0) or 0)
@@ -280,6 +284,15 @@ class OpenAIBatchOrchestrator:
                 self._heartbeat_product_locks(primary.id)
             elif row.status == OpenAIBatchStatus.COMPLETED:
                 primary.processing_phase = ProcessingPhase.COLLECTING_OPENAI_RESULTS.value
+
+    def _refresh_primary_batch_counters(self, primary_batch_id: UUID) -> None:
+        primary = self.db.get(ProcessingBatch, primary_batch_id)
+        if primary is None:
+            return
+        shop = self.db.get(Shop, primary.shop_id)
+        if shop is None:
+            return
+        PrimaryBatchService(self.db, shop).refresh_batch_counters(primary)
 
     def _heartbeat_product_locks(self, primary_batch_id: UUID) -> None:
         """Keep product locks fresh while OpenAI Platform work is still in progress.
@@ -506,6 +519,8 @@ class OpenAIBatchOrchestrator:
             req.error_message = row.error_message or f"OpenAI batch ended as {row.status.value}"
             req.completed_at = datetime.now(timezone.utc)
         self._create_retry_batch(row, [r for r in reqs if r.status != OpenAIBatchRequestStatus.COMPLETED])
+        # If retries are exhausted, leave Jobs off stuck "Enhancing image".
+        self._refresh_primary_batch_counters(row.primary_batch_id)
 
     def _create_retry_batch(self, parent: OpenAIBatch, failed_reqs: list[OpenAIBatchRequest]) -> OpenAIBatch | None:
         retryable = [

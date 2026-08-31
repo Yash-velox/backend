@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -22,11 +23,38 @@ logger = logging.getLogger("app.services.openai_batch_client")
 IMAGE_EDITS_ENDPOINT = "/v1/images/edits"
 RESPONSES_ENDPOINT = "/v1/responses"
 
+_READY_FILE_STATUSES = {None, "uploaded", "processed"}
+
 
 class OpenAIBatchClientError(RuntimeError):
     def __init__(self, message: str, *, code: str = "OPENAI_BATCH_ERROR") -> None:
         super().__init__(message)
         self.code = code
+
+
+def is_missing_file_error(message: str | None) -> bool:
+    """True when OpenAI rejected a batch because the input file is not visible yet."""
+    text = (message or "").lower()
+    return "cannot find file" in text or "does not have access to it" in text
+
+
+def extract_batch_error_message(remote: Any) -> str | None:
+    """Pull the first human-readable error from an OpenAI Batch object, if any."""
+    errors = getattr(remote, "errors", None)
+    if errors is None:
+        return None
+    data = getattr(errors, "data", None)
+    if data is None and isinstance(errors, list):
+        data = errors
+    if not data:
+        return None
+    first = data[0]
+    message = getattr(first, "message", None)
+    if message:
+        return str(message)
+    if isinstance(first, dict):
+        return str(first.get("message") or first)
+    return str(first)
 
 
 @dataclass
@@ -192,13 +220,112 @@ class OpenAIBatchClient:
         finally:
             path.unlink(missing_ok=True)
 
-    def create_batch(self, *, input_file_id: str, endpoint: str, metadata: dict[str, str] | None = None) -> Any:
-        return self._client.batches.create(
-            input_file_id=input_file_id,
-            endpoint=endpoint,  # type: ignore[arg-type]
-            completion_window=settings.openai_batch_completion_window,  # type: ignore[arg-type]
-            metadata=metadata or None,
+    def retrieve_file(self, file_id: str) -> Any:
+        return self._client.files.retrieve(file_id)
+
+    def wait_until_file_ready(
+        self,
+        file_id: str,
+        *,
+        expected_purpose: str | None = "batch",
+    ) -> Any:
+        """Poll files.retrieve until OpenAI can see the uploaded input file.
+
+        Readiness is decided by retrieve succeeding with a matching id/purpose — not a fixed sleep.
+        Short backoff between polls avoids a busy-loop while still waiting only until ready.
+        """
+        max_attempts = max(1, int(settings.openai_batch_file_ready_max_attempts))
+        delay = max(0.0, float(settings.openai_batch_file_ready_initial_delay_seconds))
+        max_delay = max(delay, float(settings.openai_batch_file_ready_max_delay_seconds))
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                remote = self.retrieve_file(file_id)
+                remote_id = getattr(remote, "id", None)
+                purpose = getattr(remote, "purpose", None)
+                status = getattr(remote, "status", None)
+                if remote_id == file_id and (expected_purpose is None or purpose == expected_purpose):
+                    if status in _READY_FILE_STATUSES:
+                        if attempt > 1:
+                            logger.info(
+                                "OpenAI file ready after poll | file_id=%s attempts=%s purpose=%s",
+                                file_id,
+                                attempt,
+                                purpose,
+                            )
+                        return remote
+                    last_error = OpenAIBatchClientError(
+                        f"OpenAI file {file_id} not ready yet (status={status})",
+                        code="FILE_NOT_READY",
+                    )
+                else:
+                    last_error = OpenAIBatchClientError(
+                        f"OpenAI file {file_id} not ready yet (id={remote_id} purpose={purpose})",
+                        code="FILE_NOT_READY",
+                    )
+            except OpenAIBatchClientError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                logger.info(
+                    "OpenAI file retrieve not ready | file_id=%s attempt=%s/%s error=%s",
+                    file_id,
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+
+            if attempt >= max_attempts:
+                break
+            if delay > 0:
+                time.sleep(delay)
+                delay = min(delay * 2, max_delay)
+
+        detail = str(last_error) if last_error else "unknown"
+        raise OpenAIBatchClientError(
+            f"OpenAI file {file_id} not ready after {max_attempts} polls: {detail}",
+            code="FILE_NOT_READY",
         )
+
+    def create_batch(self, *, input_file_id: str, endpoint: str, metadata: dict[str, str] | None = None) -> Any:
+        # Ensure Files API can see the JSONL before Batch validation runs.
+        self.wait_until_file_ready(input_file_id, expected_purpose="batch")
+
+        max_attempts = max(1, int(settings.openai_batch_create_max_attempts))
+        delay = max(0.0, float(settings.openai_batch_file_ready_initial_delay_seconds))
+        max_delay = max(delay, float(settings.openai_batch_file_ready_max_delay_seconds))
+        last_exc: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self._client.batches.create(
+                    input_file_id=input_file_id,
+                    endpoint=endpoint,  # type: ignore[arg-type]
+                    completion_window=settings.openai_batch_completion_window,  # type: ignore[arg-type]
+                    metadata=metadata or None,
+                )
+            except Exception as exc:
+                last_exc = exc
+                message = str(exc)
+                if not is_missing_file_error(message) or attempt >= max_attempts:
+                    raise
+                logger.warning(
+                    "OpenAI batches.create missing file; re-check and retry | file_id=%s attempt=%s/%s error=%s",
+                    input_file_id,
+                    attempt,
+                    max_attempts,
+                    message,
+                )
+                self.wait_until_file_ready(input_file_id, expected_purpose="batch")
+                if delay > 0:
+                    time.sleep(delay)
+                    delay = min(delay * 2, max_delay)
+
+        raise OpenAIBatchClientError(
+            f"Failed to create OpenAI batch for {input_file_id}: {last_exc}",
+            code="BATCH_CREATE_FAILED",
+        ) from last_exc
 
     def retrieve_batch(self, openai_batch_id: str) -> Any:
         return self._client.batches.retrieve(openai_batch_id)

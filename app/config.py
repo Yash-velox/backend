@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     openai_batch_poll_interval_seconds: float = 20.0
     openai_temp_file_retention_hours: int = 48
     openai_batch_max_requests: int = 50000
+    # After Files.create, poll files.retrieve until the input is visible before batches.create.
+    openai_batch_file_ready_max_attempts: int = 12
+    openai_batch_file_ready_initial_delay_seconds: float = 0.5
+    openai_batch_file_ready_max_delay_seconds: float = 4.0
+    # If batches.create still races with "Cannot find file", re-check and retry create.
+    openai_batch_create_max_attempts: int = 3
     poc_dev_skip_auth: bool = False
 
     # PostgreSQL (production). SQLite URL allowed for local/tests only.
